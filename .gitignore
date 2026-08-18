@@ -1,4 +1,5 @@
 .superpowers/
+.worktrees/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -15,4 +16,3 @@ data/processed/
 checkpoints/
 runs/
 wandb/
-
