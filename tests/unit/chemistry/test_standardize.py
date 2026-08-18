@@ -56,3 +56,21 @@ def test_standardization_rejects_unsupported_ligand_element():
 
     with pytest.raises(ValueError, match="unsupported ligand element"):
         standardize_molecule(molecule)
+
+
+@pytest.mark.parametrize("smiles", ["[P+3]", "[N+3]", "[S-3]"])
+def test_standardization_rejects_unencodable_formal_charge(smiles: str):
+    molecule = Chem.MolFromSmiles(smiles)
+    assert molecule is not None
+
+    with pytest.raises(ValueError, match="unsupported formal charge"):
+        standardize_molecule(molecule)
+
+
+def test_standardization_rejects_unencodable_dative_bond():
+    molecule = Chem.MolFromSmiles("N->[B-](F)(F)F")
+    assert molecule is not None
+    assert any(bond.GetBondType() == Chem.BondType.DATIVE for bond in molecule.GetBonds())
+
+    with pytest.raises(ValueError, match="unsupported bond type"):
+        standardize_molecule(molecule)

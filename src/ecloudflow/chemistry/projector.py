@@ -129,11 +129,13 @@ class ChemicalProjector:
             allowed-new-bond vector of shape ``[E]``.
         :rtype: ProjectedState
         :raises ValueError: If atom, charge, or bond channels do not match the
-            chemical vocabulary, or the fixed condition is incompatible.
+            chemical vocabulary, the fixed condition is incompatible, or
+            immutable fixed bonds alone exceed a node's maximum valence.
 
-        The projection uses softmax expectations and a continuous capacity
-        scale for overflowed nodes. It is differentiable with respect to
-        unmasked logits, does not choose categorical classes, and cannot
+        The projection reserves expected valence from immutable internal
+        fragment bonds before applying a continuous capacity scale to mutable
+        halfedges. It uses softmax expectations, is differentiable with respect
+        to unmasked logits, does not choose categorical classes, and cannot
         guarantee final sanitization. Exact graph feasibility and RDKit
         aromaticity recovery belong to the final decoder. Boolean feasibility
         comparisons are control masks, not a discretized molecular graph.
@@ -158,12 +160,32 @@ class ChemicalProjector:
         bond_probabilities = torch.softmax(working.bond_logits, dim=-1)
         bond_orders = working.bond_logits.new_tensor(self.vocabulary.bond_orders)
         expected_edge_orders = bond_probabilities @ bond_orders
-        expected_valence = self._sum_halfedges(working, expected_edge_orders)
+        fixed_bond_mask = (
+            fixed.fixed_bond_mask
+            if fixed is not None
+            else torch.zeros_like(expected_edge_orders, dtype=torch.bool)
+        )
+        immutable_edge_orders = torch.where(
+            fixed_bond_mask, expected_edge_orders, torch.zeros_like(expected_edge_orders)
+        )
+        mutable_edge_orders = torch.where(
+            fixed_bond_mask, torch.zeros_like(expected_edge_orders), expected_edge_orders
+        )
+        immutable_valence = self._sum_halfedges(working, immutable_edge_orders)
+        mutable_valence = self._sum_halfedges(working, mutable_edge_orders)
+        if bool((immutable_valence > maximum_valence + self.tolerance).any()):
+            raise ValueError("fixed bonds exceed the configured maximum valence.")
 
-        denominator = expected_valence.clamp_min(torch.finfo(expected_valence.dtype).tiny)
-        node_scale = (maximum_valence / denominator).clamp(max=1.0)
+        mutable_capacity = (maximum_valence - immutable_valence).clamp_min(0.0)
+        denominator = mutable_valence.clamp_min(
+            torch.finfo(mutable_valence.dtype).tiny
+        )
+        node_scale = (mutable_capacity / denominator).clamp(max=1.0)
         source, target = working.halfedge_index
         edge_scale = torch.minimum(node_scale[source], node_scale[target])
+        edge_scale = torch.where(
+            fixed_bond_mask, torch.ones_like(edge_scale), edge_scale
+        )
         scaled_probabilities = bond_probabilities.clone()
         scaled_probabilities[:, 1:] = bond_probabilities[:, 1:] * edge_scale[:, None]
         scaled_probabilities[:, 0] = 1.0 - scaled_probabilities[:, 1:].sum(dim=-1)
@@ -245,4 +267,3 @@ class ChemicalProjector:
         result.index_add_(0, source, edge_values)
         result.index_add_(0, target, edge_values)
         return result
-

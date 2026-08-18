@@ -2,7 +2,12 @@
 
 import pytest
 
-from ecloudflow.chemistry.vocabulary import ChemicalVocabulary
+from ecloudflow.chemistry.vocabulary import (
+    BOND_CLASSES,
+    FORMAL_CHARGES,
+    LIGAND_ATOMS,
+    ChemicalVocabulary,
+)
 
 
 def test_default_ligand_vocabulary_has_binding_order():
@@ -47,3 +52,20 @@ def test_vocabulary_rejects_negative_atom_indices():
 
     with pytest.raises(ValueError, match="outside vocabulary"):
         vocab.atom_symbol(-1)
+
+
+@pytest.mark.parametrize(
+    ("atoms", "charges", "bonds"),
+    [
+        (LIGAND_ATOMS + ("Fe",), FORMAL_CHARGES, BOND_CLASSES),
+        (LIGAND_ATOMS, (-1, 0, 1), BOND_CLASSES),
+        (LIGAND_ATOMS, FORMAL_CHARGES, ("none", "single", "aromatic")),
+    ],
+)
+def test_ligand_domain_rejects_nonbinding_channel_tuples(
+    atoms: tuple[str, ...],
+    charges: tuple[int, ...],
+    bonds: tuple[str, ...],
+):
+    with pytest.raises(ValueError, match="ligand vocabulary must use the binding"):
+        ChemicalVocabulary(atoms, charges, bonds, "ligand")

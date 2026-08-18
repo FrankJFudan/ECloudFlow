@@ -27,7 +27,8 @@ def standardize_molecule(
     :rtype: rdkit.Chem.Mol
     :raises TypeError: If ``molecule`` is not an RDKit molecule.
     :raises ValueError: If the vocabulary is not ligand-scoped, an element is
-        unsupported, sanitization fails, or the graph cannot be Kekulized.
+        unsupported, a formal charge or post-Kekulization bond is not
+        encodable, sanitization fails, or the graph cannot be Kekulized.
 
     RDKit sanitization assigns valence and aromaticity on the private copy.
     Stereochemistry is then cleaned and forced before canonical isomeric SMILES
@@ -47,13 +48,30 @@ def standardize_molecule(
     try:
         Chem.SanitizeMol(standardized)
         Chem.AssignStereochemistry(standardized, cleanIt=True, force=True)
+    except (RuntimeError, ValueError) as error:
+        raise ValueError(f"molecule sanitization failed: {error}") from error
+
+    for atom in standardized.GetAtoms():
+        ligand_vocabulary.charge_index(atom.GetFormalCharge())
+
+    try:
         canonical_smiles = Chem.MolToSmiles(
             standardized, canonical=True, isomericSmiles=True
         )
         Chem.Kekulize(standardized, clearAromaticFlags=True)
     except (RuntimeError, ValueError) as error:
-        raise ValueError(f"molecule sanitization or Kekulization failed: {error}") from error
+        raise ValueError(f"molecule Kekulization failed: {error}") from error
+
+    supported_bond_types = {
+        Chem.BondType.SINGLE: "single",
+        Chem.BondType.DOUBLE: "double",
+        Chem.BondType.TRIPLE: "triple",
+    }
+    for bond in standardized.GetBonds():
+        bond_type = bond.GetBondType()
+        if bond_type not in supported_bond_types:
+            raise ValueError(f"unsupported bond type: {bond_type}")
+        ligand_vocabulary.bond_index(supported_bond_types[bond_type])
 
     standardized.SetProp(CANONICAL_ISOMERIC_SMILES_PROPERTY, canonical_smiles)
     return standardized
-

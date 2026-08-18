@@ -79,6 +79,14 @@ class ChemicalVocabulary:
                 raise ValueError(f"{name} must not contain duplicate channels.")
         if any(not symbol for symbol in self.atom_symbols):
             raise ValueError("atom_symbols must contain non-empty element symbols.")
+        if self.domain == "ligand" and (
+            self.atom_symbols != LIGAND_ATOMS
+            or self.formal_charges != FORMAL_CHARGES
+            or self.bond_classes != BOND_CLASSES
+        ):
+            raise ValueError(
+                "ligand vocabulary must use the binding atom, charge, and bond tuples."
+            )
         if self.bond_classes[0] != "none":
             raise ValueError("bond_classes must place the none class first.")
 

@@ -5,6 +5,14 @@ valences supported by dataset occurrence counts. The semantic source is
 ``https://github.com/manurubo/CoCoGraph`` (MIT License, Manuel Ruiz, 2026), in
 particular its valence-distribution utilities. This module is an independent
 English implementation and does not modify or import the reference repository.
+
+Vetted base maxima follow the RDKit Book's ``Valence calculation and allowed
+valences`` table and its isoelectronic rule for charged atoms:
+``https://www.rdkit.org/docs/RDKit_Book.html#valence-calculation-and-allowed-valences``.
+The documented special maxima for ``P-2``, ``S-``, and ``Se-`` are included.
+Where RDKit lists ``-1`` as an unconstrained valence in addition to a finite
+value, this finite trajectory table conservatively uses the largest listed
+non-negative value.
 """
 
 from __future__ import annotations
@@ -21,19 +29,19 @@ ValenceKey = tuple[str, int]
 ValenceCountKey = tuple[str, int, int]
 
 
-_NEUTRAL_MAXIMA = {
-    "C": 4,
-    "N": 3,
-    "O": 2,
-    "S": 6,
-    "P": 5,
-    "F": 1,
-    "Cl": 1,
-    "Br": 1,
-    "I": 1,
-    "B": 3,
-    "Si": 4,
-    "Se": 6,
+_CHARGE_CONDITIONED_MAXIMA = {
+    "C": {-2: 2, -1: 3, 0: 4, 1: 3, 2: 2},
+    "N": {-2: 1, -1: 2, 0: 3, 1: 4, 2: 3},
+    "O": {-2: 0, -1: 1, 0: 2, 1: 3, 2: 4},
+    "S": {-2: 0, -1: 5, 0: 6, 1: 5, 2: 4},
+    "P": {-2: 5, -1: 6, 0: 5, 1: 4, 2: 3},
+    "F": {-2: 1, -1: 0, 0: 1, 1: 2, 2: 3},
+    "Cl": {-2: 1, -1: 0, 0: 1, 1: 6, 2: 5},
+    "Br": {-2: 1, -1: 0, 0: 1, 1: 6, 2: 5},
+    "I": {-2: 1, -1: 6, 0: 5, 1: 6, 2: 5},
+    "B": {-2: 3, -1: 4, 0: 3, 1: 2, 2: 1},
+    "Si": {-2: 6, -1: 5, 0: 4, 1: 3, 2: 2},
+    "Se": {-2: 0, -1: 5, 0: 6, 1: 5, 2: 4},
 }
 
 
@@ -45,18 +53,7 @@ def _default_maximum(symbol: str, charge: int) -> int:
     :return: Non-negative maximum covalent bond-order sum.
     :rtype: int
     """
-    neutral = _NEUTRAL_MAXIMA[symbol]
-    if symbol in {"F", "Cl", "Br", "I"}:
-        return {-2: 0, -1: 0, 0: 1, 1: 2, 2: 3}[charge]
-    if symbol == "O":
-        return {-2: 0, -1: 1, 0: 2, 1: 3, 2: 3}[charge]
-    if symbol == "N":
-        return {-2: 1, -1: 2, 0: 3, 1: 4, 2: 4}[charge]
-    if symbol == "B":
-        return {-2: 1, -1: 2, 0: 3, 1: 2, 2: 1}[charge]
-    if symbol in {"S", "P", "Se"}:
-        return max(0, neutral - abs(charge))
-    return max(0, neutral - abs(charge))
+    return _CHARGE_CONDITIONED_MAXIMA[symbol][charge]
 
 
 @dataclass(frozen=True)

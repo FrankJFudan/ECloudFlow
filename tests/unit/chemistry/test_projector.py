@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from rdkit import Chem
 
 from ecloudflow.chemistry.projector import ChemicalProjector
 from ecloudflow.chemistry.valence import ValenceTable
@@ -108,6 +109,26 @@ def test_projector_restores_fixed_fragment_fields():
     )
 
 
+def test_projector_reserves_fixed_bond_valence_before_scaling_mutable_edges():
+    vocab = ChemicalVocabulary.default_ligand()
+    reference = _carbon_with_four_single_bonds(vocab)
+    fixed_atoms = torch.tensor([True, True, False, False, False])
+    condition = FragmentCondition.from_atom_mask(fixed_atoms, reference)
+    mutable_overflow = reference.bond_logits.clone()
+    source, target = reference.halfedge_index
+    center_to_free = ((source == 0) | (target == 0)) & ~condition.fixed_bond_mask
+    mutable_overflow[center_to_free, vocab.bond_index("single")] = -20.0
+    mutable_overflow[center_to_free, vocab.bond_index("double")] = 20.0
+    state = reference.replace(bond_logits=mutable_overflow)
+
+    projected = ChemicalProjector(vocab).project(state, condition)
+
+    assert torch.allclose(
+        projected.expected_valence[0], projected.maximum_valence[0], atol=1.0e-5
+    )
+    assert projected.expected_valence[0] <= projected.maximum_valence[0] + 1.0e-5
+
+
 def test_projector_rejects_wrong_chemistry_channel_counts():
     vocab = ChemicalVocabulary.default_ligand()
     state = _carbon_with_four_single_bonds(vocab)
@@ -126,3 +147,15 @@ def test_valence_table_accepts_counted_dataset_extensions_deterministically():
 
     assert table.maximum("P", 0) == 5.0
 
+
+def test_default_valence_supports_rdkit_sanitized_tetrafluoroborate():
+    molecule = Chem.MolFromSmiles("[B-](F)(F)(F)F")
+    assert molecule is not None
+    boron = next(atom for atom in molecule.GetAtoms() if atom.GetSymbol() == "B")
+    rdkit_bond_order_sum = sum(
+        bond.GetBondTypeAsDouble() for bond in boron.GetBonds()
+    )
+    vocab = ChemicalVocabulary.default_ligand()
+
+    assert rdkit_bond_order_sum == 4.0
+    assert ValenceTable.default(vocab).maximum("B", -1) == rdkit_bond_order_sum
