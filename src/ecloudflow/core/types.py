@@ -6,14 +6,14 @@ import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 
 import torch
 
 from ecloudflow.core.frames import CoordinateFrame
 from ecloudflow.exceptions import ContractValidationError
 
-TensorProperty = float | int | torch.Tensor
+TensorProperty: TypeAlias = float | int | torch.Tensor
 
 
 @dataclass(frozen=True)
