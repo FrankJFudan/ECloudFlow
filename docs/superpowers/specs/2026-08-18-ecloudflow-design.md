@@ -550,6 +550,45 @@ EcloudFlow/
 
 Files remain focused: parsing does not train models, model modules do not invoke docking, evaluation does not mutate generated molecules, and CLI modules delegate to application services rather than duplicate logic.
 
+### 16.1 Python source documentation standard
+
+All Python source-code comments and docstrings must be written in English, including inline comments, module docstrings, class docstrings, public APIs, test comments, and explanatory notes. User-facing documentation may be multilingual, but Python comments must not mix Chinese text into English source files.
+
+Important functions and methods require detailed Sphinx/reStructuredText-style docstrings comparable to the approved reference image. This applies to public APIs, tensor transformations, electron-field construction and projection, stochastic-interpolant kernels, loss functions, equivariant coordinate updates, fragment masking, chemical projection and exact decoding, distributed data logic, checkpoint operations, xTB/Vina adapters, ranking, and report generation. A detailed docstring must explain:
+
+- the scientific or algorithmic purpose, including why the operation is needed;
+- every parameter through `:param <name>:` entries;
+- tensor shape, dtype, device, units, coordinate frame, masks, and accepted ranges where relevant;
+- the return structure and meanings through `:return:` and `:rtype:`;
+- raised errors through `:raises <Exception>:`;
+- invariants, side effects, numerical stability concerns, and distributed behavior when relevant.
+
+For example, a core tensor function follows this form:
+
+```python
+def project_electron_field(coefficients, centers, basis, mask):
+    """Project atom-centered electron coefficients onto a spatial field.
+
+    The projection preserves the irreducible-representation layout used by
+    the equivariant backbone and ignores padded atoms through ``mask``.
+
+    :param coefficients: Electron coefficients with shape ``[B, N, C]``.
+        The tensor must use the same floating-point dtype and device as
+        ``centers``.
+    :param centers: Atom centers with shape ``[B, N, 3]`` in angstroms,
+        expressed in the centered pocket coordinate frame.
+    :param basis: Precomputed radial and spherical-harmonic basis values.
+    :param mask: Boolean tensor with shape ``[B, N]``; ``True`` marks a
+        physical atom and ``False`` marks padding.
+    :return: A dictionary containing the reconstructed density, density
+        gradients, and integrated electron count.
+    :rtype: dict[str, torch.Tensor]
+    :raises ValueError: If shapes, devices, or irreducible layouts disagree.
+    """
+```
+
+Small private helpers may use shorter English docstrings when their contract is obvious. Comments should explain scientific intent, invariants, or non-obvious decisions instead of restating individual lines. Automated source-quality tests scan Python comment tokens and docstring nodes for disallowed CJK text and verify that designated core APIs contain the required documentation fields.
+
 ## 17. Error handling and observability
 
 `ecloudflow doctor` checks Python packages, CUDA/GPU visibility, xTB, Vina/QVina, OpenBabel where configured, dataset paths, write permissions, and checkpoint compatibility. Missing optional tools disable only the named metrics after an explicit warning; missing required tools fail before an expensive run begins.
@@ -571,6 +610,7 @@ Logging supports console, CSV, TensorBoard, and optional Weights & Biases. Crede
 - deterministic ranking and IDs such as `3ZTX-000001`;
 - SA directionality and Vina ascending-sort convention;
 - config bounds, unknown-key rejection, and resolved-config serialization.
+- English-only Python comments/docstrings and required detailed fields on designated core APIs.
 
 ### 18.2 Integration tests
 
@@ -603,6 +643,7 @@ The implementation is accepted when:
 6. sampling count, bounded attempts, docking-based ranking, IDs without `ECLF`, CSV/Parquet/Excel/SDF output, and aggregate statistics match this specification;
 7. README and theory/data/training/sampling/evaluation/visualization/distributed documents contain no incomplete placeholders;
 8. no unmeasured SOTA or binding-quality claim is presented as a result.
+9. every Python comment/docstring is English, and designated important functions pass the detailed docstring contract check.
 
 ## 19. Documentation deliverables
 
@@ -618,4 +659,3 @@ The implementation is accepted when:
 - Huang et al., “Learning Joint 2D & 3D Diffusion Models for Complete Molecule Generation,” arXiv:2305.12347.
 - Ruiz-Botella et al., “A collaborative constrained graph diffusion model for the generation of realistic synthetic molecules,” arXiv:2505.16365.
 - Cremer et al., “FLOWR: flow matching for structure-aware de novo, interaction- and fragment-based ligand generation,” *Nature Computational Science* 6, 565–574 (2026), DOI: 10.1038/s43588-026-00998-8.
-
