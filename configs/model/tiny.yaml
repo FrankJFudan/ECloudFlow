@@ -1,0 +1,5 @@
+name: tiny
+scalar_dim: 64
+vector_dim: 16
+num_blocks: 3
+lmax: 2

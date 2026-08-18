@@ -1,0 +1,6 @@
+profile: quality
+num_molecules: 100
+max_attempts: null
+solver: heun
+num_steps: 100
+corrector_steps: 8

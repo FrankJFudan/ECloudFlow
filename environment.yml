@@ -1,0 +1,10 @@
+name: ecloudflow
+channels:
+  - conda-forge
+  - pytorch
+  - pyg
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - -e ".[dev,train,eval,viz]"

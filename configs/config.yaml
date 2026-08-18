@@ -1,0 +1,6 @@
+defaults:
+  - model: tiny
+  - sample: balanced
+  - _self_
+
+seed: 2026

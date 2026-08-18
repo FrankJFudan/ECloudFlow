@@ -1,0 +1,5 @@
+name: large
+scalar_dim: 256
+vector_dim: 64
+num_blocks: 14
+lmax: 4

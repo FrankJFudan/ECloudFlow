@@ -1,0 +1,5 @@
+name: base
+scalar_dim: 128
+vector_dim: 32
+num_blocks: 8
+lmax: 3
