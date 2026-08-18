@@ -22,15 +22,16 @@ def test_basis_exposes_contiguous_e3nn_irrep_slices():
     ]
 
 
-def test_first_radial_channel_is_the_normalized_constant_monopole():
-    cutoff = 2.0
-    basis = SphericalFieldBasis(n_radial=3, lmax=1, cutoff=cutoff)
-    radii = torch.tensor([0.0, 0.7, cutoff], dtype=torch.float64)
+def test_l0_radial_channels_are_smooth_at_atom_center():
+    basis = SphericalFieldBasis(n_radial=3, lmax=1, cutoff=2.0)
+    radii = torch.tensor([0.0, 1e-6], dtype=torch.float64, requires_grad=True)
 
     values = basis.radial_values(radii)
+    gradient = torch.autograd.grad(values.sum(), radii)[0]
 
-    expected = math.sqrt(3.0 / cutoff**3)
-    assert torch.allclose(values[:, 0], torch.full((3,), expected, dtype=torch.float64))
+    assert torch.allclose(values[0], values[1], atol=1e-10, rtol=1e-10)
+    assert gradient[0] == 0.0
+    assert abs(gradient[1]) < 1e-3
 
 
 def test_radial_channels_have_compact_cutoff_support():
@@ -41,11 +42,12 @@ def test_radial_channels_have_compact_cutoff_support():
     assert values.equal(torch.zeros((1, 3), dtype=torch.float64))
 
 
-def test_radial_channels_are_orthonormal_under_spherical_volume_measure():
+@pytest.mark.parametrize("order", [0, 1, 2])
+def test_radial_channels_are_orthonormal_under_spherical_volume_measure(order):
     basis = SphericalFieldBasis(n_radial=5, lmax=2, cutoff=3.5)
     step = basis.cutoff / 20_000
     radii = (torch.arange(20_000, dtype=torch.float64) + 0.5) * step
-    values = basis.radial_values(radii)
+    values = basis.radial_values(radii, order=order)
 
     gram = values.T @ (values * (radii.square() * step).unsqueeze(-1))
 
@@ -95,3 +97,50 @@ def test_basis_rejects_out_of_range_angular_slice():
 
     with pytest.raises(ValueError, match="angular order"):
         basis.l_slice(3)
+
+
+def test_nonscalar_basis_is_regular_with_bounded_gradient_at_atom_center():
+    basis = SphericalFieldBasis(n_radial=3, lmax=2, cutoff=3.0)
+    radii = torch.tensor([0.0, 1e-6, 2e-6], dtype=torch.float64)
+    vectors = torch.zeros((3, 3), dtype=torch.float64)
+    vectors[:, 0] = radii
+    vectors.requires_grad_()
+
+    l1_values = basis.evaluate(vectors)[:, 0, basis.l_slice(1)].sum(dim=-1)
+    gradient = torch.autograd.grad(l1_values.sum(), vectors)[0]
+
+    assert l1_values[0] == 0.0
+    assert abs(l1_values[1]) < 1e-5
+    assert torch.allclose(l1_values[2], 2.0 * l1_values[1], atol=1e-10, rtol=2e-5)
+    assert torch.isfinite(gradient).all()
+    assert gradient.norm(dim=-1).max() < 10.0
+
+
+def test_radial_basis_and_gradient_vanish_continuously_at_cutoff():
+    cutoff = 3.0
+    basis = SphericalFieldBasis(n_radial=3, lmax=2, cutoff=cutoff)
+    radii = torch.tensor(
+        [cutoff - 1e-4, cutoff, cutoff + 1e-4],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    values = basis.radial_values(radii, order=0)[:, 0]
+    gradient = torch.autograd.grad(values.sum(), radii)[0]
+
+    assert abs(values[0]) < 1e-6
+    assert values[1:].equal(torch.zeros(2, dtype=torch.float64))
+    assert abs(gradient[0]) < 1e-3
+    assert gradient[1:].equal(torch.zeros(2, dtype=torch.float64))
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_radial_order_has_required_power_l_origin_behavior(order):
+    basis = SphericalFieldBasis(n_radial=3, lmax=2, cutoff=3.0)
+    radii = torch.tensor([0.0, 1e-5, 2e-5], dtype=torch.float64)
+
+    values = basis.radial_values(radii, order=order)
+    scaled = values[1:] / radii[1:, None] ** order
+
+    assert values[0].equal(torch.zeros(3, dtype=torch.float64))
+    assert torch.allclose(scaled[0], scaled[1], atol=1e-5, rtol=1e-5)

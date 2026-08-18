@@ -6,12 +6,17 @@ import pytest
 import torch
 from e3nn import o3
 
+from ecloudflow.core.frames import CoordinateFrame
+from ecloudflow.core.types import ElectronField
 from ecloudflow.ecloud.basis import SphericalFieldBasis
 from ecloudflow.ecloud.field import (
+    electron_field_multipole_moments,
     integrated_electron_count,
     multipole_moments,
     project_density_to_atoms,
+    project_electron_field_to_atoms,
     reconstruct_density,
+    reconstruct_electron_field,
 )
 
 
@@ -327,3 +332,214 @@ def test_projection_rejects_cross_device_inputs():
 
     with pytest.raises(ValueError, match="device"):
         project_density_to_atoms(density.cuda(), grid, centers, weights, basis)
+
+
+def test_electron_field_projection_applies_masks_and_isolates_batches():
+    frame = CoordinateFrame(torch.zeros(3, dtype=torch.float64))
+    field = ElectronField(
+        positions=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.2, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        values=torch.tensor([[1.0], [3.0], [100.0]], dtype=torch.float64),
+        mask=torch.tensor([True, True, False]),
+        batch=torch.tensor([0, 1, 0], dtype=torch.long),
+        channel_names=("density",),
+        frame=frame,
+    )
+    centers = torch.zeros((2, 3), dtype=torch.float64)
+    center_batch = torch.tensor([0, 1], dtype=torch.long)
+    weights = torch.ones(3, dtype=torch.float64)
+    basis = SphericalFieldBasis(2, 1, 2.0)
+
+    projected = project_electron_field_to_atoms(
+        field,
+        centers,
+        center_batch,
+        weights,
+        basis,
+        centers_frame=frame,
+    )
+    expected_first = project_density_to_atoms(
+        field.values[:1, 0], field.positions[:1], centers[:1], weights[:1], basis
+    )
+    expected_second = project_density_to_atoms(
+        field.values[1:2, 0], field.positions[1:2], centers[1:], weights[1:2], basis
+    )
+
+    assert torch.allclose(projected.values[0], expected_first[0])
+    assert torch.allclose(projected.values[1], expected_second[0])
+
+
+def test_electron_field_projection_rejects_mismatched_center_frame():
+    field_frame = CoordinateFrame(torch.zeros(3))
+    field = ElectronField(
+        positions=torch.zeros((1, 3)),
+        values=torch.ones((1, 1)),
+        mask=torch.tensor([True]),
+        batch=torch.tensor([0], dtype=torch.long),
+        channel_names=("density",),
+        frame=field_frame,
+    )
+    wrong_frame = CoordinateFrame(torch.tensor([1.0, 0.0, 0.0]))
+
+    with pytest.raises(ValueError, match="frame"):
+        project_electron_field_to_atoms(
+            field,
+            torch.zeros((1, 3)),
+            torch.tensor([0], dtype=torch.long),
+            torch.ones(1),
+            SphericalFieldBasis(2, 1, 2.0),
+            centers_frame=wrong_frame,
+        )
+
+
+def test_electron_field_projection_requires_explicit_frame_provenance():
+    field = ElectronField(
+        positions=torch.zeros((1, 3)),
+        values=torch.ones((1, 1)),
+        mask=torch.tensor([True]),
+        batch=torch.tensor([0], dtype=torch.long),
+        channel_names=("density",),
+        frame=None,
+    )
+
+    with pytest.raises(ValueError, match="frame"):
+        project_electron_field_to_atoms(
+            field,
+            torch.zeros((1, 3)),
+            torch.tensor([0], dtype=torch.long),
+            torch.ones(1),
+            SphericalFieldBasis(2, 1, 2.0),
+            centers_frame=CoordinateFrame(torch.zeros(3)),
+        )
+
+
+def test_electron_field_reconstruction_rejects_query_in_another_frame():
+    frame = CoordinateFrame(torch.zeros(3))
+    field = ElectronField(
+        positions=torch.zeros((1, 3)),
+        values=torch.ones((1, 1)),
+        mask=torch.tensor([True]),
+        batch=torch.tensor([0], dtype=torch.long),
+        channel_names=("density",),
+        frame=frame,
+    )
+    projected = project_electron_field_to_atoms(
+        field,
+        torch.zeros((1, 3)),
+        torch.tensor([0], dtype=torch.long),
+        torch.ones(1),
+        SphericalFieldBasis(2, 1, 2.0),
+        centers_frame=frame,
+    )
+    query = ElectronField(
+        positions=torch.zeros((1, 3)),
+        values=torch.zeros((1, 1)),
+        mask=torch.tensor([True]),
+        batch=torch.tensor([0], dtype=torch.long),
+        frame=CoordinateFrame(torch.tensor([1.0, 0.0, 0.0])),
+    )
+
+    with pytest.raises(ValueError, match="frame"):
+        reconstruct_electron_field(projected, query)
+
+
+def test_electron_field_reconstruction_applies_masks_and_isolates_batches():
+    frame = CoordinateFrame(torch.zeros(3, dtype=torch.float64))
+    source = ElectronField(
+        positions=torch.zeros((2, 3), dtype=torch.float64),
+        values=torch.tensor([[1.0], [3.0]], dtype=torch.float64),
+        mask=torch.tensor([True, True]),
+        batch=torch.tensor([0, 1], dtype=torch.long),
+        channel_names=("density",),
+        frame=frame,
+    )
+    centers = torch.zeros((2, 3), dtype=torch.float64)
+    center_batch = torch.tensor([0, 1], dtype=torch.long)
+    basis = SphericalFieldBasis(2, 1, 2.0)
+    projected = project_electron_field_to_atoms(
+        source,
+        centers,
+        center_batch,
+        torch.ones(2, dtype=torch.float64),
+        basis,
+        centers_frame=frame,
+    )
+    query = ElectronField(
+        positions=torch.tensor(
+            [[0.2, 0.0, 0.0], [0.2, 0.0, 0.0], [0.1, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        values=torch.zeros((3, 1), dtype=torch.float64),
+        mask=torch.tensor([True, True, False]),
+        batch=torch.tensor([0, 1, 1], dtype=torch.long),
+        frame=frame,
+    )
+
+    reconstructed = reconstruct_electron_field(projected, query)
+    expected_first = reconstruct_density(
+        projected.values[:1], query.positions[:1], centers[:1], basis
+    )
+    expected_second = reconstruct_density(
+        projected.values[1:], query.positions[1:2], centers[1:], basis
+    )
+
+    assert torch.allclose(reconstructed.values[:1, 0], expected_first)
+    assert torch.allclose(reconstructed.values[1:2, 0], expected_second)
+    assert reconstructed.values[2, 0] == 0.0
+
+
+def test_electron_field_multipoles_apply_masks_and_reduce_each_batch():
+    frame = CoordinateFrame(torch.zeros(3, dtype=torch.float64))
+    field = ElectronField(
+        positions=torch.tensor(
+            [[1.0, 0.0, 0.0], [100.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        values=torch.tensor([[2.0], [100.0], [3.0]], dtype=torch.float64),
+        mask=torch.tensor([True, False, True]),
+        batch=torch.tensor([0, 0, 2], dtype=torch.long),
+        channel_names=("density",),
+        frame=frame,
+    )
+
+    moments = electron_field_multipole_moments(
+        field, torch.tensor([0.5, 9.0, 0.25], dtype=torch.float64)
+    )
+
+    assert torch.equal(moments.batch, torch.tensor([0, 2], dtype=torch.long))
+    assert torch.allclose(
+        moments.electron_count,
+        torch.tensor([1.0, 0.75], dtype=torch.float64),
+    )
+    assert moments.frame is frame
+
+
+def test_atom_projection_vanishes_smoothly_as_center_crosses_cutoff():
+    cutoff = 2.0
+    basis = SphericalFieldBasis(2, 1, cutoff)
+
+    def projected_norm(distance: float) -> tuple[float, float]:
+        center = torch.tensor(
+            [[distance, 0.0, 0.0]], dtype=torch.float64, requires_grad=True
+        )
+        coefficients = project_density_to_atoms(
+            torch.ones(1, dtype=torch.float64),
+            torch.zeros((1, 3), dtype=torch.float64),
+            center,
+            torch.ones(1, dtype=torch.float64),
+            basis,
+        )
+        value = coefficients.square().sum()
+        gradient = torch.autograd.grad(value, center)[0]
+        return value.item(), gradient.norm().item()
+
+    inside_value, inside_gradient = projected_norm(cutoff - 1e-4)
+    boundary_value, boundary_gradient = projected_norm(cutoff)
+    outside_value, outside_gradient = projected_norm(cutoff + 1e-4)
+
+    assert inside_value < 1e-10
+    assert inside_gradient < 1e-5
+    assert boundary_value == outside_value == 0.0
+    assert boundary_gradient == outside_gradient == 0.0

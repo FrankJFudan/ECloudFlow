@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from e3nn import o3
@@ -30,10 +31,8 @@ def _validate_float_tensor(tensor: torch.Tensor, name: str) -> None:
 class SphericalFieldBasis:
     """Define an atom-centered radial and real-spherical-harmonic basis.
 
-    :param n_radial: Positive number ``R`` of compact radial channels. Channel
-        zero is the normalized constant on the cutoff ball; later channels
-        are orthogonalized spherical-Bessel ``sin(k pi r / cutoff) / r``
-        functions.
+    :param n_radial: Positive number ``R`` of compact radial channels derived
+        from regularized spherical-Bessel ``sinc(n r / cutoff)`` functions.
     :param lmax: Largest non-negative angular order. Harmonics are packed in
         e3nn order, with order ``l`` in ``[l**2:(l+1)**2]`` and total size
         ``H = (lmax + 1) ** 2``.
@@ -45,13 +44,16 @@ class SphericalFieldBasis:
     :raises ValueError: If a count is invalid, ``cutoff`` is non-finite or
         non-positive, or ``chunk_size`` is not positive.
 
-    Radial functions are orthonormal under ``integral r**2 dr`` on
-    ``[0, cutoff]``. Harmonics use ``e3nn.o3.spherical_harmonics`` with
-    ``normalization="integral"``. Consequently every ``l`` slice transforms
-    as one real e3nn irrep ``l`` with parity ``(-1)**l``. The constant radial
-    channel makes the continuous integral of the reconstructed ``l=0`` block
-    equal to its projected electron count. FP16 and BF16 inputs are evaluated
-    in float32; float32 and float64 inputs retain their dtype.
+    For angular order ``l``, raw radial functions are proportional to
+    ``(r/cutoff)**l * (1-(r/cutoff)**2)**2 * sinc(n*r/cutoff)``. They are
+    orthonormalized under ``integral r**2 dr`` on ``[0, cutoff]``. The
+    ``r**l`` factor makes their product with ``Y_lm`` a regular solid harmonic
+    at atom centers, while the envelope gives zero value and first derivative
+    at the cutoff. Harmonics use ``e3nn.o3.spherical_harmonics`` with integral
+    normalization, so every ``l`` slice transforms as one real e3nn irrep
+    with parity ``(-1)**l``. FP16 and BF16 inputs are evaluated in float32;
+    float32 and float64 inputs retain their dtype. Radial normalization gives
+    every channel units of inverse angstroms to the power ``3/2``.
     """
 
     n_radial: int
@@ -117,56 +119,60 @@ class SphericalFieldBasis:
             raise ValueError("angular order must be an integer in [0, lmax].")
         return slice(order**2, (order + 1) ** 2)
 
-    def radial_values(self, radii: torch.Tensor) -> torch.Tensor:
-        """Evaluate normalized compact radial functions.
+    def radial_values(self, radii: torch.Tensor, order: int = 0) -> torch.Tensor:
+        """Evaluate normalized compact radial functions for one angular order.
 
         :param radii: Non-negative radii with arbitrary shape in angstroms.
+        :param order: Angular order between zero and ``lmax``. Every returned
+            channel behaves as ``r**order`` at the origin.
         :return: Radial values with shape ``[*radii.shape, R]`` on the same
             device. FP16/BF16 inputs produce float32 output for stability;
             other floating dtypes are preserved.
         :rtype: torch.Tensor
         :raises TypeError: If ``radii`` is not a tensor.
-        :raises ValueError: If radii are non-floating, non-finite, or negative.
+        :raises ValueError: If radii are non-floating, non-finite, negative, or
+            ``order`` is outside the represented range.
 
-        The raw Bessel candidates are analytically orthonormal among
-        themselves. A Cholesky inverse of their analytic Gram matrix with the
-        constant monopole performs deterministic Gram-Schmidt
-        orthogonalization without sampled normalization error.
+        A cached float64 midpoint quadrature constructs the Cholesky
+        orthonormalizer for each ``l``. Evaluation itself stays differentiable
+        with respect to radii. The polynomial cutoff envelope and Bessel
+        candidates have zero radial derivative at the origin; the envelope
+        and its first derivative vanish at ``cutoff``.
         """
         _validate_float_tensor(radii, "radii")
+        self.l_slice(order)
         if bool((radii < 0).any()):
             raise ValueError("radii must be non-negative.")
         dtype = _working_dtype(radii.dtype)
         with torch.autocast(device_type=radii.device.type, enabled=False):
             work_radii = radii.to(dtype=dtype)
-            constant = math.sqrt(3.0 / self.cutoff**3)
-            constant_values = torch.full_like(work_radii, constant).unsqueeze(-1)
-            if self.n_radial == 1:
-                values = constant_values
-            else:
-                orders = torch.arange(
-                    1,
-                    self.n_radial,
-                    dtype=dtype,
-                    device=radii.device,
-                )
-                frequencies = orders * (math.pi / self.cutoff)
-                safe_radii = torch.where(
-                    work_radii == 0,
-                    torch.ones_like(work_radii),
-                    work_radii,
-                )
-                arguments = work_radii.unsqueeze(-1) * frequencies
-                bessel = math.sqrt(2.0 / self.cutoff) * (
-                    torch.sin(arguments) / safe_radii.unsqueeze(-1)
-                )
-                limits = math.sqrt(2.0 / self.cutoff) * frequencies
-                bessel = torch.where((work_radii == 0).unsqueeze(-1), limits, bessel)
-                raw_values = torch.cat((constant_values, bessel), dim=-1)
-                transform = self._radial_orthonormalizer(dtype, radii.device)
-                values = raw_values @ transform
-            support = (work_radii <= self.cutoff).unsqueeze(-1)
+            scaled = work_radii / self.cutoff
+            profiles = self._regular_profiles(scaled, order)
+            values = profiles * scaled.unsqueeze(-1).pow(order)
+            support = (work_radii < self.cutoff).unsqueeze(-1)
             return torch.where(support, values, torch.zeros_like(values))
+
+    def monopole_integrals(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """Return continuous-volume integrals of the ``l=0`` basis functions.
+
+        :param dtype: Floating output dtype used by field accumulation.
+        :param device: Output device used by the coefficient tensor.
+        :return: Tensor with shape ``[R]`` containing
+            ``integral R_n(r) Y_00 dV`` in angstroms to the power ``3/2``.
+        :rtype: torch.Tensor
+        :raises ValueError: If ``dtype`` is not floating.
+
+        These analytically scaled, high-order numerical basis constants enable
+        a conservation-constrained Galerkin correction. They depend only on
+        the basis, never on a fixture or requested electron count.
+        """
+        if not dtype.is_floating_point:
+            raise ValueError("dtype must be floating point.")
+        _, dimensionless_integrals = _cached_radial_data(self.n_radial, 0)
+        scale = self.cutoff**1.5 * math.sqrt(4.0 * math.pi)
+        return dimensionless_integrals.to(dtype=dtype, device=device) * scale
 
     def spherical_harmonics(self, vectors: torch.Tensor) -> torch.Tensor:
         """Evaluate e3nn real spherical harmonics through ``lmax``.
@@ -222,26 +228,65 @@ class SphericalFieldBasis:
         :raises TypeError: If ``vectors`` is not a tensor.
         :raises ValueError: If vectors have invalid shape, dtype, or values.
         """
-        harmonics = self.spherical_harmonics(vectors)
-        radii = torch.linalg.vector_norm(vectors.to(harmonics.dtype), dim=-1)
-        radial = self.radial_values(radii)
-        return radial.unsqueeze(-1) * harmonics.unsqueeze(-2)
-
-    def _radial_orthonormalizer(
-        self, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        """Build the analytic Cholesky inverse for the radial Gram matrix."""
-        gram = torch.eye(self.n_radial, dtype=dtype, device=device)
-        if self.n_radial > 1:
-            orders = torch.arange(1, self.n_radial, dtype=dtype, device=device)
-            signs = torch.where(
-                orders.remainder(2) == 1,
-                torch.ones_like(orders),
-                -torch.ones_like(orders),
+        _validate_float_tensor(vectors, "vectors")
+        if vectors.ndim == 0 or vectors.shape[-1] != 3:
+            raise ValueError("vectors must have shape [..., 3].")
+        dtype = _working_dtype(vectors.dtype)
+        with torch.autocast(device_type=vectors.device.type, enabled=False):
+            work_vectors = vectors.to(dtype=dtype)
+            scaled_vectors = work_vectors / self.cutoff
+            scaled_radii = torch.linalg.vector_norm(scaled_vectors, dim=-1)
+            solid_harmonics = o3.spherical_harmonics(
+                list(range(self.lmax + 1)),
+                scaled_vectors,
+                normalize=False,
+                normalization="integral",
             )
-            overlaps = math.sqrt(6.0) * signs / (math.pi * orders)
-            gram[0, 1:] = overlaps
-            gram[1:, 0] = overlaps
-        cholesky = torch.linalg.cholesky(gram)
-        identity = torch.eye(self.n_radial, dtype=dtype, device=device)
-        return torch.linalg.solve_triangular(cholesky.T, identity, upper=True)
+            blocks = []
+            for order in range(self.lmax + 1):
+                profiles = self._regular_profiles(scaled_radii, order)
+                harmonic_block = solid_harmonics[..., self.l_slice(order)]
+                blocks.append(profiles.unsqueeze(-1) * harmonic_block.unsqueeze(-2))
+            return torch.cat(blocks, dim=-1)
+
+    def _regular_profiles(self, scaled_radii: torch.Tensor, order: int) -> torch.Tensor:
+        """Evaluate radial profiles multiplying regular solid harmonics."""
+        raw = _dimensionless_profiles(scaled_radii, self.n_radial)
+        transform, _ = _cached_radial_data(self.n_radial, order)
+        work_transform = transform.to(
+            dtype=scaled_radii.dtype, device=scaled_radii.device
+        )
+        profiles = raw @ work_transform / self.cutoff**1.5
+        support = (scaled_radii < 1.0).unsqueeze(-1)
+        return torch.where(support, profiles, torch.zeros_like(profiles))
+
+
+def _dimensionless_profiles(scaled_radii: torch.Tensor, n_radial: int) -> torch.Tensor:
+    """Evaluate smooth cutoff Bessel profiles before orthonormalization."""
+    channels = torch.arange(
+        1,
+        n_radial + 1,
+        dtype=scaled_radii.dtype,
+        device=scaled_radii.device,
+    )
+    envelope = (1.0 - scaled_radii.square()).square().unsqueeze(-1)
+    return envelope * torch.sinc(scaled_radii.unsqueeze(-1) * channels)
+
+
+@lru_cache(maxsize=128)
+def _cached_radial_data(n_radial: int, order: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build float64 radial orthonormalizers and monopole integrals."""
+    quadrature_size = 32_768
+    scaled_radii = (
+        torch.arange(quadrature_size, dtype=torch.float64) + 0.5
+    ) / quadrature_size
+    profiles = _dimensionless_profiles(scaled_radii, n_radial)
+    raw_radial = profiles * scaled_radii.unsqueeze(-1).pow(order)
+    weights = scaled_radii.square() / quadrature_size
+    gram = raw_radial.T @ (raw_radial * weights.unsqueeze(-1))
+    cholesky = torch.linalg.cholesky(gram)
+    identity = torch.eye(n_radial, dtype=torch.float64)
+    transform = torch.linalg.solve_triangular(cholesky.T, identity, upper=True)
+    normalized = raw_radial @ transform
+    integrals = torch.sum(normalized * weights.unsqueeze(-1), dim=0)
+    return transform, integrals
