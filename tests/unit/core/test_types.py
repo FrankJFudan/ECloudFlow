@@ -107,6 +107,27 @@ def test_generation_condition_rejects_field_frame_and_batch_mismatches():
         GenerationCondition(pocket=pocket, pocket_field=wrong_batch_field)
 
 
+def test_generation_condition_rejects_fragment_in_a_different_coordinate_frame(
+    molecular_state_factory: Callable[[int], MolecularState],
+):
+    pocket_frame = CoordinateFrame(torch.zeros(3))
+    pocket = PocketGraph(
+        positions=torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        features=torch.tensor([[1.0], [2.0]]),
+        batch=torch.tensor([0, 0], dtype=torch.long),
+        frame=pocket_frame,
+    )
+    reference = molecular_state_factory().replace(
+        frame=CoordinateFrame(torch.tensor([5.0, 0.0, 0.0]))
+    )
+    fragment = FragmentCondition.from_atom_mask(
+        torch.tensor([True, False, True]), reference
+    )
+
+    with pytest.raises(ContractValidationError, match="frame"):
+        GenerationCondition(pocket=pocket, fragment=fragment)
+
+
 def test_complex_sample_rejects_inconsistent_batch_membership():
     frame = CoordinateFrame(torch.zeros(3))
     pocket = PocketGraph(
@@ -170,6 +191,7 @@ def test_other_public_contracts_accept_consistent_local_complex():
         electron_latent=torch.tensor([[0.0], [1.0]]),
         node_batch=ligand.batch,
         halfedge_batch=torch.tensor([0], dtype=torch.long),
+        frame=frame,
     )
     fragment = FragmentCondition.from_atom_mask(torch.tensor([True, False]), state)
     condition = GenerationCondition(pocket=pocket, fragment=fragment)

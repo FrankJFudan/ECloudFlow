@@ -6,6 +6,7 @@ import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import Any, cast
 
 import torch
 
@@ -205,6 +206,8 @@ class MolecularState:
         ``torch.long`` dtype/device matching ``positions``.
     :param halfedge_batch: Complex index per halfedge with shape ``[E]`` and
         ``torch.long`` dtype/device matching ``positions``.
+    :param frame: Optional centered pocket coordinate frame for ``positions``.
+        When supplied, it must share the positions floating dtype/device.
     :return: Immutable molecular state used by training and sampling.
     :rtype: MolecularState
     :raises ContractValidationError: If node counts, ranks, finite values,
@@ -223,6 +226,7 @@ class MolecularState:
     electron_latent: torch.Tensor
     node_batch: torch.Tensor
     halfedge_batch: torch.Tensor
+    frame: CoordinateFrame | None = None
 
     def __post_init__(self) -> None:
         """Validate state tensor ranks, batches, and halfedge invariants.
@@ -258,11 +262,21 @@ class MolecularState:
         _validate_halfedge_batches(
             self.halfedge_index, self.node_batch, self.halfedge_batch
         )
+        if self.frame is not None and (
+            self.frame.origin.dtype != self.positions.dtype
+            or self.frame.origin.device != self.positions.device
+        ):
+            raise ContractValidationError(
+                "frame must have the same dtype and device as state positions."
+            )
 
-    def replace(self, **changes: torch.Tensor) -> MolecularState:
+    def replace(
+        self, **changes: torch.Tensor | CoordinateFrame | None
+    ) -> MolecularState:
         """Return a revalidated state with selected tensor fields replaced.
 
-        :param changes: Keyword tensor replacements for dataclass fields.
+        :param changes: Keyword tensor or coordinate-frame replacements for
+            dataclass fields.
         :return: New immutable molecular state after all invariants are checked.
         :rtype: MolecularState
         :raises TypeError: If a replacement is not a molecular-state field.
@@ -273,7 +287,7 @@ class MolecularState:
         nor copies tensors. The original state remains bound to its original
         tensor attributes.
         """
-        return dataclasses.replace(self, **changes)
+        return dataclasses.replace(self, **cast(Any, changes))
 
 
 @dataclass(frozen=True)
@@ -493,6 +507,14 @@ class GenerationCondition:
                 raise ContractValidationError(
                     "fragment reference must share the pocket coordinate dtype and device."
                 )
+            if self.pocket.frame is None or reference.frame is None:
+                raise ContractValidationError(
+                    "pocket and fragment reference must both declare a coordinate frame."
+                )
+            if self.pocket.frame != reference.frame:
+                raise ContractValidationError(
+                    "fragment reference frame must equal the pocket coordinate frame."
+                )
             _validate_batch_membership(
                 self.pocket.batch, reference.node_batch, "fragment reference"
             )
@@ -640,6 +662,14 @@ class ComplexSample:
                 "fragment reference positions must match the sample ligand positions."
             )
         if self.fragment is not None:
+            if self.fragment.reference.frame is None:
+                raise ContractValidationError(
+                    "fragment reference must declare the sample coordinate frame."
+                )
+            if self.fragment.reference.frame != self.frame:
+                raise ContractValidationError(
+                    "fragment reference frame must equal the sample coordinate frame."
+                )
             _validate_batch_membership(
                 self.ligand.batch,
                 self.fragment.reference.node_batch,
