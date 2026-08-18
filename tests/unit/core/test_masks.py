@@ -2,10 +2,12 @@
 
 from collections.abc import Callable
 
+import pytest
 import torch
 
 from ecloudflow.core.masks import clamp_fragment
 from ecloudflow.core.types import FragmentCondition, MolecularState
+from ecloudflow.exceptions import ContractValidationError, FragmentInvariantError
 
 
 def find_halfedge(halfedge_index: torch.Tensor, source: int, target: int) -> int:
@@ -48,6 +50,11 @@ def test_clamp_fragment_restores_all_fixed_fields(
         clamped.charge_logits[[0, 2]], reference.charge_logits[[0, 2]]
     )
     assert torch.equal(clamped.bond_logits[edge_0_2], reference.bond_logits[edge_0_2])
+    assert torch.equal(clamped.positions[1], noisy.positions[1])
+    assert torch.equal(clamped.atom_logits[1], noisy.atom_logits[1])
+    assert torch.equal(clamped.charge_logits[1], noisy.charge_logits[1])
+    assert torch.equal(clamped.bond_logits[0], noisy.bond_logits[0])
+    assert torch.equal(clamped.bond_logits[2], noisy.bond_logits[2])
 
 
 def test_fragment_mask_marks_only_complete_fixed_halfedges(
@@ -60,3 +67,32 @@ def test_fragment_mask_marks_only_complete_fixed_halfedges(
 
     assert torch.equal(condition.fixed_bond_mask, torch.tensor([False, True, False]))
     assert torch.equal(condition.fixed_coord_mask, condition.fixed_atom_mask)
+
+
+def test_fragment_condition_rejects_coordinate_masks_that_do_not_match_fixed_atoms(
+    molecular_state_factory: Callable[[int], MolecularState],
+):
+    reference = molecular_state_factory()
+    fixed_atoms = torch.tensor([True, False, True])
+
+    with pytest.raises(ContractValidationError, match="fixed_coord_mask"):
+        FragmentCondition.from_atom_mask(
+            fixed_atoms,
+            reference,
+            fixed_coord_mask=torch.tensor([True, True, False]),
+        )
+
+
+def test_clamp_fragment_raises_typed_exception_for_mismatched_topology(
+    molecular_state_factory: Callable[[int], MolecularState],
+):
+    reference = molecular_state_factory()
+    condition = FragmentCondition.from_atom_mask(
+        torch.tensor([True, False, True]), reference
+    )
+    incompatible = reference.replace(
+        halfedge_index=torch.tensor([[0, 1, 0], [1, 2, 2]], dtype=torch.long)
+    )
+
+    with pytest.raises(FragmentInvariantError, match="halfedge_index"):
+        clamp_fragment(incompatible, condition)

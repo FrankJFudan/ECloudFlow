@@ -27,6 +27,8 @@ class PocketGraph:
         ``torch.long`` dtype/device matching ``positions``.
     :param atom_numbers: Optional atomic numbers with shape ``[P]`` and
         ``torch.long`` dtype/device matching ``positions``.
+    :param frame: Optional centered pocket coordinate frame. When supplied it
+        must have the same floating dtype/device as ``positions``.
     :return: Immutable canonical pocket graph.
     :rtype: PocketGraph
     :raises ContractValidationError: If ranks, dtypes, devices, finite values,
@@ -40,6 +42,7 @@ class PocketGraph:
     features: torch.Tensor
     batch: torch.Tensor
     atom_numbers: torch.Tensor | None = None
+    frame: CoordinateFrame | None = None
 
     def __post_init__(self) -> None:
         """Validate pocket tensor shapes and compatibility.
@@ -55,6 +58,13 @@ class PocketGraph:
         if self.atom_numbers is not None:
             _validate_index_vector(
                 self.atom_numbers, "atom_numbers", count, self.positions
+            )
+        if self.frame is not None and (
+            self.frame.origin.dtype != self.positions.dtype
+            or self.frame.origin.device != self.positions.device
+        ):
+            raise ContractValidationError(
+                "frame must have the same dtype and device as pocket positions."
             )
 
 
@@ -101,7 +111,7 @@ class LigandGraph:
         """
         count = _validate_positions(self.positions, "positions", nonempty=True)
         _validate_index_vector(self.atom_types, "atom_types", count, self.positions)
-        _validate_index_vector(
+        _validate_signed_long_vector(
             self.formal_charges, "formal_charges", count, self.positions
         )
         _validate_index_vector(self.batch, "batch", count, self.positions)
@@ -278,7 +288,8 @@ class FragmentCondition:
         on the reference device. It is true exactly when both endpoints are
         fixed atoms and is therefore symmetric for unordered endpoint pairs.
     :param fixed_coord_mask: Boolean coordinate mask with shape ``[N]`` on the
-        reference device.
+        reference device. It must exactly equal ``fixed_atom_mask`` so fixed
+        coordinates are restored and free coordinates remain generative.
     :param attachment_mask: Boolean atom mask with shape ``[N]`` identifying
         allowed fixed-to-free attachment sites on the reference device.
     :param component_ids: Optional ``torch.long`` component labels with shape
@@ -348,6 +359,10 @@ class FragmentCondition:
             raise ContractValidationError(
                 "fixed_bond_mask must select exactly the internal fixed halfedges."
             )
+        if not torch.equal(self.fixed_coord_mask, self.fixed_atom_mask):
+            raise ContractValidationError(
+                "fixed_coord_mask must exactly equal fixed_atom_mask."
+            )
         if bool((self.attachment_mask & ~self.fixed_atom_mask).any()):
             raise ContractValidationError(
                 "attachment_mask may contain only fixed fragment atoms."
@@ -370,7 +385,8 @@ class FragmentCondition:
             reference device; true entries preserve atom type and charge.
         :param reference: Clean canonical state that supplies values to clamp.
         :param fixed_coord_mask: Optional boolean coordinate mask with shape
-            ``[N]``; omitted values default to ``fixed_atom_mask``.
+            ``[N]``; omitted values default to ``fixed_atom_mask`` and supplied
+            values must equal it exactly.
         :param attachment_mask: Optional boolean mask with shape ``[N]``;
             omitted values default to no marked attachment sites.
         :param component_ids: Optional long fragment-component labels with shape
@@ -426,8 +442,8 @@ class GenerationCondition:
         the same device as ``pocket.positions``.
     :return: Immutable condition passed to model and sampler components.
     :rtype: GenerationCondition
-    :raises ContractValidationError: If field/frame devices, targets, or
-        fragment references are incompatible with the pocket context.
+    :raises ContractValidationError: If field/frame dtype-device-batch context,
+        targets, or fragment references are incompatible with the pocket.
 
     The mapping is copied into a read-only proxy so conditions cannot be
     silently changed through a caller-owned dictionary after validation.
@@ -448,10 +464,38 @@ class GenerationCondition:
             cannot be jointly consumed by a model.
         """
         device = self.pocket.positions.device
-        if self.pocket_field is not None and self.pocket_field.positions.device != device:
-            raise ContractValidationError("pocket_field must be on the pocket device.")
-        if self.fragment is not None and self.fragment.reference.positions.device != device:
-            raise ContractValidationError("fragment reference must be on the pocket device.")
+        dtype = self.pocket.positions.dtype
+        if self.pocket_field is not None:
+            if (
+                self.pocket_field.positions.device != device
+                or self.pocket_field.positions.dtype != dtype
+            ):
+                raise ContractValidationError(
+                    "pocket_field must share the pocket coordinate dtype and device."
+                )
+            if self.pocket.frame is None or self.pocket_field.frame is None:
+                raise ContractValidationError(
+                    "pocket and pocket_field must both declare a coordinate frame."
+                )
+            if self.pocket.frame != self.pocket_field.frame:
+                raise ContractValidationError(
+                    "pocket_field frame must equal the pocket coordinate frame."
+                )
+            _validate_batch_membership(
+                self.pocket.batch, self.pocket_field.batch, "pocket_field"
+            )
+        if self.fragment is not None:
+            reference = self.fragment.reference
+            if (
+                reference.positions.device != device
+                or reference.positions.dtype != dtype
+            ):
+                raise ContractValidationError(
+                    "fragment reference must share the pocket coordinate dtype and device."
+                )
+            _validate_batch_membership(
+                self.pocket.batch, reference.node_batch, "fragment reference"
+            )
         frozen_targets = _freeze_properties(self.property_targets)
         object.__setattr__(self, "property_targets", frozen_targets)
         if self.interaction_targets is not None:
@@ -525,8 +569,8 @@ class ComplexSample:
         fragment reference geometry are incompatible.
 
     The contract uses explicit fields rather than arbitrary payload dictionaries.
-    Local pocket and ligand positions share the same centered frame and retain
-    global restoration through ``frame``.
+    Local pocket, ligand, and present field tensors share batch identities and
+    the same centered frame, with global restoration through ``frame``.
     """
 
     source_id: str
@@ -551,6 +595,7 @@ class ComplexSample:
             raise ContractValidationError("source_id must be a non-empty string.")
         device = self.pocket.positions.device
         dtype = self.pocket.positions.dtype
+        _validate_batch_membership(self.pocket.batch, self.ligand.batch, "ligand")
         for name, positions in (
             ("ligand", self.ligand.positions),
             ("frame", self.frame.origin),
@@ -559,17 +604,29 @@ class ComplexSample:
                 raise ContractValidationError(
                     f"{name} must share the pocket coordinate dtype and device."
                 )
+        if self.pocket.frame is None or self.pocket.frame != self.frame:
+            raise ContractValidationError(
+                "pocket frame must equal the sample coordinate frame."
+            )
         for name, field_value in (
             ("pocket_field", self.pocket_field),
             ("ligand_field", self.ligand_field),
         ):
-            if field_value is not None and (
-                field_value.positions.device != device
-                or field_value.positions.dtype != dtype
-            ):
-                raise ContractValidationError(
-                    f"{name} must share the pocket coordinate dtype and device."
+            if field_value is not None:
+                if (
+                    field_value.positions.device != device
+                    or field_value.positions.dtype != dtype
+                ):
+                    raise ContractValidationError(
+                        f"{name} must share the pocket coordinate dtype and device."
+                    )
+                _validate_batch_membership(
+                    self.pocket.batch, field_value.batch, name
                 )
+                if field_value.frame is None or field_value.frame != self.frame:
+                    raise ContractValidationError(
+                        f"{name} frame must equal the sample coordinate frame."
+                    )
         if self.provenance.original_ligand_positions is not None and (
             self.provenance.original_ligand_positions.shape != self.ligand.positions.shape
         ):
@@ -581,6 +638,12 @@ class ComplexSample:
         ):
             raise ContractValidationError(
                 "fragment reference positions must match the sample ligand positions."
+            )
+        if self.fragment is not None:
+            _validate_batch_membership(
+                self.ligand.batch,
+                self.fragment.reference.node_batch,
+                "fragment reference",
             )
         object.__setattr__(self, "properties", _freeze_properties(self.properties))
 
@@ -663,6 +726,32 @@ def _validate_index_vector(
         raise ContractValidationError(f"{name} must be on the positions device.")
     if bool((value < 0).any()):
         raise ContractValidationError(f"{name} must not contain negative indices.")
+
+
+def _validate_signed_long_vector(
+    value: torch.Tensor, name: str, leading_count: int, reference: torch.Tensor
+) -> None:
+    """Validate a signed long value vector with a shared leading dimension.
+
+    :param value: Candidate tensor with expected shape ``[N]`` and long dtype.
+    :param name: Human-readable tensor name for errors.
+    :param leading_count: Required leading dimension ``N``.
+    :param reference: Tensor supplying required device.
+    :return: None.
+    :rtype: None
+    :raises ContractValidationError: If rank, dtype, or device is invalid.
+
+    Formal charges are signed chemistry values, unlike atom, bond, and batch
+    indices, so negative values are intentionally accepted.
+    """
+    if not isinstance(value, torch.Tensor):
+        raise ContractValidationError(f"{name} must be a torch.Tensor.")
+    if value.ndim != 1 or value.shape[0] != leading_count:
+        raise ContractValidationError(f"{name} must have shape [{leading_count}].")
+    if value.dtype != torch.long:
+        raise ContractValidationError(f"{name} must have torch.long dtype.")
+    if value.device != reference.device:
+        raise ContractValidationError(f"{name} must be on the positions device.")
 
 
 def _validate_bool_vector(
@@ -761,6 +850,27 @@ def _internal_bond_mask(
     """
     source, target = halfedge_index
     return fixed_atom_mask[source] & fixed_atom_mask[target] & (source != target)
+
+
+def _validate_batch_membership(
+    expected: torch.Tensor, actual: torch.Tensor, name: str
+) -> None:
+    """Require two flattened tensors to represent the same complex batches.
+
+    :param expected: Reference complex indices with shape ``[N]``.
+    :param actual: Candidate complex indices with shape ``[M]``.
+    :param name: Human-readable candidate name for diagnostic messages.
+    :return: None.
+    :rtype: None
+    :raises ContractValidationError: If unique complex identities differ.
+
+    Node counts may differ across pockets, ligands, and fields, so this checks
+    the sorted unique batch identities instead of elementwise equality.
+    """
+    if not torch.equal(torch.unique(expected), torch.unique(actual)):
+        raise ContractValidationError(
+            f"{name} must have the same complex batch membership as the pocket."
+        )
 
 
 def _freeze_properties(values: Mapping[str, TensorProperty]) -> Mapping[str, TensorProperty]:

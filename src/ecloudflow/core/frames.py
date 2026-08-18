@@ -55,17 +55,26 @@ class CoordinateFrame:
             raise CoordinateFrameError(
                 "rotation must have the same dtype and device as origin."
             )
-        identity = torch.eye(3, dtype=rotation.dtype, device=rotation.device)
+        validation_rotation = _validation_rotation(rotation)
+        identity = torch.eye(
+            3,
+            dtype=validation_rotation.dtype,
+            device=validation_rotation.device,
+        )
         if not torch.allclose(
-            rotation.transpose(0, 1) @ rotation,
+            validation_rotation.transpose(0, 1) @ validation_rotation,
             identity,
             rtol=1e-5,
             atol=1e-6,
         ):
             raise CoordinateFrameError("rotation must be orthonormal.")
         if not torch.allclose(
-            torch.linalg.det(rotation),
-            torch.ones((), dtype=rotation.dtype, device=rotation.device),
+            torch.linalg.det(validation_rotation),
+            torch.ones(
+                (),
+                dtype=validation_rotation.dtype,
+                device=validation_rotation.device,
+            ),
             rtol=1e-5,
             atol=1e-6,
         ):
@@ -225,3 +234,19 @@ def _validate_points(
         raise CoordinateFrameError(f"{name} must have a floating dtype.")
     if not torch.isfinite(value).all():
         raise CoordinateFrameError(f"{name} must contain only finite values.")
+
+
+def _validation_rotation(rotation: torch.Tensor) -> torch.Tensor:
+    """Promote low-precision rotations for portable orthogonality validation.
+
+    :param rotation: Validated finite rotation tensor with shape ``[3, 3]``.
+    :return: Rotation in a dtype supported by determinant implementations.
+    :rtype: torch.Tensor
+
+    ``torch.linalg.det`` is unavailable for some low-precision CPU dtypes.
+    Promotion affects validation only; the frame retains its caller-provided
+    dtype and therefore preserves its transform contract.
+    """
+    if rotation.dtype in (torch.float16, torch.bfloat16):
+        return rotation.to(torch.float32)
+    return rotation
