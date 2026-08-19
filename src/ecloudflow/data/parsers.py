@@ -121,7 +121,7 @@ def build_complex_sample(
     tool_versions: dict[str, str] = {}
     if build_fields:
         bundle = field_builders or FieldBuilderBundle.default()
-        pocket_field = bundle.pocket_builder.build(structure)
+        pocket_field = _reframe_field(bundle.pocket_builder.build(pocket), frame)
         try:
             result = bundle.ligand_builder.calculate_ligand(
                 ligand,
@@ -129,7 +129,7 @@ def build_complex_sample(
                 multiplicity=1,
             )
             if getattr(result, "density", None) is not None:
-                ligand_field = result.density
+                ligand_field = _reframe_field(result.density, frame)
             tool_versions["xTB"] = str(getattr(result, "status", "available"))
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             tool_versions["xTB"] = f"unavailable:{type(error).__name__}"
@@ -161,3 +161,28 @@ def build_complex_sample(
 def _sha256(path: Path) -> str:
     """Compute a content hash for immutable source provenance."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _reframe_field(field: ElectronField, frame: CoordinateFrame) -> ElectronField:
+    """Convert a field's coordinates into the sample frame and tensor contract.
+
+    :param field: Electron field with an explicit source frame.
+    :param frame: Target sample pocket frame.
+    :return: Field with global positions transformed to the target frame, while
+        preserving values, masks, batches, and channel names.
+    :rtype: ElectronField
+    :raises DataValidationError: If the source field omits a frame or uses an
+        incompatible batch layout.
+    """
+    if field.frame is None:
+        raise DataValidationError("field builder returned a field without a frame")
+    global_positions = field.frame.to_global(field.positions)
+    positions = frame.to_local(global_positions).to(dtype=torch.float32)
+    return ElectronField(
+        positions=positions,
+        values=field.values.to(dtype=torch.float32),
+        mask=field.mask.to(dtype=torch.bool),
+        batch=field.batch.to(dtype=torch.long),
+        channel_names=field.channel_names,
+        frame=frame,
+    )
