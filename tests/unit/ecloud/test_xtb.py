@@ -30,6 +30,14 @@ def methane_molecule() -> Chem.Mol:
     return molecule
 
 
+def carbon_dioxide_molecule() -> Chem.Mol:
+    molecule = Chem.AddHs(Chem.MolFromSmiles("O=C=O"))
+    assert AllChem.EmbedMolecule(molecule, randomSeed=19) == 0
+    assert all(atom.GetNumImplicitHs() == 0 for atom in molecule.GetAtoms())
+    assert all(atom.GetAtomicNum() != 1 for atom in molecule.GetAtoms())
+    return molecule
+
+
 def test_xtb_runner_records_failed_qm_without_fake_density(tmp_path: Path):
     runner = XTBRunner(executable="missing-xtb", work_root=tmp_path)
     result = runner.calculate_ligand(methane_molecule(), charge=0, multiplicity=1)
@@ -187,6 +195,13 @@ def test_partial_explicit_hydrogens_are_rejected_before_external_work(tmp_path: 
         )
 
 
+def test_hydrogen_free_ligand_is_valid_for_xtb_input(tmp_path: Path):
+    result = XTBRunner(executable="missing-xtb", work_root=tmp_path).calculate_ligand(
+        carbon_dioxide_molecule(), charge=0, multiplicity=1
+    )
+    assert result.status is QMStatus.TOOL_MISSING
+
+
 @pytest.mark.parametrize("replacement", ["-1.0", "0.0"])
 def test_cube_rejects_nonphysical_density_values(
     tmp_path: Path, fixture_dir: Path, replacement: str
@@ -228,6 +243,33 @@ def test_cube_interpolation_rejects_density_grid_frame_mismatch(fixture_dir: Pat
         frame=density.frame,
     )
     with pytest.raises(ValueError, match="lattice"):
+        interpolate_density_cube(altered, grid, query)
+
+
+def test_cube_interpolation_rejects_same_integral_density_payload_mutation(
+    fixture_dir: Path,
+):
+    density, grid = read_density_cube(fixture_dir / "xtb/success.cube")
+    altered_values = density.values.clone()
+    altered_values[0, 0] += 0.25
+    altered_values[1, 0] -= 0.25
+    altered = ElectronField(
+        positions=density.positions,
+        values=altered_values,
+        mask=density.mask,
+        batch=density.batch,
+        channel_names=density.channel_names,
+        frame=density.frame,
+    )
+    assert density.frame is not None
+    query = ElectronField(
+        positions=density.positions[:1],
+        values=torch.zeros((1, 1), dtype=torch.float64),
+        mask=torch.ones(1, dtype=torch.bool),
+        batch=torch.zeros(1, dtype=torch.long),
+        frame=density.frame,
+    )
+    with pytest.raises(ValueError, match="payload"):
         interpolate_density_cube(altered, grid, query)
 
 

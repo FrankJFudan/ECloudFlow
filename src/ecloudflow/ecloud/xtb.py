@@ -13,6 +13,7 @@ import math
 import re
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -67,6 +68,8 @@ class CubeGrid:
     :param density_scale: Conversion applied to source density, normally
         ``bohr**3 per angstrom**3`` for an atomic-unit xTB cube.
     :param source_sha256: SHA-256 hash of the exact cube bytes.
+    :param density_payload_sha256: SHA-256 binding the canonical parsed density
+        tensors and frame/lattice metadata.
     :param integrated_electron_count: Integral of the accepted density over
         the cube volume, in electrons.
     :return: Immutable cube grid metadata.
@@ -79,6 +82,7 @@ class CubeGrid:
     voxel_volume_angstrom3: float
     density_scale: float
     source_sha256: str
+    density_payload_sha256: str
     integrated_electron_count: float = 0.0
 
     def __post_init__(self) -> None:
@@ -121,10 +125,14 @@ class CubeGrid:
             raise ValueError(
                 "cube integrated electron count must be positive and finite."
             )
-        if len(self.source_sha256) != 64 or any(
-            character not in "0123456789abcdef" for character in self.source_sha256
+        for name, digest in (
+            ("source_sha256", self.source_sha256),
+            ("density_payload_sha256", self.density_payload_sha256),
         ):
-            raise ValueError("source_sha256 must be a lowercase SHA-256 hash.")
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 hash.")
 
 
 @dataclass(frozen=True)
@@ -556,13 +564,24 @@ def read_density_cube(
         channel_names=("density",),
         frame=frame,
     )
+    grid_shape = (counts[0], counts[1], counts[2])
+    density_payload_sha256 = _density_payload_sha256(
+        field,
+        origin_angstrom=origin_tensor,
+        axes_angstrom=axes_tensor,
+        shape=grid_shape,
+        voxel_volume_angstrom3=volume,
+        density_scale=density_scale,
+        integrated_electron_count=integrated_electrons,
+    )
     grid = CubeGrid(
         origin_angstrom=origin_tensor,
         axes_angstrom=axes_tensor,
-        shape=(counts[0], counts[1], counts[2]),
+        shape=grid_shape,
         voxel_volume_angstrom3=volume,
         density_scale=density_scale,
         source_sha256=hashlib.sha256(source).hexdigest(),
+        density_payload_sha256=density_payload_sha256,
         integrated_electron_count=integrated_electrons,
     )
     return field, grid
@@ -714,10 +733,6 @@ def _validate_calculation_input(
         raise ValueError("molecule coordinates must be finite Cartesian values.")
     if molecule.GetNumAtoms() == 0:
         raise ValueError("molecule must contain atoms.")
-    if sanitized.GetNumHeavyAtoms() and not any(
-        atom.GetAtomicNum() == 1 for atom in sanitized.GetAtoms()
-    ):
-        raise ValueError("molecule must contain explicit hydrogens.")
     implicit_hydrogen_atoms = [
         atom.GetIdx()
         for atom in sanitized.GetAtoms()
@@ -806,3 +821,71 @@ def _validate_density_grid_alignment(density: ElectronField, grid: CubeGrid) -> 
         abs_tol=1.0e-8,
     ):
         raise ValueError("density values do not match the cube lattice electron count.")
+    payload_digest = _density_payload_sha256(
+        density,
+        origin_angstrom=grid.origin_angstrom,
+        axes_angstrom=grid.axes_angstrom,
+        shape=grid.shape,
+        voxel_volume_angstrom3=grid.voxel_volume_angstrom3,
+        density_scale=grid.density_scale,
+        integrated_electron_count=grid.integrated_electron_count,
+    )
+    if payload_digest != grid.density_payload_sha256:
+        raise ValueError("density payload does not match the cube provenance binding.")
+
+
+def _density_payload_sha256(
+    density: ElectronField,
+    *,
+    origin_angstrom: torch.Tensor,
+    axes_angstrom: torch.Tensor,
+    shape: tuple[int, int, int],
+    voxel_volume_angstrom3: float,
+    density_scale: float,
+    integrated_electron_count: float,
+) -> str:
+    """Hash canonical parsed density tensors and binding-relevant grid metadata."""
+    digest = hashlib.sha256()
+    _update_digest_parts(digest, ("ecloudflow-density-payload-v1",))
+    for tensor in (
+        density.positions,
+        density.values,
+        density.mask,
+        density.batch,
+        origin_angstrom,
+        axes_angstrom,
+    ):
+        canonical = tensor.detach().to(device="cpu").contiguous()
+        _update_digest_parts(
+            digest,
+            (str(canonical.dtype), repr(tuple(canonical.shape))),
+        )
+        digest.update(canonical.numpy().tobytes(order="C"))
+    if density.frame is None or density.frame.rotation is None:
+        raise ValueError("density payload requires a complete coordinate frame.")
+    for tensor in (density.frame.origin, density.frame.rotation):
+        canonical = tensor.detach().to(device="cpu").contiguous()
+        _update_digest_parts(
+            digest,
+            (str(canonical.dtype), repr(tuple(canonical.shape))),
+        )
+        digest.update(canonical.numpy().tobytes(order="C"))
+    _update_digest_parts(
+        digest,
+        (
+            repr(shape),
+            repr(density.channel_names),
+            float(voxel_volume_angstrom3).hex(),
+            float(density_scale).hex(),
+            float(integrated_electron_count).hex(),
+        ),
+    )
+    return digest.hexdigest()
+
+
+def _update_digest_parts(digest: object, parts: Iterable[str]) -> None:
+    """Add length-delimited UTF-8 strings to a hashlib-compatible digest."""
+    for part in parts:
+        encoded = part.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))  # type: ignore[attr-defined]
+        digest.update(encoded)  # type: ignore[attr-defined]
