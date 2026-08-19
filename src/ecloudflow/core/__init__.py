@@ -10,6 +10,7 @@ from ecloudflow.core.types import (
     LigandGraph,
     MolecularState,
     PocketGraph,
+    QMProvenance,
     SampleProvenance,
 )
 
@@ -22,6 +23,7 @@ __all__ = [
     "LigandGraph",
     "MolecularState",
     "PocketGraph",
+    "QMProvenance",
     "SampleProvenance",
     "clamp_fragment",
 ]

@@ -17,6 +17,69 @@ TensorProperty: TypeAlias = float | int | torch.Tensor
 
 
 @dataclass(frozen=True)
+class QMProvenance:
+    """Store serializable, credential-free metadata for one QM attempt.
+
+    :param status: Stable status string such as ``"success"`` or ``"tool_missing"``.
+    :param qm_mask: True only when a genuine QM density was accepted.
+    :param tool: External tool name.
+    :param version: Tool version or ``"unavailable"``.
+    :param executable: Executable name/path supplied to the runner.
+    :param command: Exact argument-list command without environment values.
+    :param charge: Molecular charge.
+    :param multiplicity: Spin multiplicity.
+    :param failure_category: Sanitized failure category.
+    :param source_hashes: Immutable hashes of inputs and captured streams.
+    :param integrated_electron_count: Accepted electron count, if available.
+    :return: Immutable provenance record safe for manifests and reports.
+    :rtype: QMProvenance
+    """
+
+    status: str
+    qm_mask: bool
+    tool: str
+    version: str
+    executable: str
+    command: tuple[str, ...]
+    charge: int
+    multiplicity: int
+    failure_category: str
+    source_hashes: Mapping[str, str] = field(default_factory=dict)
+    integrated_electron_count: float | None = None
+
+    def __post_init__(self) -> None:
+        """Validate and freeze credential-free QM metadata."""
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                self.status,
+                self.tool,
+                self.version,
+                self.executable,
+                self.failure_category,
+            )
+        ):
+            raise ContractValidationError(
+                "QM provenance string fields must be non-empty."
+            )
+        if not self.command or any(not value for value in self.command):
+            raise ContractValidationError(
+                "QM provenance command must be a non-empty argument list."
+            )
+        if (
+            not isinstance(self.charge, int)
+            or not isinstance(self.multiplicity, int)
+            or self.multiplicity <= 0
+        ):
+            raise ContractValidationError(
+                "QM provenance charge/multiplicity are invalid."
+            )
+        object.__setattr__(
+            self, "source_hashes", _freeze_string_mapping(self.source_hashes)
+        )
+
+
+@dataclass(frozen=True)
 class PocketGraph:
     """Represent a flattened protein-pocket graph in a local pocket frame.
 
@@ -165,9 +228,7 @@ class ElectronField:
             leading dimensions, channel names, or coordinate metadata.
         """
         count = _validate_positions(self.positions, "positions", nonempty=False)
-        channels = _validate_float_matrix(
-            self.values, "values", count, self.positions
-        )
+        channels = _validate_float_matrix(self.values, "values", count, self.positions)
         _validate_bool_vector(self.mask, "mask", count, self.positions)
         _validate_index_vector(self.batch, "batch", count, self.positions)
         if self.channel_names and len(self.channel_names) != channels:
@@ -237,9 +298,7 @@ class MolecularState:
             represent a valid batched molecular trajectory state.
         """
         count = _validate_positions(self.positions, "positions", nonempty=False)
-        _validate_float_matrix(
-            self.atom_logits, "atom_logits", count, self.positions
-        )
+        _validate_float_matrix(self.atom_logits, "atom_logits", count, self.positions)
         _validate_float_matrix(
             self.charge_logits, "charge_logits", count, self.positions
         )
@@ -337,7 +396,10 @@ class FragmentCondition:
         node_count = self.reference.positions.shape[0]
         edge_count = self.reference.halfedge_index.shape[1]
         _validate_bool_vector(
-            self.fixed_atom_mask, "fixed_atom_mask", node_count, self.reference.positions
+            self.fixed_atom_mask,
+            "fixed_atom_mask",
+            node_count,
+            self.reference.positions,
         )
         _validate_bool_vector(
             self.fixed_coord_mask,
@@ -428,9 +490,7 @@ class FragmentCondition:
             if attachment_mask is None
             else attachment_mask
         )
-        fixed_bond_mask = _internal_bond_mask(
-            reference.halfedge_index, fixed_atom_mask
-        )
+        fixed_bond_mask = _internal_bond_mask(reference.halfedge_index, fixed_atom_mask)
         return cls(
             reference=reference,
             fixed_atom_mask=fixed_atom_mask,
@@ -548,6 +608,7 @@ class SampleProvenance:
     tool_versions: Mapping[str, str] = field(default_factory=dict)
     preprocessing_status: str = "complete"
     original_ligand_positions: torch.Tensor | None = None
+    qm: QMProvenance | None = None
 
     def __post_init__(self) -> None:
         """Freeze provenance mappings and validate optional source coordinates.
@@ -557,9 +618,15 @@ class SampleProvenance:
         :raises ContractValidationError: If a mapping key/value or source
             coordinate tensor does not meet the provenance contract.
         """
-        object.__setattr__(self, "source_paths", _freeze_string_mapping(self.source_paths))
-        object.__setattr__(self, "file_hashes", _freeze_string_mapping(self.file_hashes))
-        object.__setattr__(self, "tool_versions", _freeze_string_mapping(self.tool_versions))
+        object.__setattr__(
+            self, "source_paths", _freeze_string_mapping(self.source_paths)
+        )
+        object.__setattr__(
+            self, "file_hashes", _freeze_string_mapping(self.file_hashes)
+        )
+        object.__setattr__(
+            self, "tool_versions", _freeze_string_mapping(self.tool_versions)
+        )
         if not self.preprocessing_status:
             raise ContractValidationError("preprocessing_status must be non-empty.")
         if self.original_ligand_positions is not None:
@@ -642,15 +709,14 @@ class ComplexSample:
                     raise ContractValidationError(
                         f"{name} must share the pocket coordinate dtype and device."
                     )
-                _validate_batch_membership(
-                    self.pocket.batch, field_value.batch, name
-                )
+                _validate_batch_membership(self.pocket.batch, field_value.batch, name)
                 if field_value.frame is None or field_value.frame != self.frame:
                     raise ContractValidationError(
                         f"{name} frame must equal the sample coordinate frame."
                     )
         if self.provenance.original_ligand_positions is not None and (
-            self.provenance.original_ligand_positions.shape != self.ligand.positions.shape
+            self.provenance.original_ligand_positions.shape
+            != self.ligand.positions.shape
         ):
             raise ContractValidationError(
                 "original_ligand_positions must match ligand position shape."
@@ -829,13 +895,17 @@ def _validate_halfedge_index(
     if value.device != reference.device:
         raise ContractValidationError("halfedge_index must be on the positions device.")
     if value.numel() and (bool((value < 0).any()) or bool((value >= node_count).any())):
-        raise ContractValidationError("halfedge_index contains endpoints outside [0, N).")
+        raise ContractValidationError(
+            "halfedge_index contains endpoints outside [0, N)."
+        )
     if not bool((value[0] < value[1]).all()):
         raise ContractValidationError(
             "halfedge_index must have row-zero indices strictly smaller than row-one indices."
         )
     if value.shape[1] != torch.unique(value, dim=1).shape[1]:
-        raise ContractValidationError("halfedge_index must not contain duplicate pairs.")
+        raise ContractValidationError(
+            "halfedge_index must not contain duplicate pairs."
+        )
     return value.shape[1]
 
 
@@ -857,7 +927,9 @@ def _validate_halfedge_batches(
     source_batch = node_batch[halfedge_index[0]]
     target_batch = node_batch[halfedge_index[1]]
     if not torch.equal(source_batch, target_batch):
-        raise ContractValidationError("halfedges must connect nodes in the same complex.")
+        raise ContractValidationError(
+            "halfedges must connect nodes in the same complex."
+        )
     if halfedge_batch is not None and not torch.equal(halfedge_batch, source_batch):
         raise ContractValidationError(
             "halfedge_batch must equal the complex index of every halfedge endpoint."
@@ -903,7 +975,9 @@ def _validate_batch_membership(
         )
 
 
-def _freeze_properties(values: Mapping[str, TensorProperty]) -> Mapping[str, TensorProperty]:
+def _freeze_properties(
+    values: Mapping[str, TensorProperty],
+) -> Mapping[str, TensorProperty]:
     """Validate and copy scalar property targets into a read-only mapping.
 
     :param values: Property values keyed by non-empty strings.
@@ -914,7 +988,9 @@ def _freeze_properties(values: Mapping[str, TensorProperty]) -> Mapping[str, Ten
     copied: dict[str, TensorProperty] = {}
     for key, value in values.items():
         if not isinstance(key, str) or not key:
-            raise ContractValidationError("property target keys must be non-empty strings.")
+            raise ContractValidationError(
+                "property target keys must be non-empty strings."
+            )
         if isinstance(value, torch.Tensor):
             _validate_finite_tensor(value, f"property_targets[{key!r}]")
         elif not isinstance(value, (float, int)) or not torch.isfinite(
@@ -937,7 +1013,12 @@ def _freeze_string_mapping(values: Mapping[str, str]) -> Mapping[str, str]:
     """
     copied: dict[str, str] = {}
     for key, value in values.items():
-        if not isinstance(key, str) or not key or not isinstance(value, str) or not value:
+        if (
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            or not value
+        ):
             raise ContractValidationError(
                 "provenance metadata keys and values must be non-empty strings."
             )

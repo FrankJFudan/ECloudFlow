@@ -115,8 +115,16 @@ class FragmentTaskSampler:
         if not bool(fixed.any()):
             fixed[self._random.randrange(atom_count)] = True
         if bool(fixed.all()) and atom_count > 1:
-            fixed[_select_free_atom(molecule, fixed, self._random)] = False
-            fixed = _expand_complete_rings(molecule, fixed)
+            free_candidates = (
+                [atom.GetIdx() for atom in molecule.GetAtoms() if not atom.IsInRing()]
+                if molecule is not None
+                else []
+            )
+            if not free_candidates:
+                raise ValueError(
+                    f"fragment mode {mode.value!r} cannot leave a valid free ring-atomic region"
+                )
+            fixed[self._random.choice(free_candidates)] = False
         attachments = _attachment_mask(state.halfedge_index, fixed)
         components = _component_ids(state.halfedge_index, fixed)
         condition = FragmentCondition.from_atom_mask(
@@ -143,7 +151,11 @@ def _coerce_state(
         return _state_from_graph(ligand, frame), None
     if not isinstance(ligand, Chem.Mol):
         raise TypeError("ligand must be an RDKit Mol, LigandGraph, or MolecularState")
-    molecule = Chem.RemoveHs(Chem.Mol(ligand), sanitize=True)
+    molecule = Chem.Mol(ligand)
+    if any(atom.GetAtomicNum() == 1 for atom in molecule.GetAtoms()):
+        raise ValueError(
+            "fragment RDKit inputs must not contain explicit hydrogen atoms"
+        )
     if molecule.GetNumConformers() != 1 or not molecule.GetConformer().Is3D():
         raise ValueError("RDKit fragment ligand must have exactly one 3D conformer")
     positions = torch.tensor(

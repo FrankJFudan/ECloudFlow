@@ -11,6 +11,71 @@ from ecloudflow.chemistry.vocabulary import ChemicalVocabulary
 from ecloudflow.core.frames import CoordinateFrame
 from ecloudflow.core.types import LigandGraph, PocketGraph
 
+POCKET_FEATURE_NAMES = tuple(
+    [
+        f"element_{symbol}"
+        for symbol in (
+            "C",
+            "N",
+            "O",
+            "S",
+            "P",
+            "F",
+            "Cl",
+            "Br",
+            "I",
+            "B",
+            "Si",
+            "Se",
+            "Na",
+            "Mg",
+            "K",
+            "Ca",
+            "Mn",
+            "Fe",
+            "Co",
+            "Ni",
+            "Cu",
+            "Zn",
+        )
+    ]
+    + [
+        f"residue_{name}"
+        for name in (
+            "ALA",
+            "ARG",
+            "ASN",
+            "ASP",
+            "CYS",
+            "GLN",
+            "GLU",
+            "GLY",
+            "HIS",
+            "ILE",
+            "LEU",
+            "LYS",
+            "MET",
+            "PHE",
+            "PRO",
+            "SER",
+            "THR",
+            "TRP",
+            "TYR",
+            "VAL",
+            "OTHER",
+        )
+    ]
+    + [
+        "backbone",
+        "partial_charge",
+        "donor",
+        "acceptor",
+        "aromatic",
+        "hydrophobic",
+        "metal",
+    ]
+)
+
 
 def pocket_graph_from_entity(entity: Any, frame: CoordinateFrame) -> PocketGraph:
     """Build a pocket graph from a Biopython entity in a declared frame.
@@ -37,7 +102,7 @@ def pocket_graph_from_entity(entity: Any, frame: CoordinateFrame) -> PocketGraph
     global_positions = torch.stack(positions)
     local_positions = frame.to_local(global_positions)
     atomic_numbers = torch.tensor(numbers, dtype=torch.long)
-    features = _pocket_features(atomic_numbers)
+    features = _pocket_features(atoms)
     return PocketGraph(
         positions=local_positions,
         features=features,
@@ -108,19 +173,141 @@ def ligand_graph_from_molecule(
     )
 
 
-def _pocket_features(atomic_numbers: torch.Tensor) -> torch.Tensor:
-    """Return deterministic one-hot plus coarse chemistry pocket features."""
-    symbols = (6, 7, 8, 16, 15, 17, 35, 53, 26, 30)
-    one_hot = torch.stack(
-        [(atomic_numbers == number).to(torch.float32) for number in symbols], dim=1
+def _pocket_features(atoms: list[Any]) -> torch.Tensor:
+    """Return the stable biochemical pocket feature schema.
+
+    :param atoms: Biopython atoms retaining residue and PDB atom metadata.
+    :return: Features ordered exactly as :data:`POCKET_FEATURE_NAMES`.
+    :rtype: torch.Tensor
+
+    The schema preserves element identity, all standard amino-acid residue
+    classes plus ``OTHER``, backbone membership, finite PQR charge (or neutral
+    zero fallback), residue-aware donor/acceptor flags, aromaticity,
+    hydrophobicity, and explicit metal identity. Feature columns are never
+    silently dropped when metadata are absent; deterministic fallback values
+    are encoded instead.
+    """
+    elements = (
+        "C",
+        "N",
+        "O",
+        "S",
+        "P",
+        "F",
+        "Cl",
+        "Br",
+        "I",
+        "B",
+        "Si",
+        "Se",
+        "Na",
+        "Mg",
+        "K",
+        "Ca",
+        "Mn",
+        "Fe",
+        "Co",
+        "Ni",
+        "Cu",
+        "Zn",
     )
-    donor = (
-        torch.isin(atomic_numbers, torch.tensor([7, 8, 16]))
-        .to(torch.float32)
-        .unsqueeze(1)
+    residues = (
+        "ALA",
+        "ARG",
+        "ASN",
+        "ASP",
+        "CYS",
+        "GLN",
+        "GLU",
+        "GLY",
+        "HIS",
+        "ILE",
+        "LEU",
+        "LYS",
+        "MET",
+        "PHE",
+        "PRO",
+        "SER",
+        "THR",
+        "TRP",
+        "TYR",
+        "VAL",
+        "OTHER",
     )
-    acceptor = donor.clone()
-    hydrophobic = (
-        torch.isin(atomic_numbers, torch.tensor([6, 16])).to(torch.float32).unsqueeze(1)
-    )
-    return torch.cat((one_hot, donor, acceptor, hydrophobic), dim=1)
+    rows: list[list[float]] = []
+    backbone_names = {"N", "CA", "C", "O", "OXT"}
+    donor_by_residue = {
+        "ARG": {"N"},
+        "LYS": {"N"},
+        "HIS": {"ND1", "NE2"},
+        "SER": {"OG"},
+        "THR": {"OG1"},
+        "TYR": {"OH"},
+        "CYS": {"SG"},
+        "ASN": {"ND2"},
+        "GLN": {"NE2"},
+        "TRP": {"NE1"},
+    }
+    acceptor_by_residue = {
+        "ASP": {"OD1", "OD2"},
+        "GLU": {"OE1", "OE2"},
+        "ASN": {"OD1"},
+        "GLN": {"OE1"},
+        "SER": {"OG"},
+        "THR": {"OG1"},
+        "TYR": {"OH"},
+        "CYS": {"SG"},
+        "HIS": {"ND1", "NE2"},
+    }
+    hydrophobic_residues = {
+        "ALA",
+        "VAL",
+        "ILE",
+        "LEU",
+        "MET",
+        "PHE",
+        "TRP",
+        "TYR",
+        "CYS",
+        "PRO",
+        "GLY",
+    }
+    aromatic_residues = {"PHE", "TYR", "TRP", "HIS"}
+    metal_symbols = {"Na", "Mg", "K", "Ca", "Mn", "Fe", "Co", "Ni", "Cu", "Zn"}
+    for atom in atoms:
+        element = str(getattr(atom, "element", "") or "").strip().title()
+        residue = str(atom.get_parent().get_resname()).strip().upper()
+        residue = residue if residue in residues[:-1] else "OTHER"
+        atom_name = str(atom.get_name()).strip().upper()
+        pqr = getattr(atom, "pqr_charge", None)
+        charge = (
+            float(pqr)
+            if isinstance(pqr, (int, float))
+            and torch.isfinite(torch.tensor(float(pqr)))
+            else 0.0
+        )
+        donor = float(atom_name in donor_by_residue.get(residue, set()))
+        acceptor = float(atom_name in acceptor_by_residue.get(residue, set()))
+        if atom_name == "N" and residue not in {"PRO", "OTHER"}:
+            donor = 1.0
+        if atom_name in {"O", "OXT"}:
+            acceptor = 1.0
+        if residue == "OTHER" and element in {"N", "O", "S"}:
+            donor = float(element in {"N", "O", "S"} and atom_name not in {"O", "OXT"})
+            acceptor = float(
+                element in {"N", "O", "S"} and atom_name not in {"N", "NZ"}
+            )
+        rows.append(
+            [float(element == item) for item in elements]
+            + [float(residue == item) for item in residues]
+            + [
+                float(atom_name in backbone_names),
+                charge,
+                donor,
+                acceptor,
+                float(residue in aromatic_residues and element in {"C", "N"}),
+                float(residue in hydrophobic_residues),
+                float(element in metal_symbols),
+            ]
+        )
+    return torch.tensor(rows, dtype=torch.float32)

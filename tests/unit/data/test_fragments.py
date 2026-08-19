@@ -8,10 +8,33 @@ from ecloudflow.data.fragments import FragmentMode, FragmentTaskSampler
 
 def medicinal_ligand_fixture() -> Chem.Mol:
     """Return a small aromatic molecule with both ring and linker bonds."""
-    mol = Chem.AddHs(Chem.MolFromSmiles("CCOc1ccccc1C(=O)N"))
+    mol = Chem.MolFromSmiles("CCOc1ccccc1C(=O)N")
     assert mol is not None
     assert AllChem.EmbedMolecule(mol, randomSeed=17) == 0
     return mol
+
+
+def test_explicit_hydrogen_input_is_rejected() -> None:
+    """Fragment construction never silently removes explicit hydrogens."""
+    ligand = Chem.AddHs(Chem.MolFromSmiles("CC"))
+    assert ligand is not None
+    assert Chem.AllChem.EmbedMolecule(ligand, randomSeed=3) == 0
+    import pytest
+
+    with pytest.raises(ValueError, match="explicit hydrogen"):
+        FragmentTaskSampler().sample(ligand, forced_mode=FragmentMode.GROW)
+
+
+def test_ring_only_ligands_reject_all_fixed_tasks() -> None:
+    """Benzene and cyclohexane cannot yield a valid free ring-atomic region."""
+    import pytest
+
+    for smiles in ("c1ccccc1", "C1CCCCC1"):
+        ligand = Chem.MolFromSmiles(smiles)
+        assert ligand is not None
+        assert Chem.AllChem.EmbedMolecule(ligand, randomSeed=3) == 0
+        with pytest.raises(ValueError, match="free ring-atomic region"):
+            FragmentTaskSampler().sample(ligand, forced_mode=FragmentMode.REPLACE)
 
 
 def test_fragment_sampler_builds_all_four_optimization_modes() -> None:

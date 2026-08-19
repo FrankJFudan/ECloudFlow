@@ -12,7 +12,12 @@ from rdkit import Chem
 
 from ecloudflow.chemistry.standardize import standardize_molecule
 from ecloudflow.core.frames import CoordinateFrame
-from ecloudflow.core.types import ComplexSample, ElectronField, SampleProvenance
+from ecloudflow.core.types import (
+    ComplexSample,
+    ElectronField,
+    QMProvenance,
+    SampleProvenance,
+)
 from ecloudflow.data.features import (
     ligand_graph_from_molecule,
     pocket_graph_from_entity,
@@ -83,7 +88,7 @@ def build_complex_sample(
     sample_id: str,
     field_builders: FieldBuilderBundle | None = None,
     *,
-    build_fields: bool = False,
+    build_fields: bool = True,
 ) -> ComplexSample:
     """Parse one cocrystal pair into the canonical model data contract.
 
@@ -92,7 +97,9 @@ def build_complex_sample(
     :param sample_id: Stable source identifier stored in every artifact.
     :param field_builders: Optional pocket/ligand physical-field bundle.
     :param build_fields: Whether to build deterministic pocket and optional xTB
-        ligand fields. xTB failures leave the ligand field absent with provenance.
+        ligand fields. Defaults to true per the physical-field contract; set it
+        to false for graph-only preprocessing. xTB failures leave the ligand
+        field absent with typed provenance.
     :return: Centered graph, optional fields, inverse frame, and provenance.
     :rtype: ComplexSample
     :raises DataValidationError: If files are unreadable or chemistry/geometry
@@ -119,20 +126,48 @@ def build_complex_sample(
     pocket_field: ElectronField | None = None
     ligand_field: ElectronField | None = None
     tool_versions: dict[str, str] = {}
+    qm_provenance: QMProvenance | None = None
     if build_fields:
         bundle = field_builders or FieldBuilderBundle.default()
         pocket_field = _reframe_field(bundle.pocket_builder.build(pocket), frame)
         try:
+            calculation_molecule = Chem.AddHs(Chem.Mol(ligand), addCoords=True)
             result = bundle.ligand_builder.calculate_ligand(
-                ligand,
+                calculation_molecule,
                 charge=int(sum(atom.GetFormalCharge() for atom in ligand.GetAtoms())),
                 multiplicity=1,
             )
             if getattr(result, "density", None) is not None:
                 ligand_field = _reframe_field(result.density, frame)
             tool_versions["xTB"] = str(getattr(result, "status", "available"))
+            tool = result.provenance
+            qm_provenance = QMProvenance(
+                status=str(result.status.value),
+                qm_mask=bool(result.qm_mask),
+                tool=tool.tool,
+                version=tool.version,
+                executable=tool.executable,
+                command=tool.command,
+                charge=tool.charge,
+                multiplicity=tool.multiplicity,
+                failure_category=str(result.failure_category.value),
+                source_hashes=tool.source_hashes,
+                integrated_electron_count=tool.integrated_electron_count,
+            )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             tool_versions["xTB"] = f"unavailable:{type(error).__name__}"
+            runner = bundle.ligand_builder
+            qm_provenance = QMProvenance(
+                status="unavailable",
+                qm_mask=False,
+                tool="xTB",
+                version="unavailable",
+                executable=str(getattr(runner, "executable", "xtb")),
+                command=(str(getattr(runner, "executable", "xtb")),),
+                charge=int(sum(atom.GetFormalCharge() for atom in ligand.GetAtoms())),
+                multiplicity=1,
+                failure_category=type(error).__name__,
+            )
     provenance = SampleProvenance(
         source_paths={
             "pocket": str(pocket_source.resolve()),
@@ -145,6 +180,7 @@ def build_complex_sample(
         tool_versions=tool_versions,
         preprocessing_status="complete",
         original_ligand_positions=ligand_global,
+        qm=qm_provenance,
     )
     return ComplexSample(
         source_id=sample_id,
@@ -177,10 +213,13 @@ def _reframe_field(field: ElectronField, frame: CoordinateFrame) -> ElectronFiel
     if field.frame is None:
         raise DataValidationError("field builder returned a field without a frame")
     global_positions = field.frame.to_global(field.positions)
-    positions = frame.to_local(global_positions).to(dtype=torch.float32)
+    global_positions = global_positions.to(
+        device=frame.origin.device, dtype=frame.origin.dtype
+    )
+    positions = frame.to_local(global_positions)
     return ElectronField(
         positions=positions,
-        values=field.values.to(dtype=torch.float32),
+        values=field.values.to(device=frame.origin.device, dtype=frame.origin.dtype),
         mask=field.mask.to(dtype=torch.bool),
         batch=field.batch.to(dtype=torch.long),
         channel_names=field.channel_names,
