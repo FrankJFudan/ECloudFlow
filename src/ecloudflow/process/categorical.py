@@ -76,8 +76,15 @@ class CategoricalPath:
         )
         prior = self._prior.reshape(*([1] * target.ndim), self.num_classes)
         weights = expanded_time.to(dtype=self._prior.dtype).unsqueeze(-1)
-        probabilities = (1.0 - weights) * prior + weights * one_hot
-        probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
+        interpolated = (1.0 - weights) * prior + weights * one_hot
+        normalized = interpolated / interpolated.sum(dim=-1, keepdim=True)
+        start = expanded_time.eq(0.0).unsqueeze(-1)
+        end = expanded_time.eq(1.0).unsqueeze(-1)
+        probabilities = torch.where(
+            start,
+            prior.expand(*target.shape, self.num_classes),
+            torch.where(end, one_hot, normalized),
+        )
         if not bool(torch.isfinite(probabilities).all()):
             raise ValueError("categorical probabilities must remain finite.")
         return probabilities
@@ -222,7 +229,7 @@ def _validate_prior(prior: torch.Tensor, num_classes: int) -> None:
             stable_prior.sum(),
             stable_prior.new_tensor(1.0),
             atol=tolerance,
-            rtol=tolerance,
+            rtol=0.0,
         )
     ):
         raise ValueError("prior probabilities must sum to one.")

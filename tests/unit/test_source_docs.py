@@ -97,6 +97,7 @@ def test_task9_designated_apis_keep_stochastic_path_contracts() -> None:
         "schedules.InterpolantSchedule.data_weight_derivative",
         "schedules.InterpolantSchedule.noise_scale",
         "schedules.InterpolantSchedule.noise_scale_derivative",
+        "continuous._normalize_shape",
     }
     assert required <= DESIGNATED_APIS
     root = Path(__file__).resolve().parents[2]

@@ -364,6 +364,9 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
     "schedules.InterpolantSchedule.noise_scale_derivative": APIDocContract(
         True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
     ),
+    "continuous._normalize_shape": APIDocContract(
+        True, (_DEVICE, _DTYPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
 }
 DESIGNATED_APIS = frozenset(API_DOC_CONTRACTS)
 

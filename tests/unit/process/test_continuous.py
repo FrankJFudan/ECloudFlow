@@ -75,6 +75,25 @@ def test_score_threshold_excludes_unstable_times_and_keeps_exact_nearby_score() 
     assert torch.equal(score, expected)
 
 
+def test_float64_score_boundary_is_not_rounded_to_float32_safety() -> None:
+    """Float64 threshold decisions retain the returned time's precision."""
+    path = ContinuousPath(LinearBridge(), numerical_epsilon=1e-6)
+    x0 = torch.zeros(1, 3, dtype=torch.float64)
+    x1 = torch.ones_like(x0)
+    boundary = torch.tensor(1.00000098e-6, dtype=torch.float64)
+    assert path.schedule.noise_scale(boundary) < path.numerical_epsilon
+    sample = path.sample(x0, x1, boundary, generator=_generator(4))
+    with pytest.raises(ValueError, match="below numerical_epsilon"):
+        path.targets(x0, x1, sample)
+
+    accepted_time = torch.tensor(1.000002e-6, dtype=torch.float64)
+    accepted = path.sample(x0, x1, accepted_time, generator=_generator(4))
+    _, score = path.targets(x0, x1, accepted)
+    assert torch.equal(
+        score, -accepted.noise / path.schedule.noise_scale(accepted_time)
+    )
+
+
 def test_reduced_precision_retains_float32_epsilon_and_float32_targets() -> None:
     """BF16 targets use the original float32 epsilon from the sampled coupling."""
     path = ContinuousPath(LinearBridge(interior_noise=0.2))
@@ -111,6 +130,49 @@ def test_batch_times_and_antithetic_sampling_are_deterministic() -> None:
         times, path.sample_times(4, generator=_generator(7), antithetic=True)
     )
     assert bool((path.schedule.noise_scale(times) >= path.numerical_epsilon).all())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+def test_score_time_samples_pass_targets_in_their_effective_dtype(
+    dtype: torch.dtype,
+) -> None:
+    """Every default score-mode time is valid for a same-dtype endpoint path."""
+    path = ContinuousPath(LinearBridge())
+    times = path.sample_times(17, dtype=dtype, generator=_generator(21))
+    x0 = torch.zeros(17, 2, dtype=dtype)
+    x1 = torch.ones_like(x0)
+    sample = path.sample(x0, x1, times, generator=_generator(22))
+    velocity, score = path.targets(x0, x1, sample)
+    assert times.dtype == dtype
+    assert torch.isfinite(velocity).all() and torch.isfinite(score).all()
+
+
+@pytest.mark.parametrize("shape", [1, 3, (1, 3)])
+def test_odd_antithetic_score_times_are_deterministic_and_safe(
+    shape: int | tuple[int, int],
+) -> None:
+    """Odd totals retain paired values plus one independently safe final value."""
+    path = ContinuousPath(LinearBridge())
+    times = path.sample_times(shape, antithetic=True, generator=_generator(23))
+    repeated = path.sample_times(shape, antithetic=True, generator=_generator(23))
+    flattened = times.reshape(-1)
+    pairs = flattened.numel() // 2
+    assert torch.equal(times, repeated)
+    assert bool((path.schedule.noise_scale(flattened) >= path.numerical_epsilon).all())
+    if pairs:
+        assert torch.allclose(
+            flattened[:pairs] + flattened[pairs : 2 * pairs], torch.ones(pairs)
+        )
+    x0 = torch.zeros(flattened.numel(), 2)
+    x1 = torch.ones_like(x0)
+    _, score = path.targets(x0, x1, path.sample(x0, x1, flattened))
+    assert torch.isfinite(score).all()
+
+
+def test_sample_times_rejects_non_shape_objects_with_typed_error() -> None:
+    """Shape type errors are explicit rather than leaked tuple-conversion errors."""
+    with pytest.raises(TypeError, match="integer or a sequence"):
+        ContinuousPath(LinearBridge()).sample_times(1.5)  # type: ignore[arg-type]
 
 
 def test_bfloat16_reduction_accumulates_in_float32() -> None:

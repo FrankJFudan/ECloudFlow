@@ -44,6 +44,16 @@ def test_categorical_endpoints_and_seeded_class_draws() -> None:
     assert torch.equal(first.classes, second.classes)
 
 
+def test_categorical_probability_endpoints_are_exact_canonical_values() -> None:
+    """The canonical stored prior and data one-hot endpoints are bitwise exact."""
+    path = CategoricalPath(num_classes=3, prior=torch.tensor([0.2, 0.3, 0.5]))
+    target = torch.tensor([2, 0])
+    start = path.probabilities(target, torch.tensor(0.0))
+    finish = path.probabilities(target, torch.tensor(1.0))
+    assert torch.equal(start, path.prior.expand(2, -1))
+    assert torch.equal(finish, torch.nn.functional.one_hot(target, 3).float())
+
+
 def test_endpoint_cross_entropy_masks_fixed_entries_without_biased_denominator() -> (
     None
 ):
@@ -70,6 +80,11 @@ def test_categorical_path_rejects_invalid_priors_classes_and_masks() -> None:
         CategoricalPath(
             num_classes=3,
             prior=torch.tensor([0.30, 0.30, 0.45], dtype=torch.bfloat16),
+        )
+    with pytest.raises(ValueError, match="sum to one"):
+        CategoricalPath(
+            num_classes=3,
+            prior=torch.tensor([0.3359375, 0.3359375, 0.3359375], dtype=torch.bfloat16),
         )
 
 

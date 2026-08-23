@@ -354,12 +354,26 @@ def _compute_dtype(dtype: torch.dtype) -> torch.dtype:
 
 
 def _normalize_shape(shape: int | Sequence[int] | torch.Size) -> tuple[int, ...]:
-    """Normalize one public sample-time shape into a validated tuple."""
+    """Normalize one public sample-time shape into a validated tuple.
+
+    :param shape: A non-negative integer or a finite sequence of non-negative
+        integer dimensions; strings and other non-sequence objects are invalid.
+    :return: An immutable shape tuple used without mutation by time sampling.
+    :rtype: tuple[int, ...]
+    :raises TypeError: If ``shape`` is neither an integer nor a dimension
+        sequence.
+    :raises ValueError: If any supplied dimension is negative or non-integral.
+
+    This helper is deterministic, device and dtype independent, consumes no
+    generator state, and has no tensor/autograd side effects.
+    """
     values: tuple[int, ...]
     if isinstance(shape, int):
         values = (shape,)
-    else:
+    elif isinstance(shape, Sequence) and not isinstance(shape, (str, bytes)):
         values = tuple(shape)
+    else:
+        raise TypeError("shape must be an integer or a sequence of dimensions.")
     if any(not isinstance(value, int) or value < 0 for value in values):
         raise ValueError("shape must contain only non-negative integers.")
     return values
@@ -400,16 +414,18 @@ def _draw_score_times(
         return torch.empty(0, device=device, dtype=dtype)
     if antithetic:
         pair_count = count // 2
-        primary = _draw_valid_score_values(
-            schedule,
-            pair_count,
-            device=device,
-            dtype=dtype,
-            generator=generator,
-            threshold=threshold,
-            require_antithetic=True,
-        )
-        values = [primary, 1.0 - primary]
+        values: list[torch.Tensor] = []
+        if pair_count:
+            primary = _draw_valid_score_values(
+                schedule,
+                pair_count,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+                threshold=threshold,
+                require_antithetic=True,
+            )
+            values.extend((primary, 1.0 - primary))
         if count % 2:
             values.append(
                 _draw_valid_score_values(
@@ -445,6 +461,8 @@ def _draw_valid_score_values(
     require_antithetic: bool,
 ) -> torch.Tensor:
     """Draw primary score times, optionally requiring valid complementary times."""
+    if count == 0:
+        return torch.empty(0, device=device, dtype=dtype)
     accepted: list[torch.Tensor] = []
     attempts = 0
     required = count
@@ -456,11 +474,15 @@ def _draw_valid_score_values(
         candidates = torch.rand(
             candidate_count, device=device, dtype=dtype, generator=generator
         )
-        stable_time = candidates.to(dtype=torch.float32)
-        gamma = schedule.noise_scale(stable_time)
-        valid = (stable_time > 0.0) & (stable_time < 1.0) & (gamma.abs() >= threshold)
+        validation_time = candidates.to(dtype=_compute_dtype(dtype))
+        gamma = schedule.noise_scale(validation_time)
+        valid = (
+            (validation_time > 0.0)
+            & (validation_time < 1.0)
+            & (gamma.abs() >= threshold)
+        )
         if require_antithetic:
-            complement = 1.0 - stable_time
+            complement = (1.0 - candidates).to(dtype=_compute_dtype(dtype))
             complement_gamma = schedule.noise_scale(complement)
             valid &= (
                 (complement > 0.0)
