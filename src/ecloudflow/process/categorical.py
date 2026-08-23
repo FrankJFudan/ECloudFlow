@@ -66,8 +66,11 @@ class CategoricalPath:
             contracts are invalid.
 
         ``t=0`` is exactly the configured prior and ``t=1`` is exactly the data
-        one-hot distribution. The calculation does not mutate either input and
-        preserves autograd through a floating time tensor.
+        one-hot distribution. A straight-through value correction retains those
+        exact forward values while its time gradient is the intended affine
+        one-sided derivative ``one_hot(target)-prior`` at both endpoints.
+        Interior rows use stable normalization. The calculation does not mutate
+        either input and preserves autograd through a floating time tensor.
         """
         _validate_target(target, self.num_classes, self._prior.device)
         expanded_time = _expand_time(time, target)
@@ -80,11 +83,12 @@ class CategoricalPath:
         normalized = interpolated / interpolated.sum(dim=-1, keepdim=True)
         start = expanded_time.eq(0.0).unsqueeze(-1)
         end = expanded_time.eq(1.0).unsqueeze(-1)
-        probabilities = torch.where(
+        forward_values = torch.where(
             start,
             prior.expand(*target.shape, self.num_classes),
             torch.where(end, one_hot, normalized),
         )
+        probabilities = interpolated + (forward_values - interpolated).detach()
         if not bool(torch.isfinite(probabilities).all()):
             raise ValueError("categorical probabilities must remain finite.")
         return probabilities

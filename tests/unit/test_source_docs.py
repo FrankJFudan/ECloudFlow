@@ -1,9 +1,11 @@
 """Tests for the Python source documentation policy checker."""
 
+import inspect
 from pathlib import Path
 
 import pytest
 
+from ecloudflow.process import ContinuousPath
 from tools.check_python_docs import API_DOC_CONTRACTS, DESIGNATED_APIS, check_paths
 
 
@@ -91,6 +93,7 @@ def test_task9_designated_apis_keep_stochastic_path_contracts() -> None:
         "continuous.ContinuousPath.sample",
         "continuous.ContinuousPath.targets",
         "continuous.ContinuousPath.velocity_loss",
+        "continuous.ContinuousPath.sample_times",
         "categorical.CategoricalPath.sample",
         "categorical.CategoricalPath.endpoint_loss",
         "schedules.InterpolantSchedule.data_weight",
@@ -107,6 +110,7 @@ def test_task9_designated_apis_keep_stochastic_path_contracts() -> None:
         root / "src/ecloudflow/process/schedules.py",
     ]
     assert check_paths(paths, designated=required) == []
+    assert ":raises TypeError:" in inspect.getdoc(ContinuousPath.sample_times)
 
 
 def test_checker_rejects_missing_designated_api(tmp_path: Path) -> None:

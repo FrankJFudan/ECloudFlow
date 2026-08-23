@@ -345,6 +345,9 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
     "continuous.ContinuousPath.velocity_loss": APIDocContract(
         True, (_DEVICE, _DTYPE, _SHAPE, _MASK, _MUTATION, _FAILURE, _GRADIENT)
     ),
+    "continuous.ContinuousPath.sample_times": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
     "categorical.CategoricalPath.sample": APIDocContract(
         True,
         (_DEVICE, _DTYPE, _SHAPE, _MASK, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT),

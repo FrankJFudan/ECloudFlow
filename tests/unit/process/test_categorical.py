@@ -54,6 +54,46 @@ def test_categorical_probability_endpoints_are_exact_canonical_values() -> None:
     assert torch.equal(finish, torch.nn.functional.one_hot(target, 3).float())
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_categorical_endpoint_values_keep_one_sided_time_gradients(
+    dtype: torch.dtype,
+) -> None:
+    """Exact endpoint forwards retain the affine path's endpoint derivatives."""
+    path = CategoricalPath(
+        num_classes=3,
+        prior=torch.tensor([0.2, 0.3, 0.5], dtype=dtype),
+    )
+    target = torch.tensor([2])
+    coefficients = torch.tensor([1.25, -0.5, 2.0], dtype=dtype)
+    expected_derivative = (
+        (torch.nn.functional.one_hot(target, 3).to(dtype) - path.prior) * coefficients
+    ).sum()
+    for endpoint in (0.0, 1.0):
+        time = torch.tensor(endpoint, dtype=dtype, requires_grad=True)
+        probabilities = path.probabilities(target, time)
+        assert torch.equal(
+            probabilities,
+            path.prior.expand(1, -1)
+            if endpoint == 0.0
+            else torch.nn.functional.one_hot(target, 3).to(dtype),
+        )
+        gradient = torch.autograd.grad((probabilities * coefficients).sum(), time)[0]
+        assert torch.allclose(gradient, expected_derivative, atol=1e-6, rtol=1e-6)
+
+    delta = 1e-6 if dtype == torch.float32 else 1e-10
+    near_start = path.probabilities(target, torch.tensor(delta, dtype=dtype))
+    near_finish = path.probabilities(target, torch.tensor(1.0 - delta, dtype=dtype))
+    expected_finish = torch.nn.functional.one_hot(target, 3).to(dtype)
+    tolerance = 3e-6 if dtype == torch.float32 else 1e-9
+    assert torch.allclose(near_start, path.prior.expand(1, -1), atol=tolerance)
+    assert torch.allclose(near_finish, expected_finish, atol=tolerance)
+    assert torch.allclose(
+        torch.cat((near_start, near_finish)).sum(-1),
+        torch.ones(2, dtype=dtype),
+        atol=tolerance,
+    )
+
+
 def test_endpoint_cross_entropy_masks_fixed_entries_without_biased_denominator() -> (
     None
 ):

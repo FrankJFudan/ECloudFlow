@@ -207,6 +207,8 @@ class ContinuousPath:
         :rtype: torch.Tensor
         :raises ValueError: If shape, dtype, mode, or score-trainable support
             is invalid.
+        :raises TypeError: If ``shape`` is neither an integer nor a sequence of
+            integer dimensions.
         :raises RuntimeError: If the supplied generator cannot generate on the
             requested device.
 
