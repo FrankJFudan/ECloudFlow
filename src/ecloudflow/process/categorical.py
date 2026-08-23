@@ -33,7 +33,8 @@ class CategoricalPath:
         :param num_classes: Number of classes in the fixed categorical
             vocabulary, at least two.
         :param prior: Finite floating normalized simplex of shape ``[C]`` on
-            the device that target class tensors will use.
+            the device that target class tensors will use. Reduced-precision
+            priors are checked in float32 and normalized there for stable rows.
         :raises ValueError: If class count, prior shape/dtype/finiteness/device,
             non-negativity, or normalization is invalid.
         """
@@ -41,7 +42,9 @@ class CategoricalPath:
             raise ValueError("num_classes must be an integer of at least two.")
         _validate_prior(prior, num_classes)
         self.num_classes = num_classes
-        self._prior = prior.detach().clone()
+        probability_dtype = _probability_dtype(prior.dtype)
+        stable_prior = prior.to(dtype=probability_dtype)
+        self._prior = (stable_prior / stable_prior.sum()).detach().clone()
 
     @property
     def prior(self) -> torch.Tensor:
@@ -56,7 +59,8 @@ class CategoricalPath:
         :param time: Floating scalar or target-prefix batch tensor on the same
             device with values in ``[0,1]``.
         :return: Normalized finite probabilities with shape ``target.shape+[C]``
-            and the prior dtype/device.
+            and float32 dtype for FP16/BF16/FP32 priors or float64 for float64
+            priors, on the prior device.
         :rtype: torch.Tensor
         :raises ValueError: If classes, time, device, or finite simplex
             contracts are invalid.
@@ -73,6 +77,7 @@ class CategoricalPath:
         prior = self._prior.reshape(*([1] * target.ndim), self.num_classes)
         weights = expanded_time.to(dtype=self._prior.dtype).unsqueeze(-1)
         probabilities = (1.0 - weights) * prior + weights * one_hot
+        probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
         if not bool(torch.isfinite(probabilities).all()):
             raise ValueError("categorical probabilities must remain finite.")
         return probabilities
@@ -100,6 +105,8 @@ class CategoricalPath:
         :rtype: CategoricalSample
         :raises ValueError: If class, time, mask, shape, device, or dtype
             contracts are invalid.
+        :raises RuntimeError: If the supplied generator is incompatible with
+            the class-probability device.
 
         Sampling does not mutate target, masks, or the retained prior. Fixed
         entries are selected functionally, never approximately renormalized;
@@ -119,7 +126,7 @@ class CategoricalPath:
             classes = torch.empty_like(target)
         else:
             classes = torch.multinomial(
-                probabilities.reshape(-1, self.num_classes).to(dtype=torch.float32),
+                _multinomial_probabilities(probabilities).reshape(-1, self.num_classes),
                 1,
                 replacement=True,
                 generator=generator,
@@ -202,15 +209,39 @@ def _validate_prior(prior: torch.Tensor, num_classes: int) -> None:
         )
     if bool((prior < 0.0).any()):
         raise ValueError("prior probabilities must be non-negative.")
-    tolerance = 10.0 * torch.finfo(prior.dtype).eps
+    stable_prior = prior.to(dtype=_probability_dtype(prior.dtype))
+    tolerance = (
+        1e-8
+        if prior.dtype == torch.float64
+        else 4e-3
+        if prior.dtype in (torch.float16, torch.bfloat16)
+        else 1e-5
+    )
     if not bool(
         torch.isclose(
-            prior.sum(), prior.new_tensor(1.0), atol=tolerance, rtol=tolerance
+            stable_prior.sum(),
+            stable_prior.new_tensor(1.0),
+            atol=tolerance,
+            rtol=tolerance,
         )
     ):
         raise ValueError("prior probabilities must sum to one.")
     if not bool((prior > 0.0).any()):
         raise ValueError("prior must assign positive mass to at least one class.")
+
+
+def _probability_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Choose stable simplex arithmetic while preserving float64 probabilities."""
+    return torch.float64 if dtype == torch.float64 else torch.float32
+
+
+def _multinomial_probabilities(probabilities: torch.Tensor) -> torch.Tensor:
+    """Preserve float64 probabilities and only promote reduced precision draws."""
+    return (
+        probabilities.float()
+        if probabilities.dtype in (torch.float16, torch.bfloat16)
+        else probabilities
+    )
 
 
 def _validate_target(

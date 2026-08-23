@@ -352,6 +352,18 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
     "categorical.CategoricalPath.endpoint_loss": APIDocContract(
         True, (_DEVICE, _DTYPE, _SHAPE, _MASK, _MUTATION, _FAILURE, _GRADIENT)
     ),
+    "schedules.InterpolantSchedule.data_weight": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
+    "schedules.InterpolantSchedule.data_weight_derivative": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
+    "schedules.InterpolantSchedule.noise_scale": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
+    "schedules.InterpolantSchedule.noise_scale_derivative": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
 }
 DESIGNATED_APIS = frozenset(API_DOC_CONTRACTS)
 

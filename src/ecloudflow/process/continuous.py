@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -18,6 +19,8 @@ class ContinuousSample:
     ``value`` equals ``(1-a(t))x0 + a(t)x1 + g(t)noise``. ``noise`` has the
     endpoint tensor shape and is retained so conditional velocity and score
     targets use precisely the same random coupling used to create ``value``.
+    For FP16/BF16 endpoints, ``noise`` is deliberately float32 rather than
+    downcast, while ``value`` remains at endpoint dtype.
     """
 
     value: torch.Tensor
@@ -98,14 +101,18 @@ class ContinuousPath:
         :param generator: Optional torch generator controlling the sole normal
             draw. Reusing an equally seeded compatible generator is deterministic.
         :return: Immutable sample with endpoint-shaped ``value`` and ``noise``
-            plus the unmodified caller time tensor.
+            plus the unmodified caller time tensor. ``noise`` is float32 for
+            FP16/BF16 endpoints and otherwise has endpoint dtype.
         :rtype: ContinuousSample
         :raises ValueError: If inputs have invalid shape, dtype, device,
             finiteness, or time range.
+        :raises RuntimeError: If the supplied generator cannot generate on the
+            endpoint device.
 
         No input is mutated and autograd remains connected to ``x0`` and ``x1``.
         The normal noise itself has no gradient. FP16/BF16 bridge arithmetic is
-        performed in float32 and cast back to the endpoint dtype.
+        performed in float32 and only ``value`` is cast back to endpoint dtype;
+        retained epsilon is never downcast before target construction.
         """
         _validate_endpoints(x0, x1)
         expanded = _expand_time(time, x0)
@@ -121,9 +128,7 @@ class ContinuousPath:
             + coefficient * x1.to(compute_dtype)
             + scale * noise
         )
-        return ContinuousSample(
-            value=value.to(dtype=x0.dtype), time=time, noise=noise.to(dtype=x0.dtype)
-        )
+        return ContinuousSample(value=value.to(dtype=x0.dtype), time=time, noise=noise)
 
     def targets(
         self, x0: torch.Tensor, x1: torch.Tensor, sample: ContinuousSample
@@ -134,20 +139,22 @@ class ContinuousPath:
         :param x1: Finite floating data endpoint matching ``x0`` shape, dtype,
             and device.
         :param sample: Coupled output from :meth:`sample`; its noise must match
-            endpoint shape/dtype/device and its time must be strictly interior.
-        :return: ``(velocity, score)`` tensors matching endpoint shape, dtype,
-            and device. Velocity is ``a'(t)(x1-x0)+g'(t)epsilon`` and score is
+            endpoint shape/device and uses float32 dtype for FP16/BF16
+            endpoints (otherwise endpoint dtype); time must be strictly interior.
+        :return: ``(velocity, score)`` tensors matching endpoint shape/device.
+            Their dtype is float32 for FP16/BF16 endpoints and endpoint dtype
+            otherwise. Velocity is ``a'(t)(x1-x0)+g'(t)epsilon`` and score is
             ``-epsilon/g(t)``.
         :rtype: tuple[torch.Tensor, torch.Tensor]
         :raises TypeError: If ``sample`` is not a :class:`ContinuousSample`.
         :raises ValueError: If contracts disagree, time is not in the open
-            interval, or the schedule has non-positive interior noise.
+            interval, or ``abs(gamma(t))`` is below ``numerical_epsilon``.
 
-        Endpoint scores are deliberately undefined and rejected, never made up
-        by endpoint denominator clamping. At valid interior times only,
-        ``numerical_epsilon`` bounds the denominator against underflow. Inputs
-        and the frozen sample are not mutated; endpoint gradients flow through
-        velocity while score has the sampled-noise gradient semantics.
+        Endpoint scores are deliberately undefined and rejected. Interior times
+        with a too-small nonzero noise scale are also excluded; accepted scores
+        use the exact denominator, never a clamped surrogate. Inputs and the
+        frozen sample are not mutated; endpoint gradients flow through velocity
+        while score has the sampled-noise gradient semantics.
         """
         _validate_endpoints(x0, x1)
         if not isinstance(sample, ContinuousSample):
@@ -165,10 +172,12 @@ class ContinuousPath:
             + self.schedule.noise_scale_derivative(time) * noise
         )
         gamma = self.schedule.noise_scale(time)
-        if not bool((gamma > 0.0).all()):
-            raise ValueError("schedule noise scale must be positive at interior times.")
-        score = -noise / gamma.clamp_min(self.numerical_epsilon)
-        return velocity.to(dtype=x0.dtype), score.to(dtype=x0.dtype)
+        if not bool((gamma.abs() >= self.numerical_epsilon).all()):
+            raise ValueError(
+                "score targets exclude times whose abs(gamma) is below numerical_epsilon."
+            )
+        score = -noise / gamma
+        return velocity, score
 
     def sample_times(
         self,
@@ -178,6 +187,7 @@ class ContinuousPath:
         dtype: torch.dtype = torch.float32,
         generator: torch.Generator | None = None,
         antithetic: bool = False,
+        mode: Literal["score", "flow"] = "score",
     ) -> torch.Tensor:
         """Draw reproducible open-interval training times, optionally paired.
 
@@ -189,35 +199,46 @@ class ContinuousPath:
         :param generator: Optional generator controlling all uniform draws.
         :param antithetic: Pair flattened draws as ``u, 1-u``; an odd final
             element is independently drawn.
-        :return: Finite times with ``shape`` and values strictly in ``(0,1)``.
+        :param mode: ``"score"`` (default) rejects values with
+            ``abs(gamma(t)) < numerical_epsilon``; explicit ``"flow"`` draws
+            closed-interval bridge times without score-trainability filtering.
+        :return: Finite times with ``shape``. Score mode yields only strictly
+            interior, score-trainable values; flow mode yields ``[0,1]``.
         :rtype: torch.Tensor
-        :raises ValueError: If shape or dtype is invalid.
+        :raises ValueError: If shape, dtype, mode, or score-trainable support
+            is invalid.
+        :raises RuntimeError: If the supplied generator cannot generate on the
+            requested device.
 
         The operation does not mutate a caller tensor. Antithetic layout is
         deterministic: the first half is ``u`` and the next half is ``1-u``;
-        only the supplied generator determines randomness.
+        only the supplied generator determines randomness. No caller tensors
+        exist to mutate, and sampled times are not differentiable random draws.
         """
         output_shape = _normalize_shape(shape)
         if not torch.empty((), dtype=dtype).is_floating_point():
             raise ValueError("dtype must be a floating torch dtype.")
+        if mode not in {"score", "flow"}:
+            raise ValueError("mode must be 'score' or 'flow'.")
         count = math.prod(output_shape)
-        if not antithetic:
-            raw = torch.rand(
-                output_shape, device=device, dtype=dtype, generator=generator
+        if mode == "flow":
+            return _draw_uniform_times(
+                output_shape,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+                antithetic=antithetic,
             )
-        else:
-            pair_count = count // 2
-            leading = torch.rand(
-                pair_count, device=device, dtype=dtype, generator=generator
-            )
-            values = [leading, 1.0 - leading]
-            if count % 2:
-                values.append(
-                    torch.rand(1, device=device, dtype=dtype, generator=generator)
-                )
-            raw = torch.cat(values).reshape(output_shape)
-        epsilon = torch.finfo(dtype).eps
-        return raw.clamp(min=epsilon, max=1.0 - epsilon)
+        values = _draw_score_times(
+            self.schedule,
+            count,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+            antithetic=antithetic,
+            threshold=self.numerical_epsilon,
+        )
+        return values.reshape(output_shape)
 
     def velocity_loss(
         self,
@@ -236,20 +257,24 @@ class ContinuousPath:
             every feature of ``[N,C]``; true entries, not fixed entries, enter
             the reduction.
         :return: Scalar MSE in float32 for BF16/FP16 inputs, otherwise the
-            native floating accumulation dtype.
+            native floating accumulation dtype. Empty tensors or an all-false
+            mask return a differentiable finite zero.
         :rtype: torch.Tensor
         :raises ValueError: If tensors or mask violate shape/dtype/device/
             finiteness contracts.
 
         The denominator is the number of selected scalar entries, preventing
-        fixed fragment entries from biasing the result. A fully fixed mask
-        returns a differentiable zero. No input is mutated and prediction
-        gradients remain intact under autocast.
+        fixed fragment entries from biasing the result. Arbitrary empty leading
+        dimensions and a fully fixed mask return a differentiable zero instead
+        of a mean-of-empty NaN. No input is mutated and prediction gradients
+        remain intact under autocast.
         """
         _validate_endpoints(prediction, target)
         compute_dtype = _compute_dtype(prediction.dtype)
         squared = (prediction.to(compute_dtype) - target.to(compute_dtype)).square()
         if edit_mask is None:
+            if squared.numel() == 0:
+                return squared.sum() * 0.0
             return squared.mean()
         expanded = _expand_mask(edit_mask, prediction)
         weights = expanded.to(dtype=compute_dtype)
@@ -289,18 +314,20 @@ def _expand_time(time: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
 
 def _validate_sample(sample: ContinuousSample, reference: torch.Tensor) -> None:
     """Check shape, dtype, device, and finite sample components."""
+    expected_noise_dtype = _compute_dtype(reference.dtype)
     for name in ("value", "noise"):
         tensor = getattr(sample, name)
+        expected_dtype = reference.dtype if name == "value" else expected_noise_dtype
         if (
             not isinstance(tensor, torch.Tensor)
             or tensor.shape != reference.shape
-            or tensor.dtype != reference.dtype
+            or tensor.dtype != expected_dtype
             or tensor.device != reference.device
             or not tensor.is_floating_point()
             or not bool(torch.isfinite(tensor).all())
         ):
             raise ValueError(
-                f"sample.{name} must match endpoint shape, dtype, device, and finiteness."
+                f"sample.{name} must match endpoint shape, expected dtype, device, and finiteness."
             )
 
 
@@ -328,6 +355,7 @@ def _compute_dtype(dtype: torch.dtype) -> torch.dtype:
 
 def _normalize_shape(shape: int | Sequence[int] | torch.Size) -> tuple[int, ...]:
     """Normalize one public sample-time shape into a validated tuple."""
+    values: tuple[int, ...]
     if isinstance(shape, int):
         values = (shape,)
     else:
@@ -335,3 +363,112 @@ def _normalize_shape(shape: int | Sequence[int] | torch.Size) -> tuple[int, ...]
     if any(not isinstance(value, int) or value < 0 for value in values):
         raise ValueError("shape must contain only non-negative integers.")
     return values
+
+
+def _draw_uniform_times(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device | str | None,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+    antithetic: bool,
+) -> torch.Tensor:
+    """Draw flow times with deterministic optional antithetic ordering."""
+    count = math.prod(shape)
+    if not antithetic:
+        return torch.rand(shape, device=device, dtype=dtype, generator=generator)
+    pair_count = count // 2
+    leading = torch.rand(pair_count, device=device, dtype=dtype, generator=generator)
+    values = [leading, 1.0 - leading]
+    if count % 2:
+        values.append(torch.rand(1, device=device, dtype=dtype, generator=generator))
+    return torch.cat(values).reshape(shape)
+
+
+def _draw_score_times(
+    schedule: InterpolantSchedule,
+    count: int,
+    *,
+    device: torch.device | str | None,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+    antithetic: bool,
+    threshold: float,
+) -> torch.Tensor:
+    """Rejection-sample score-trainable times without changing their targets."""
+    if count == 0:
+        return torch.empty(0, device=device, dtype=dtype)
+    if antithetic:
+        pair_count = count // 2
+        primary = _draw_valid_score_values(
+            schedule,
+            pair_count,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+            threshold=threshold,
+            require_antithetic=True,
+        )
+        values = [primary, 1.0 - primary]
+        if count % 2:
+            values.append(
+                _draw_valid_score_values(
+                    schedule,
+                    1,
+                    device=device,
+                    dtype=dtype,
+                    generator=generator,
+                    threshold=threshold,
+                    require_antithetic=False,
+                )
+            )
+        return torch.cat(values)
+    return _draw_valid_score_values(
+        schedule,
+        count,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+        threshold=threshold,
+        require_antithetic=False,
+    )
+
+
+def _draw_valid_score_values(
+    schedule: InterpolantSchedule,
+    count: int,
+    *,
+    device: torch.device | str | None,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+    threshold: float,
+    require_antithetic: bool,
+) -> torch.Tensor:
+    """Draw primary score times, optionally requiring valid complementary times."""
+    accepted: list[torch.Tensor] = []
+    attempts = 0
+    required = count
+    while required:
+        attempts += 1
+        if attempts > 4096:
+            raise ValueError("schedule has no reachable score-trainable time support.")
+        candidate_count = max(required * 2, 32)
+        candidates = torch.rand(
+            candidate_count, device=device, dtype=dtype, generator=generator
+        )
+        stable_time = candidates.to(dtype=torch.float32)
+        gamma = schedule.noise_scale(stable_time)
+        valid = (stable_time > 0.0) & (stable_time < 1.0) & (gamma.abs() >= threshold)
+        if require_antithetic:
+            complement = 1.0 - stable_time
+            complement_gamma = schedule.noise_scale(complement)
+            valid &= (
+                (complement > 0.0)
+                & (complement < 1.0)
+                & (complement_gamma.abs() >= threshold)
+            )
+        selected = candidates[valid][:required]
+        if selected.numel():
+            accepted.append(selected)
+            required -= selected.numel()
+    return torch.cat(accepted)

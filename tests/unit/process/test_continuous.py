@@ -59,6 +59,43 @@ def test_continuous_path_rejects_endpoint_scores_and_preserves_inputs() -> None:
     assert torch.equal(x1, torch.ones_like(x1))
 
 
+def test_score_threshold_excludes_unstable_times_and_keeps_exact_nearby_score() -> None:
+    """Small nonzero gamma is excluded instead of silently denominator-clamped."""
+    path = ContinuousPath(LinearBridge(), numerical_epsilon=1e-6)
+    x0 = torch.zeros(2, 3)
+    x1 = torch.ones_like(x0)
+    excluded = path.sample(x0, x1, torch.tensor(1e-8), generator=_generator(2))
+    with pytest.raises(ValueError, match="below numerical_epsilon"):
+        path.targets(x0, x1, excluded)
+
+    time = torch.tensor(2e-6)
+    accepted = path.sample(x0, x1, time, generator=_generator(2))
+    _, score = path.targets(x0, x1, accepted)
+    expected = -accepted.noise / path.schedule.noise_scale(time)
+    assert torch.equal(score, expected)
+
+
+def test_reduced_precision_retains_float32_epsilon_and_float32_targets() -> None:
+    """BF16 targets use the original float32 epsilon from the sampled coupling."""
+    path = ContinuousPath(LinearBridge(interior_noise=0.2))
+    x0 = torch.zeros(2, 3, dtype=torch.bfloat16, requires_grad=True)
+    x1 = torch.ones(2, 3, dtype=torch.bfloat16, requires_grad=True)
+    time = torch.tensor(0.4)
+    sample = path.sample(x0, x1, time, generator=_generator(10))
+    velocity, score = path.targets(x0, x1, sample)
+    assert sample.value.dtype == torch.bfloat16
+    assert sample.noise.dtype == velocity.dtype == score.dtype == torch.float32
+    expected_velocity = (x1.float() - x0.float()) + 0.2 * (
+        1.0 - 2.0 * time
+    ) * sample.noise
+    expected_score = -sample.noise / (0.2 * time * (1.0 - time))
+    assert torch.equal(velocity, expected_velocity)
+    assert torch.equal(score, expected_score)
+    (velocity.square().mean() + score.square().mean()).backward()
+    assert x0.grad is not None and torch.isfinite(x0.grad).all()
+    assert x1.grad is not None and torch.isfinite(x1.grad).all()
+
+
 def test_batch_times_and_antithetic_sampling_are_deterministic() -> None:
     """Batch time broadcasting and generator streams have stable semantics."""
     path = ContinuousPath(LinearBridge())
@@ -73,6 +110,7 @@ def test_batch_times_and_antithetic_sampling_are_deterministic() -> None:
     assert torch.equal(
         times, path.sample_times(4, generator=_generator(7), antithetic=True)
     )
+    assert bool((path.schedule.noise_scale(times) >= path.numerical_epsilon).all())
 
 
 def test_bfloat16_reduction_accumulates_in_float32() -> None:
@@ -100,3 +138,20 @@ def test_targets_and_masked_loss_preserve_prediction_gradients() -> None:
     ).backward()
     assert prediction.grad is not None
     assert x0.grad is not None and x1.grad is not None
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_empty_velocity_loss_is_differentiable_finite_zero(masked: bool) -> None:
+    """Empty arbitrary leading dimensions never reduce to a NaN mean."""
+    path = ContinuousPath(LinearBridge())
+    prediction = torch.empty(0, 3, requires_grad=True)
+    target = torch.empty_like(prediction)
+    loss = path.velocity_loss(
+        prediction,
+        target,
+        edit_mask=torch.empty(0, dtype=torch.bool) if masked else None,
+    )
+    assert loss.dtype == torch.float32 and loss.item() == 0.0
+    loss.backward()
+    assert prediction.grad is not None
+    assert torch.equal(prediction.grad, torch.zeros_like(prediction.grad))

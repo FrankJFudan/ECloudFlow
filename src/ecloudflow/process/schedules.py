@@ -20,19 +20,67 @@ class InterpolantSchedule(ABC):
 
     @abstractmethod
     def data_weight(self, time: torch.Tensor) -> torch.Tensor:
-        """Return the analytic coefficient of the data endpoint."""
+        """Return the analytic data-endpoint coefficient ``a(t)``.
+
+        :param time: Finite floating tensor of any shape, dtype, and device,
+            with every value in the closed interval ``[0,1]``.
+        :return: Coefficients matching ``time`` shape, dtype, and device, with
+            ``a(0)=0`` and ``a(1)=1``.
+        :rtype: torch.Tensor
+        :raises ValueError: If time dtype, finiteness, shape, or endpoints are
+            invalid for the schedule.
+
+        Implementations do not mutate time or consume randomness, are
+        deterministic for identical inputs, and retain autograd gradients with
+        respect to floating time values.
+        """
 
     @abstractmethod
     def data_weight_derivative(self, time: torch.Tensor) -> torch.Tensor:
-        """Return the exact derivative of :meth:`data_weight`."""
+        """Return the analytic derivative ``a'(t)`` of the data weight.
+
+        :param time: Finite floating tensor of arbitrary shape, dtype, and
+            device, containing times in ``[0,1]``.
+        :return: Exact derivative values matching time shape, dtype, and device.
+        :rtype: torch.Tensor
+        :raises ValueError: If time dtype, finite values, shape, or interval is
+            invalid.
+
+        This method never mutates time or uses random state. It is deterministic
+        and differentiable with respect to time wherever the schedule is.
+        """
 
     @abstractmethod
     def noise_scale(self, time: torch.Tensor) -> torch.Tensor:
-        """Return the non-negative noise coefficient of the bridge."""
+        """Return the analytic noise scale ``g(t)`` of the bridge.
+
+        :param time: Finite floating tensor with arbitrary shape, dtype, and
+            device, whose values lie in ``[0,1]``.
+        :return: Noise scales matching time shape, dtype, and device; endpoint
+            values are exactly zero and score training uses only stable interior
+            values.
+        :rtype: torch.Tensor
+        :raises ValueError: If time dtype, finite values, shape, or interval is
+            invalid.
+
+        Implementations are deterministic, do not mutate input storage, and
+        preserve autograd gradients for floating time tensors.
+        """
 
     @abstractmethod
     def noise_scale_derivative(self, time: torch.Tensor) -> torch.Tensor:
-        """Return the exact derivative of :meth:`noise_scale`."""
+        """Return the analytic derivative ``g'(t)`` of the noise scale.
+
+        :param time: Finite floating time tensor with arbitrary shape, dtype,
+            and device, constrained to the closed unit interval.
+        :return: Exact derivative values matching time shape, dtype, and device.
+        :rtype: torch.Tensor
+        :raises ValueError: If time dtype, finiteness, shape, or interval is
+            invalid.
+
+        The derivative is deterministic, consumes no generator state, never
+        mutates time, and remains differentiable with respect to time.
+        """
 
 
 class LinearBridge(InterpolantSchedule):

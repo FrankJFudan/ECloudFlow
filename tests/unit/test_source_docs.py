@@ -93,12 +93,17 @@ def test_task9_designated_apis_keep_stochastic_path_contracts() -> None:
         "continuous.ContinuousPath.velocity_loss",
         "categorical.CategoricalPath.sample",
         "categorical.CategoricalPath.endpoint_loss",
+        "schedules.InterpolantSchedule.data_weight",
+        "schedules.InterpolantSchedule.data_weight_derivative",
+        "schedules.InterpolantSchedule.noise_scale",
+        "schedules.InterpolantSchedule.noise_scale_derivative",
     }
     assert required <= DESIGNATED_APIS
     root = Path(__file__).resolve().parents[2]
     paths = [
         root / "src/ecloudflow/process/continuous.py",
         root / "src/ecloudflow/process/categorical.py",
+        root / "src/ecloudflow/process/schedules.py",
     ]
     assert check_paths(paths, designated=required) == []
 
