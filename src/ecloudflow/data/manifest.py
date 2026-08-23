@@ -11,6 +11,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ecloudflow.data.splits import SplitAudit
+
 
 @dataclass(frozen=True)
 class ShardRecord:
@@ -20,6 +22,8 @@ class ShardRecord:
     :param sha256: File digest prefixed by ``"sha256:"``.
     :param size_bytes: Final tar size in bytes.
     :param sample_ids: Stable sample identifiers stored in the shard.
+    :return: Immutable content-addressed shard descriptor.
+    :rtype: ShardRecord
     """
 
     path: str
@@ -37,7 +41,7 @@ class ShardRecord:
             or candidate.suffix != ".tar"
         ):
             raise ValueError("shard path must be a safe relative tar path")
-        if not self.sha256.startswith("sha256:") or len(self.sha256) != 71:
+        if not _is_sha256(self.sha256):
             raise ValueError("shard sha256 must be a prefixed hexadecimal digest")
         if self.size_bytes <= 0:
             raise ValueError("shard size_bytes must be positive")
@@ -52,6 +56,8 @@ class SkipRecord:
     :param sample_id: Known source ID or ``"unknown"``.
     :param category: Stable exception category without sensitive text.
     :param message: Short sanitized diagnostic.
+    :return: Immutable bounded preprocessing failure descriptor.
+    :rtype: SkipRecord
     """
 
     sample_id: str
@@ -75,10 +81,14 @@ class DatasetManifest:
     :param source_hashes: Source hashes keyed by ``"sample_id:role"``.
     :param skips: Typed failures that were never replaced by another sample.
     :param preprocessing_version: Schema/preprocessing version string.
+    :param generation_id: Immutable dataset-generation directory identifier.
+    :param partition_mode: Explicit ``"grouped"`` or ``"unpartitioned"`` mode.
     :param split_hash: Optional grouped-split fingerprint.
     :param sample_partitions: Production sample-to-partition lookup.
+    :param sample_groups: Production sample-to-leakage-group lookup.
     :param entity_partitions: Entity lookup retained for leakage auditing.
     :param entity_groups: Entity-to-connected-group lookup for auditing.
+    :param split_audit: Recoverable grouping algorithm and input metadata.
     :return: Immutable, JSON-serializable manifest.
     :rtype: DatasetManifest
     """
@@ -88,15 +98,27 @@ class DatasetManifest:
     source_hashes: Mapping[str, str] = field(default_factory=dict)
     skips: tuple[SkipRecord, ...] = ()
     preprocessing_version: str = "1"
+    generation_id: str = "legacy"
+    partition_mode: str = "unpartitioned"
     split_hash: str | None = None
     sample_partitions: Mapping[str, str] = field(default_factory=dict)
+    sample_groups: Mapping[str, str] = field(default_factory=dict)
     entity_partitions: Mapping[str, str] = field(default_factory=dict)
     entity_groups: Mapping[str, str] = field(default_factory=dict)
+    split_audit: SplitAudit | None = None
 
     def __post_init__(self) -> None:
         """Validate cross-record coverage and freeze manifest mappings."""
         if not self.preprocessing_version:
             raise ValueError("preprocessing_version must be non-empty")
+        if not self.generation_id or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            for character in self.generation_id
+        ):
+            raise ValueError("generation_id must be a portable path component")
+        if self.partition_mode not in {"grouped", "unpartitioned"}:
+            raise ValueError("partition_mode must be grouped or unpartitioned")
         if len(self.sample_ids) != len(set(self.sample_ids)) or any(
             not sample_id for sample_id in self.sample_ids
         ):
@@ -106,11 +128,12 @@ class DatasetManifest:
         )
         if shard_ids != self.sample_ids:
             raise ValueError("manifest sample_ids must exactly match ordered shard IDs")
-        if self.split_hash is not None and not self.split_hash.startswith("sha256:"):
+        if self.split_hash is not None and not _is_sha256(self.split_hash):
             raise ValueError("split_hash must use a sha256 prefix")
         for name in (
             "source_hashes",
             "sample_partitions",
+            "sample_groups",
             "entity_partitions",
             "entity_groups",
         ):
@@ -124,10 +147,47 @@ class DatasetManifest:
             ):
                 raise ValueError(f"{name} must contain non-empty string pairs")
             object.__setattr__(self, name, MappingProxyType(values))
+        sample_id_set = set(self.sample_ids)
+        if self.partition_mode == "grouped":
+            if set(self.sample_partitions) != sample_id_set:
+                raise ValueError(
+                    "grouped sample_partitions must exactly cover serialized sample IDs"
+                )
+            if set(self.sample_groups) != sample_id_set:
+                raise ValueError(
+                    "grouped sample_groups must exactly cover serialized sample IDs"
+                )
+            if self.split_hash is None or self.split_audit is None:
+                raise ValueError(
+                    "grouped manifests require split hash and audit metadata"
+                )
+            if set(self.split_audit.input_hashes) != sample_id_set:
+                raise ValueError(
+                    "split audit inputs must exactly cover serialized sample IDs"
+                )
+        elif any(
+            (
+                self.sample_partitions,
+                self.sample_groups,
+                self.entity_partitions,
+                self.entity_groups,
+                self.split_hash,
+                self.split_audit,
+            )
+        ):
+            raise ValueError("unpartitioned manifests must not contain split metadata")
 
     @property
     def hash(self) -> str:
-        """Return a stable SHA-256 fingerprint of the manifest payload."""
+        """Return a stable SHA-256 fingerprint of the manifest payload.
+
+        :return: Lowercase hexadecimal digest prefixed by ``"sha256:"``.
+        :rtype: str
+
+        The hash covers generation paths, shard/source hashes, skips, explicit
+        partition mode, all sample/entity groups, and recoverable split audit
+        metadata. It excludes only its own derived hash field.
+        """
         payload = json.dumps(
             self.to_dict(include_hash=False),
             sort_keys=True,
@@ -163,10 +223,16 @@ class DatasetManifest:
                 for skip in self.skips
             ],
             "preprocessing_version": self.preprocessing_version,
+            "generation_id": self.generation_id,
+            "partition_mode": self.partition_mode,
             "split_hash": self.split_hash,
             "sample_partitions": dict(self.sample_partitions),
+            "sample_groups": dict(self.sample_groups),
             "entity_partitions": dict(self.entity_partitions),
             "entity_groups": dict(self.entity_groups),
+            "split_audit": self.split_audit.to_dict()
+            if self.split_audit is not None
+            else None,
         }
         if include_hash:
             data["hash"] = self.hash
@@ -219,12 +285,33 @@ class DatasetManifest:
             )
             for item in data.get("skips", ())
         )
+        if data.get("split_audit") is not None:
+            data["split_audit"] = SplitAudit.from_dict(data["split_audit"])
         manifest = cls(**data)
         if expected_hash is not None and manifest.hash != expected_hash:
             raise ValueError("dataset manifest hash does not match its content")
         return manifest
 
     def shard_paths(self, base_dir: str | Path) -> tuple[Path, ...]:
-        """Resolve all recorded shard paths relative to ``base_dir``."""
+        """Resolve immutable generation shard paths without filesystem mutation.
+
+        :param base_dir: Dataset root containing versioned generation directories.
+        :return: Manifest-ordered absolute or root-relative ``Path`` objects.
+        :rtype: tuple[pathlib.Path, ...]
+
+        The method performs no existence checks or directory creation. Callers
+        retain manifest order because it defines deterministic sample ordering.
+        """
         root = Path(base_dir)
         return tuple(root / shard.path for shard in self.shards)
+
+
+def _is_sha256(value: str) -> bool:
+    """Return whether ``value`` is a canonical prefixed hexadecimal digest."""
+    if not value.startswith("sha256:") or len(value) != 71:
+        return False
+    try:
+        int(value.removeprefix("sha256:"), 16)
+    except ValueError:
+        return False
+    return True

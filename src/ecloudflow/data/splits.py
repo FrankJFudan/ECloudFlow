@@ -9,11 +9,94 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+from Bio.Align import PairwiseAligner
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 _PARTITIONS = ("train", "val", "test")
+
+
+@dataclass(frozen=True)
+class SplitAudit:
+    """Persist every input needed to reproduce and audit a grouped split.
+
+    :param grouping_method: Versioned grouping algorithm identifier.
+    :param sequence_identity: Global-alignment protein identity threshold.
+    :param ligand_tanimoto: Murcko/Morgan ligand similarity threshold.
+    :param seed: Deterministic component allocation seed.
+    :param fractions: Train, validation, and test fractions.
+    :param input_hashes: Canonical leakage-input hash per sample.
+    :param source_identifiers: Traceable source identifier per sample.
+    :return: Immutable, JSON-serializable audit contract.
+    :rtype: SplitAudit
+    """
+
+    grouping_method: str
+    sequence_identity: float
+    ligand_tanimoto: float
+    seed: int
+    fractions: tuple[float, float, float]
+    input_hashes: Mapping[str, str]
+    source_identifiers: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        """Validate thresholds and freeze input/source lookup mappings."""
+        if not self.grouping_method:
+            raise ValueError("grouping_method must be non-empty")
+        _validate_split_parameters(
+            self.sequence_identity, self.ligand_tanimoto, self.fractions
+        )
+        for name in ("input_hashes", "source_identifiers"):
+            values = dict(getattr(self, name))
+            if any(not key or not value for key, value in values.items()):
+                raise ValueError(f"{name} must contain non-empty string pairs")
+            object.__setattr__(self, name, MappingProxyType(values))
+        if set(self.input_hashes) != set(self.source_identifiers):
+            raise ValueError(
+                "split input hashes and source identifiers must share keys"
+            )
+        if any(not _is_sha256(value) for value in self.input_hashes.values()):
+            raise ValueError("split input hashes must be prefixed SHA-256 digests")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return stable JSON primitives for manifests and split hashes.
+
+        :return: Complete recoverable audit fields with ordinary mappings/lists.
+        :rtype: dict[str, Any]
+
+        Mapping proxies are copied without mutating this record. Sorting occurs
+        only at the JSON/hash boundary, so scientific thresholds remain exact.
+        """
+        return {
+            "grouping_method": self.grouping_method,
+            "sequence_identity": self.sequence_identity,
+            "ligand_tanimoto": self.ligand_tanimoto,
+            "seed": self.seed,
+            "fractions": list(self.fractions),
+            "input_hashes": dict(self.input_hashes),
+            "source_identifiers": dict(self.source_identifiers),
+        }
+
+    @classmethod
+    def from_dict(cls, values: Mapping[str, Any]) -> SplitAudit:
+        """Reconstruct and validate an audit record from manifest primitives.
+
+        :param values: Mapping emitted by :meth:`to_dict`.
+        :return: Frozen audit metadata with recovered tuple/mapping types.
+        :rtype: SplitAudit
+        :raises KeyError: If a required recoverability field is absent.
+        :raises ValueError: If thresholds, fractions, hashes, or sources fail.
+        """
+        return cls(
+            grouping_method=str(values["grouping_method"]),
+            sequence_identity=float(values["sequence_identity"]),
+            ligand_tanimoto=float(values["ligand_tanimoto"]),
+            seed=int(values["seed"]),
+            fractions=tuple(float(value) for value in values["fractions"]),  # type: ignore[arg-type]
+            input_hashes=dict(values["input_hashes"]),
+            source_identifiers=dict(values["source_identifiers"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -24,6 +107,8 @@ class GroupedSplit:
     :param entity_partitions: Protein and ligand identifiers to partitions.
     :param sample_groups: Sample identifiers to connected leakage groups.
     :param entity_groups: Protein and ligand identifiers to leakage groups.
+    :param audit: Recoverable algorithms, thresholds, seed, fractions, and
+        canonical input/source hashes.
     :param hash: Content-addressed fingerprint prefixed by ``"sha256:"``.
     :return: Immutable grouped split result.
     :rtype: GroupedSplit
@@ -36,6 +121,7 @@ class GroupedSplit:
     entity_partitions: Mapping[str, str]
     sample_groups: Mapping[str, str]
     entity_groups: Mapping[str, str]
+    audit: SplitAudit
     hash: str
 
     def __post_init__(self) -> None:
@@ -55,41 +141,73 @@ class GroupedSplit:
             raise ValueError("sample partitions contain an unknown partition")
         if any(value not in _PARTITIONS for value in self.entity_partitions.values()):
             raise ValueError("entity partitions contain an unknown partition")
-        if not self.hash.startswith("sha256:") or len(self.hash) != 71:
+        if not _is_sha256(self.hash):
             raise ValueError("split hash must be a prefixed SHA-256 digest")
 
     @property
     def assignments(self) -> Mapping[str, str]:
-        """Return the production sample partition mapping."""
+        """Return the immutable production sample partition mapping.
+
+        :return: Sample IDs mapped to train, validation, or test.
+        :rtype: Mapping[str, str]
+        """
         return self.sample_partitions
 
     @property
     def groups(self) -> Mapping[str, str]:
-        """Return the production sample leakage-group mapping."""
+        """Return immutable sample-to-connected-component audit groups.
+
+        :return: Sample IDs mapped to stable hashed group identifiers.
+        :rtype: Mapping[str, str]
+        """
         return self.sample_groups
 
-    def partition_of(self, identifier: str) -> str:
+    def partition_of(self, identifier: str, *, entity_kind: str | None = None) -> str:
         """Return the partition for a sample or audited entity.
 
         :param identifier: Sample, protein, or ligand identifier.
+        :param entity_kind: Optional ``"protein"`` or ``"ligand"`` qualifier.
         :return: One of ``"train"``, ``"val"``, or ``"test``.
         :rtype: str
         :raises KeyError: If the identifier was absent from the split inputs.
         """
+        if entity_kind is not None:
+            if entity_kind not in {"protein", "ligand"}:
+                raise ValueError("entity_kind must be 'protein' or 'ligand'")
+            qualified = f"{entity_kind}:{identifier}"
+            if qualified in self.entity_partitions:
+                return self.entity_partitions[qualified]
+            raise KeyError(f"unknown split identifier: {qualified}")
         if identifier in self.sample_partitions:
             return self.sample_partitions[identifier]
-        if identifier in self.entity_partitions:
-            return self.entity_partitions[identifier]
+        matches = [
+            self.entity_partitions[qualified]
+            for qualified in (f"protein:{identifier}", f"ligand:{identifier}")
+            if qualified in self.entity_partitions
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise KeyError(
+                f"ambiguous entity identifier {identifier!r}; supply entity_kind"
+            )
         raise KeyError(f"unknown split identifier: {identifier}")
 
     def to_metadata(self) -> dict[str, Any]:
-        """Return JSON-serializable sample and entity split metadata."""
+        """Return complete JSON-serializable split publication metadata.
+
+        :return: Hash, sample/entity partitions and groups, and full audit data.
+        :rtype: dict[str, Any]
+
+        The returned dictionaries are copies; callers cannot mutate this split.
+        """
         return {
             "hash": self.hash,
             "sample_partitions": dict(self.sample_partitions),
             "entity_partitions": dict(self.entity_partitions),
             "sample_groups": dict(self.sample_groups),
             "entity_groups": dict(self.entity_groups),
+            "audit": self.audit.to_dict(),
         }
 
 
@@ -128,7 +246,7 @@ def build_grouped_split(
         ``source_id``), protein and ligand identifiers, and optionally
         ``sequence_cluster``, ``protein_sequence``, ``ligand_scaffold``, or
         ``ligand_smiles`` values.
-    :param sequence_identity: Pairwise positional identity threshold used only
+    :param sequence_identity: Global-alignment identity threshold used only
         when raw protein sequences are supplied. Precomputed sequence-cluster
         identifiers take precedence and are always honored.
     :param ligand_tanimoto: Morgan fingerprint Tanimoto threshold for ligand
@@ -152,8 +270,8 @@ def build_grouped_split(
     disjoint = _DisjointSet()
     normalized: list[dict[str, str | None]] = []
     for row, sample_id in zip(rows, sample_ids):
-        protein_id = _required_entity_id(row, "protein_id", "protein", sample_id)
-        ligand_id = _required_entity_id(row, "ligand_id", "ligand", sample_id)
+        protein_id = _required_entity_id(row, "protein_id", "protein")
+        ligand_id = _required_entity_id(row, "ligand_id", "ligand")
         sample_node = f"sample:{sample_id}"
         disjoint.find(sample_node)
         disjoint.union(sample_node, f"protein-id:{protein_id}")
@@ -164,6 +282,12 @@ def build_grouped_split(
         ligand_group = _optional_text(
             row.get("ligand_scaffold", row.get("ligand_group"))
         )
+        protein_sequence = _optional_text(row.get("protein_sequence"))
+        ligand_smiles = _optional_text(row.get("ligand_smiles"))
+        if protein_cluster is None and protein_sequence is None:
+            raise ValueError(f"sample {sample_id} lacks protein grouping evidence")
+        if ligand_group is None and ligand_smiles is None:
+            raise ValueError(f"sample {sample_id} lacks ligand grouping evidence")
         if protein_cluster:
             disjoint.union(sample_node, f"protein-cluster:{protein_cluster}")
         if ligand_group:
@@ -173,8 +297,12 @@ def build_grouped_split(
                 "sample_id": sample_id,
                 "protein_id": protein_id,
                 "ligand_id": ligand_id,
-                "protein_sequence": _optional_text(row.get("protein_sequence")),
-                "ligand_smiles": _optional_text(row.get("ligand_smiles")),
+                "protein_sequence": protein_sequence,
+                "ligand_smiles": ligand_smiles,
+                "protein_cluster": protein_cluster,
+                "ligand_group": ligand_group,
+                "source_identifier": _optional_text(row.get("source_identifier"))
+                or sample_id,
             }
         )
 
@@ -197,18 +325,37 @@ def build_grouped_split(
         root = disjoint.find(f"sample:{sample_id}")
         group_id = "group:sha256:" + hashlib.sha256(root.encode()).hexdigest()
         sample_groups[sample_id] = group_id
-        for entity_key in ("protein_id", "ligand_id"):
-            entity_id = str(row[entity_key])
+        for entity_kind, entity_key in (
+            ("protein", "protein_id"),
+            ("ligand", "ligand_id"),
+        ):
+            entity_id = f"{entity_kind}:{row[entity_key]}"
             previous = entity_partitions.get(entity_id)
             if previous is not None and previous != partitions[sample_id]:
                 raise RuntimeError("entity leakage remained after component grouping")
             entity_partitions[entity_id] = partitions[sample_id]
             entity_groups[entity_id] = group_id
+    input_hashes = {
+        str(row["sample_id"]): "sha256:"
+        + hashlib.sha256(
+            json.dumps(row, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        for row in normalized
+    }
+    source_identifiers = {
+        str(row["sample_id"]): str(row["source_identifier"]) for row in normalized
+    }
+    audit = SplitAudit(
+        grouping_method="ecloudflow.connected-components.global-align.murcko-morgan.v1",
+        sequence_identity=sequence_identity,
+        ligand_tanimoto=ligand_tanimoto,
+        seed=seed,
+        fractions=fractions,
+        input_hashes=input_hashes,
+        source_identifiers=source_identifiers,
+    )
     payload = {
-        "seed": seed,
-        "sequence_identity": sequence_identity,
-        "ligand_tanimoto": ligand_tanimoto,
-        "fractions": fractions,
+        "audit": audit.to_dict(),
         "sample_partitions": partitions,
         "entity_partitions": entity_partitions,
         "sample_groups": sample_groups,
@@ -225,6 +372,7 @@ def build_grouped_split(
         entity_partitions=entity_partitions,
         sample_groups=sample_groups,
         entity_groups=entity_groups,
+        audit=audit,
         hash=digest,
     )
 
@@ -257,13 +405,11 @@ def _sample_identifier(record: Mapping[str, Any]) -> str:
     return value.strip()
 
 
-def _required_entity_id(
-    record: Mapping[str, Any], primary: str, fallback: str, sample_id: str
-) -> str:
-    """Extract an entity identifier with a stable sample-scoped fallback."""
-    value = record.get(primary, record.get(fallback, f"{fallback}:{sample_id}"))
+def _required_entity_id(record: Mapping[str, Any], primary: str, fallback: str) -> str:
+    """Extract a required entity identifier without leakage-hiding fallbacks."""
+    value = record.get(primary, record.get(fallback))
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{primary} must be a non-empty string when supplied")
+        raise ValueError(f"{primary} is required and must be a non-empty string")
     return value.strip()
 
 
@@ -286,19 +432,38 @@ def _union_similar_sequences(
             right_sequence = right["protein_sequence"]
             if (
                 right_sequence
-                and _positional_identity(left_sequence, right_sequence) >= threshold
+                and _global_alignment_identity(left_sequence, right_sequence)
+                >= threshold
             ):
                 disjoint.union(
                     f"sample:{left['sample_id']}", f"sample:{right['sample_id']}"
                 )
 
 
-def _positional_identity(left: str, right: str) -> float:
-    """Return conservative ungapped positional sequence identity."""
-    denominator = max(len(left), len(right))
-    if denominator == 0:
-        return 0.0
-    return sum(a == b for a, b in zip(left, right)) / denominator
+def _global_alignment_identity(left: str, right: str) -> float:
+    """Return deterministic global-alignment identity including gap columns.
+
+    A global affine-gap alignment is selected with fixed scores. Identity is
+    exact character matches divided by the full alignment length, including
+    insertions/deletions. This prevents a single indel from shifting every
+    downstream comparison as an ungapped ``zip`` calculation would.
+    """
+    aligner = PairwiseAligner(mode="global")
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    aligner.open_gap_score = -2.0
+    aligner.extend_gap_score = -0.5
+    alignment = aligner.align(left.upper(), right.upper())[0]
+    indices = alignment.indices
+    matches = 0
+    for left_index, right_index in zip(indices[0], indices[1]):
+        if (
+            left_index >= 0
+            and right_index >= 0
+            and left[left_index].upper() == right[right_index].upper()
+        ):
+            matches += 1
+    return matches / indices.shape[1] if indices.shape[1] else 0.0
 
 
 def _union_similar_ligands(
@@ -354,3 +519,14 @@ def _allocate_components(
             assignments[sample_id] = _PARTITIONS[partition_index]
         counts[partition_index] += size
     return dict(sorted(assignments.items()))
+
+
+def _is_sha256(value: str) -> bool:
+    """Return whether a value is a canonical prefixed hexadecimal digest."""
+    if not value.startswith("sha256:") or len(value) != 71:
+        return False
+    try:
+        int(value.removeprefix("sha256:"), 16)
+    except ValueError:
+        return False
+    return True

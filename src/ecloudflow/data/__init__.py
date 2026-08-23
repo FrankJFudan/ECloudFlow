@@ -22,7 +22,7 @@ from ecloudflow.data.shards import (
     sample_ids_for_partition,
     stream_samples,
 )
-from ecloudflow.data.splits import GroupedSplit, build_grouped_split
+from ecloudflow.data.splits import GroupedSplit, SplitAudit, build_grouped_split
 
 __all__ = [
     "DataConfig",
@@ -38,6 +38,7 @@ __all__ = [
     "ShardWriteError",
     "ShardWriter",
     "SkipRecord",
+    "SplitAudit",
     "bucketed_batches",
     "build_complex_sample",
     "build_grouped_split",

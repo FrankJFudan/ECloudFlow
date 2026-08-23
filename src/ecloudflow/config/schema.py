@@ -60,6 +60,12 @@ class DataConfig(StrictModel):
     :param prefetch_factor: Batches prefetched by each worker.
     :param pin_memory: Pin CPU tensors before accelerator transfer.
     :param verify_shard_hashes: Verify manifest hashes when opening shards.
+    :param local_cache_dir: Optional portable local read-through shard cache;
+        ``None`` disables caching without assuming a machine-specific path.
+    :param diffgui_lmdb: Optional existing DiffGui processed LMDB path.
+    :param diffgui_source_root: Optional read-only root for official DiffGui
+        protein and ligand source filenames.
+    :param diffgui_build_fields: Build physical fields while importing DiffGui.
     """
 
     dataset: str = "pdbbind"
@@ -76,6 +82,10 @@ class DataConfig(StrictModel):
     prefetch_factor: int = Field(default=2, ge=1)
     pin_memory: bool = True
     verify_shard_hashes: bool = False
+    local_cache_dir: str | None = None
+    diffgui_lmdb: str | None = None
+    diffgui_source_root: str | None = None
+    diffgui_build_fields: bool = False
 
 
 class AppConfig(StrictModel):

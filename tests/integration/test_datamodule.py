@@ -14,7 +14,8 @@ from ecloudflow.data.datamodule import ECloudDataModule
 from ecloudflow.data.diffgui_lmdb import DiffGuiLMDBImporter
 from ecloudflow.data.parsers import build_complex_sample
 from ecloudflow.data.shards import ShardWriter
-from ecloudflow.data.splits import GroupedSplit
+from ecloudflow.data.splits import GroupedSplit, SplitAudit
+from ecloudflow.exceptions import DataValidationError
 
 
 def _template():
@@ -57,11 +58,22 @@ def test_datamodule_filters_production_samples_from_split_metadata(
     samples = [replace(template, source_id=f"split-{index}") for index in range(3)]
     split = GroupedSplit(
         sample_partitions={"split-0": "train", "split-1": "val", "split-2": "test"},
-        entity_partitions={"protein-0": "train"},
+        entity_partitions={"protein:protein-0": "train"},
         sample_groups={
             sample.source_id: f"group-{index}" for index, sample in enumerate(samples)
         },
-        entity_groups={"protein-0": "group-0"},
+        entity_groups={"protein:protein-0": "group-0"},
+        audit=SplitAudit(
+            grouping_method="test.v1",
+            sequence_identity=0.4,
+            ligand_tanimoto=0.8,
+            seed=0,
+            fractions=(0.8, 0.1, 0.1),
+            input_hashes={sample.source_id: "sha256:" + "1" * 64 for sample in samples},
+            source_identifiers={
+                sample.source_id: sample.source_id for sample in samples
+            },
+        ),
         hash="sha256:" + "0" * 64,
     )
     ShardWriter().write(samples, tmp_path, split=split)
@@ -78,7 +90,7 @@ def test_datamodule_filters_production_samples_from_split_metadata(
     ]
     assert observed == ["split-0"]
     assert module.manifest is not None
-    assert module.manifest.entity_partitions["protein-0"] == "train"
+    assert module.manifest.entity_partitions["protein:protein-0"] == "train"
     with pytest.raises(ValidationError):
         config.batch_size = 99  # type: ignore[misc]
 
@@ -109,3 +121,61 @@ def test_diffgui_importer_is_read_only_and_requires_canonical_output(
     after = hashlib.sha256(database.read_bytes()).hexdigest()
     assert [sample.source_id for sample in imported] == ["diffgui-000"]
     assert before == after
+
+
+def test_persistent_worker_observes_shared_epoch_and_reproduces_order(
+    tmp_path: Path,
+) -> None:
+    """The same persistent worker changes and restores seeded epoch ordering."""
+    template = _template()
+    samples = [replace(template, source_id=f"epoch-{index}") for index in range(12)]
+    ShardWriter(max_samples_per_shard=3).write(samples, tmp_path)
+    module = ECloudDataModule(
+        DataConfig(
+            shard_dir=str(tmp_path),
+            partition="all",
+            batch_size=1,
+            num_workers=1,
+            persistent_workers=True,
+            prefetch_factor=1,
+            shuffle_buffer=12,
+            pin_memory=False,
+        )
+    )
+    loader = module.train_dataloader()
+
+    def order() -> list[str]:
+        return [sample.source_id for batch in loader for sample in batch]
+
+    module.set_epoch(0)
+    epoch_zero = order()
+    module.set_epoch(1)
+    epoch_one = order()
+    module.set_epoch(0)
+    repeated_zero = order()
+    assert epoch_zero != epoch_one
+    assert repeated_zero == epoch_zero
+    iterator = loader._iterator
+    if iterator is not None:
+        iterator._shutdown_workers()
+
+
+def test_checkpoint_hash_loaded_before_setup_is_validated_later(
+    tmp_path: Path,
+) -> None:
+    """Lightning restore-before-setup cannot bypass dataset identity checks."""
+    template = _template()
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    ShardWriter().write([replace(template, source_id="first")], first_root)
+    ShardWriter().write([replace(template, source_id="second")], second_root)
+    first = ECloudDataModule(
+        DataConfig(shard_dir=str(first_root), num_workers=0, pin_memory=False)
+    )
+    first.setup()
+    state = first.state_dict()
+    second = ECloudDataModule(
+        DataConfig(shard_dir=str(second_root), num_workers=0, pin_memory=False)
+    )
+    second.load_state_dict(state)
+    with pytest.raises(DataValidationError, match="manifest hash mismatch"):
+        second.setup()

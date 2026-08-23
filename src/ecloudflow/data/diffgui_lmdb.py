@@ -9,6 +9,7 @@ from typing import Any
 
 import lmdb
 
+from ecloudflow.config.schema import DataConfig
 from ecloudflow.core.types import ComplexSample
 from ecloudflow.data.parsers import build_complex_sample
 from ecloudflow.exceptions import DataValidationError
@@ -52,8 +53,49 @@ class DiffGuiLMDBImporter:
         self.source_root = Path(source_root) if source_root is not None else None
         self.build_fields = build_fields
 
+    @classmethod
+    def from_config(
+        cls,
+        config: DataConfig,
+        *,
+        converter: Callable[[Any], ComplexSample] | None = None,
+        decoder: Callable[[bytes], Any] = pickle.loads,
+    ) -> DiffGuiLMDBImporter:
+        """Construct an importer from strict portable Hydra data settings.
+
+        :param config: Frozen ``DataConfig`` containing nullable DiffGui paths.
+        :param converter: Optional converter for non-official DiffGui forks.
+        :param decoder: Legacy value decoder, normally ``pickle.loads``.
+        :return: Read-only importer configured without hidden machine paths.
+        :rtype: DiffGuiLMDBImporter
+        :raises DataValidationError: If ``diffgui_lmdb`` is not configured.
+
+        This constructor performs no filesystem access or mutation. Path
+        existence and source requirements are checked lazily during iteration.
+        """
+        if config.diffgui_lmdb is None:
+            raise DataValidationError("data.diffgui_lmdb must be configured")
+        return cls(
+            path=config.diffgui_lmdb,
+            converter=converter,
+            decoder=decoder,
+            source_root=config.diffgui_source_root,
+            build_fields=config.diffgui_build_fields,
+        )
+
     def __iter__(self) -> Iterator[ComplexSample]:
-        """Yield canonical samples in byte-sorted LMDB key order."""
+        """Yield canonical samples in byte-sorted LMDB key order.
+
+        :return: Lazy iterator of Task 6 ``ComplexSample`` instances.
+        :rtype: Iterator[ComplexSample]
+        :raises DataValidationError: If the database cannot be opened read-only,
+            decoding fails, official sources are unavailable, or a custom
+            converter violates the canonical output contract.
+
+        A fresh read-only LMDB environment is opened for each iteration. No
+        lock, migration flag, source tensor, or external repository file is
+        modified. Records are revalidated during canonical construction.
+        """
         yield from self.iter_samples()
 
     def iter_samples(self) -> Iterator[ComplexSample]:

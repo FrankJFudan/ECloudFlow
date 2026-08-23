@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from multiprocessing import Value
 from pathlib import Path
 from typing import Any
 
@@ -26,17 +27,34 @@ class _ShardBatchDataset(IterableDataset[list[ComplexSample]]):
         manifest: DatasetManifest,
         config: DataConfig,
         partition: str,
-        epoch: int,
+        epoch_state: Any,
     ) -> None:
         super().__init__()
         self.paths = paths
-        self.manifest = manifest
+        self.sample_partitions = dict(manifest.sample_partitions)
+        self.shard_hashes = {
+            Path(record.path).name: record.sha256 for record in manifest.shards
+        }
+        self.shard_sample_ids = {
+            Path(record.path).name: tuple(record.sample_ids)
+            for record in manifest.shards
+        }
         self.config = config
         self.partition = partition
-        self.epoch = epoch
+        self.epoch_state = epoch_state
 
     def __iter__(self) -> Iterator[list[ComplexSample]]:
-        """Partition rank first, worker second, then bucket local samples."""
+        """Build one deterministic rank/worker-local epoch iterator.
+
+        :return: Iterator of node-count bucketed canonical sample lists.
+        :rtype: Iterator[list[ComplexSample]]
+
+        Distributed identity is read inside each worker. The shared epoch value
+        is read when iteration begins, so persistent worker processes observe a
+        later :meth:`ECloudDataModule.set_epoch` call without loader recreation.
+        Whole-shard ownership is preferred; sparse shards use indexed members
+        and never deserialize samples owned by another rank or worker.
+        """
         worker = get_worker_info()
         worker_id, worker_count = (worker.id, worker.num_workers) if worker else (0, 1)
         if distributed.is_available() and distributed.is_initialized():
@@ -44,27 +62,28 @@ class _ShardBatchDataset(IterableDataset[list[ComplexSample]]):
         else:
             rank, world_size = 0, 1
         allowed_ids: set[str] | None = None
-        if self.manifest.sample_partitions and self.partition != "all":
+        if self.sample_partitions and self.partition != "all":
             allowed_ids = {
                 sample_id
-                for sample_id, assigned in self.manifest.sample_partitions.items()
+                for sample_id, assigned in self.sample_partitions.items()
                 if assigned == self.partition
             }
         expected_hashes = None
-        if self.config.verify_shard_hashes:
-            expected_hashes = {
-                record.path: record.sha256 for record in self.manifest.shards
-            }
+        if self.config.verify_shard_hashes or self.config.local_cache_dir is not None:
+            expected_hashes = self.shard_hashes
+        epoch = int(self.epoch_state.value)
         stream = stream_samples(
             self.paths,
             rank=rank,
             world_size=world_size,
             worker_id=worker_id,
             num_workers=worker_count,
-            seed=self.config.seed + self.epoch,
+            seed=self.config.seed + epoch,
             shuffle_buffer=self.config.shuffle_buffer,
             allowed_sample_ids=allowed_ids,
             expected_hashes=expected_hashes,
+            shard_sample_ids=self.shard_sample_ids,
+            cache_dir=self.config.local_cache_dir,
         )
         yield from bucketed_batches(
             stream,
@@ -90,6 +109,8 @@ class ECloudDataModule(LightningDataModule):
         super().__init__()
         self.config = config
         self.epoch = 0
+        self._epoch_state = Value("q", 0, lock=True)
+        self._pending_manifest_hash: str | None = None
         self.manifest: DatasetManifest | None = None
         self.paths: tuple[Path, ...] = ()
 
@@ -122,17 +143,43 @@ class ECloudDataModule(LightningDataModule):
             raise DataValidationError(f"dataset shards do not exist: {missing}")
         self.manifest = manifest
         self.paths = paths
+        if (
+            self._pending_manifest_hash is not None
+            and self._pending_manifest_hash != manifest.hash
+        ):
+            raise DataValidationError("checkpoint dataset manifest hash mismatch")
 
     def train_dataloader(self) -> DataLoader[list[ComplexSample]]:
-        """Return the configured sample partition as bucketed training batches."""
+        """Create the configured training-partition loader.
+
+        :return: Iterable DataLoader yielding pre-bucketed sample lists without
+            an additional collation step.
+        :rtype: torch.utils.data.DataLoader
+        :raises DataValidationError: If setup, manifest, or shard validation fails.
+
+        Rank and worker ownership are resolved lazily inside worker processes.
+        Persistent workers share epoch state but never mutate the manifest.
+        """
         return self._loader(self.config.partition)
 
     def val_dataloader(self) -> DataLoader[list[ComplexSample]]:
-        """Return the validation partition when split metadata are available."""
+        """Create a validation loader using sample-level split assignments.
+
+        :return: Bucketed validation DataLoader; explicit unpartitioned
+            manifests yield all samples.
+        :rtype: torch.utils.data.DataLoader
+        :raises DataValidationError: If dataset setup or validation fails.
+        """
         return self._loader("val")
 
     def test_dataloader(self) -> DataLoader[list[ComplexSample]]:
-        """Return the test partition when split metadata are available."""
+        """Create a test loader using sample-level split assignments.
+
+        :return: Bucketed test DataLoader; explicit unpartitioned manifests
+            yield all samples.
+        :rtype: torch.utils.data.DataLoader
+        :raises DataValidationError: If dataset setup or validation fails.
+        """
         return self._loader("test")
 
     def _loader(self, partition: str) -> DataLoader[list[ComplexSample]]:
@@ -142,7 +189,7 @@ class ECloudDataModule(LightningDataModule):
         if self.manifest is None:
             raise DataValidationError("dataset manifest was not initialized")
         dataset = _ShardBatchDataset(
-            self.paths, self.manifest, self.config, partition, self.epoch
+            self.paths, self.manifest, self.config, partition, self._epoch_state
         )
         options: dict[str, Any] = {
             "batch_size": None,
@@ -157,21 +204,53 @@ class ECloudDataModule(LightningDataModule):
         return DataLoader(dataset, **options)
 
     def set_epoch(self, epoch: int) -> None:
-        """Set the nonnegative epoch used to derive deterministic shuffle seeds."""
+        """Publish a deterministic epoch to current persistent workers.
+
+        :param epoch: Nonnegative epoch number mixed with the configured seed.
+        :return: None.
+        :rtype: None
+        :raises ValueError: If ``epoch`` is negative.
+
+        The synchronized CPU scalar is worker-visible and contains no device
+        tensors. Equal seed/epoch pairs reproduce order; a changed epoch changes
+        bounded-shuffle order without recreating persistent workers.
+        """
         if epoch < 0:
             raise ValueError("epoch must be nonnegative")
         self.epoch = int(epoch)
+        with self._epoch_state.get_lock():
+            self._epoch_state.value = self.epoch
 
     def state_dict(self) -> dict[str, Any]:
-        """Return resumable deterministic stream metadata."""
+        """Return checkpoint-safe epoch and dataset identity metadata.
+
+        :return: Plain mapping containing epoch and the loaded manifest hash.
+        :rtype: dict[str, Any]
+
+        The method performs no filesystem mutation. A manifest hash is absent
+        only when Lightning requests state before :meth:`setup`.
+        """
         return {
             "epoch": self.epoch,
             "manifest_hash": self.manifest.hash if self.manifest is not None else None,
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Restore epoch state after validating the dataset fingerprint."""
+        """Restore epoch and defer manifest validation when setup is later.
+
+        :param state_dict: Checkpoint metadata returned by :meth:`state_dict`.
+        :return: None.
+        :rtype: None
+        :raises DataValidationError: If a loaded manifest disagrees with the
+            checkpoint hash, either immediately or during subsequent setup.
+
+        Lightning may restore state before calling ``setup``. The expected hash
+        is retained and checked as soon as the immutable manifest is loaded.
+        """
         expected = state_dict.get("manifest_hash")
+        if expected is not None and not isinstance(expected, str):
+            raise DataValidationError("checkpoint manifest hash must be textual")
+        self._pending_manifest_hash = expected
         if self.manifest is not None and expected not in (None, self.manifest.hash):
             raise DataValidationError("checkpoint dataset manifest hash mismatch")
         self.set_epoch(int(state_dict.get("epoch", 0)))

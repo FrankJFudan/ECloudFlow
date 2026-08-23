@@ -78,6 +78,25 @@ class QMProvenance:
             self, "source_hashes", _freeze_string_mapping(self.source_hashes)
         )
 
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Serialize immutable mappings for multiprocessing worker transport."""
+        return (
+            type(self),
+            (
+                self.status,
+                self.qm_mask,
+                self.tool,
+                self.version,
+                self.executable,
+                self.command,
+                self.charge,
+                self.multiplicity,
+                self.failure_category,
+                dict(self.source_hashes),
+                self.integrated_electron_count,
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class PocketGraph:
@@ -636,6 +655,20 @@ class SampleProvenance:
                 nonempty=False,
             )
 
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Serialize read-only provenance mappings across DataLoader processes."""
+        return (
+            type(self),
+            (
+                dict(self.source_paths),
+                dict(self.file_hashes),
+                dict(self.tool_versions),
+                self.preprocessing_status,
+                self.original_ligand_positions,
+                self.qm,
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class ComplexSample:
@@ -742,6 +775,32 @@ class ComplexSample:
                 "fragment reference",
             )
         object.__setattr__(self, "properties", _freeze_properties(self.properties))
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Transport canonical samples while restoring immutable mappings.
+
+        :return: Constructor and primitive argument tuple understood by pickle.
+        :rtype: tuple[Any, tuple[Any, ...]]
+
+        PyTorch DataLoader uses multiprocessing pickle between persistent CPU
+        workers and the training process. ``MappingProxyType`` is intentionally
+        not picklable, so mappings are copied to ordinary dictionaries only for
+        transport; the receiving constructor revalidates and freezes them.
+        """
+        return (
+            type(self),
+            (
+                self.source_id,
+                self.pocket,
+                self.ligand,
+                self.pocket_field,
+                self.ligand_field,
+                dict(self.properties),
+                self.frame,
+                self.provenance,
+                self.fragment,
+            ),
+        )
 
 
 def _validate_positions(value: torch.Tensor, name: str, *, nonempty: bool) -> int:

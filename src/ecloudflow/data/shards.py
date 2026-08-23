@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import random
+import shutil
 import tarfile
+import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -41,6 +44,10 @@ class ShardWriteError(RuntimeError):
 
 class ShardReadError(RuntimeError):
     """Raise when a shard or canonical sample payload is invalid."""
+
+
+class DuplicateSampleError(ValueError):
+    """Raise when a reserved candidate identifier appears more than once."""
 
 
 class ShardWriter:
@@ -100,60 +107,127 @@ class ShardWriter:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        config_fingerprint = _generation_config_fingerprint(
+            self.target_size_bytes,
+            self.max_samples_per_shard,
+            self.preprocessing_version,
+            split,
+        )
+        generation_id, stage_dir, journal = _open_generation(
+            output_dir, config_fingerprint
+        )
+        completed_candidates = list(journal.get("candidates", []))
+        staged_shards = tuple(
+            _shard_record_from_dict(record) for record in journal.get("shards", [])
+        )
+        _validate_completed_shards(stage_dir, staged_shards)
         sample_ids: list[str] = []
         source_hashes: dict[str, str] = {}
         skips: list[SkipRecord] = []
-        shard_records: list[ShardRecord] = []
+        shard_records: list[ShardRecord] = list(staged_shards)
         pending: list[tuple[ComplexSample, bytes]] = []
         pending_bytes = 0
         seen_ids: set[str] = set()
+        candidate_records: list[dict[str, str]] = []
+        replay_index = 0
 
         def flush() -> None:
             nonlocal pending, pending_bytes
             if not pending:
                 return
-            record = self._write_shard(pending, output_dir, len(shard_records))
+            record = self._write_shard(pending, stage_dir, len(shard_records))
             shard_records.append(record)
             pending = []
             pending_bytes = 0
+            _write_generation_journal(
+                stage_dir,
+                config_fingerprint,
+                candidate_records,
+                shard_records,
+            )
 
         for candidate in samples:
-            sample_id = getattr(candidate, "source_id", "unknown")
-            try:
-                if not isinstance(candidate, ComplexSample):
-                    raise TypeError("record is not a ComplexSample")
-                if candidate.source_id in seen_ids:
-                    raise ValueError("duplicate sample identifier")
-                encoded = _serialize_sample(candidate)
-            except (TypeError, ValueError, RuntimeError, OSError) as error:
-                skips.append(_skip_record(str(sample_id), error))
+            sample, encoded, skip, candidate_record = _process_candidate(
+                candidate, seen_ids
+            )
+            if replay_index < len(completed_candidates):
+                if candidate_record != completed_candidates[replay_index]:
+                    raise ShardWriteError(
+                        "resumed candidate stream differs from the staged generation"
+                    )
+                candidate_records.append(candidate_record)
+                replay_index += 1
+                if skip is not None:
+                    skips.append(skip)
+                elif sample is not None:
+                    _append_sample_metadata(sample, sample_ids, source_hashes)
                 continue
-            if pending and (
-                pending_bytes + len(encoded) > self.target_size_bytes
-                or (
-                    self.max_samples_per_shard is not None
-                    and len(pending) >= self.max_samples_per_shard
-                )
+            if skip is not None:
+                candidate_records.append(candidate_record)
+                skips.append(skip)
+                continue
+            if sample is None or encoded is None:
+                raise ShardWriteError("candidate processing returned no outcome")
+            if pending and (pending_bytes + len(encoded) > self.target_size_bytes):
+                # The current candidate is deliberately excluded from the
+                # checkpoint until its payload belongs to a durable shard.
+                flush()
+            candidate_records.append(candidate_record)
+            pending.append((sample, encoded))
+            pending_bytes += len(encoded)
+            _append_sample_metadata(sample, sample_ids, source_hashes)
+            if (
+                self.max_samples_per_shard is not None
+                and len(pending) >= self.max_samples_per_shard
             ):
                 flush()
-            pending.append((candidate, encoded))
-            pending_bytes += len(encoded)
-            seen_ids.add(candidate.source_id)
-            sample_ids.append(candidate.source_id)
-            for role, digest in candidate.provenance.file_hashes.items():
-                source_hashes[f"{candidate.source_id}:{role}"] = digest
+        if replay_index != len(completed_candidates):
+            raise ShardWriteError(
+                "resumed candidate stream ended before staged records"
+            )
         flush()
+        _write_generation_journal(
+            stage_dir,
+            config_fingerprint,
+            candidate_records,
+            shard_records,
+        )
+        if split is not None and set(split.sample_partitions) != set(sample_ids):
+            raise ShardWriteError(
+                "grouped split assignments must exactly match serialized sample IDs"
+            )
         metadata = split.to_metadata() if split is not None else {}
+        generation_dir = output_dir / "generations" / generation_id
+        generation_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(stage_dir, generation_dir)
+        except OSError as error:
+            raise ShardWriteError(
+                f"failed to publish dataset generation: {error}"
+            ) from error
+        published_shards = tuple(
+            ShardRecord(
+                path=(Path("generations") / generation_id / record.path).as_posix(),
+                sha256=record.sha256,
+                size_bytes=record.size_bytes,
+                sample_ids=record.sample_ids,
+            )
+            for record in shard_records
+        )
         manifest = DatasetManifest(
             sample_ids=tuple(sample_ids),
-            shards=tuple(shard_records),
+            shards=published_shards,
             source_hashes=dict(sorted(source_hashes.items())),
             skips=tuple(skips),
             preprocessing_version=self.preprocessing_version,
+            generation_id=generation_id,
+            partition_mode="grouped" if split is not None else "unpartitioned",
             split_hash=metadata.get("hash"),
             sample_partitions=metadata.get("sample_partitions", {}),
+            sample_groups=metadata.get("sample_groups", {}),
             entity_partitions=metadata.get("entity_partitions", {}),
             entity_groups=metadata.get("entity_groups", {}),
+            split_audit=split.audit if split is not None else None,
         )
         try:
             manifest.write(output_dir / "manifest.json")
@@ -161,6 +235,11 @@ class ShardWriter:
             raise ShardWriteError(
                 f"failed to finalize dataset manifest: {error}"
             ) from error
+        active = output_dir / ".staging" / "active.json"
+        try:
+            active.unlink(missing_ok=True)
+        except OSError:
+            pass
         return manifest
 
     def _write_shard(
@@ -203,6 +282,196 @@ class ShardWriter:
         )
 
 
+def _generation_config_fingerprint(
+    target_size_bytes: int,
+    max_samples_per_shard: int | None,
+    preprocessing_version: str,
+    split: GroupedSplit | None,
+) -> str:
+    """Hash settings that must remain identical across a resumed generation."""
+    payload = {
+        "target_size_bytes": target_size_bytes,
+        "max_samples_per_shard": max_samples_per_shard,
+        "preprocessing_version": preprocessing_version,
+        "split_hash": split.hash if split is not None else None,
+    }
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+
+
+def _open_generation(
+    output_dir: Path, config_fingerprint: str
+) -> tuple[str, Path, dict[str, Any]]:
+    """Resume a compatible staged generation or create a new isolated stage."""
+    staging_root = output_dir / ".staging"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    active_path = staging_root / "active.json"
+    if active_path.is_file():
+        try:
+            active = json.loads(active_path.read_text(encoding="utf-8"))
+            generation_id = str(active["generation_id"])
+            stage_dir = staging_root / generation_id
+            if (
+                active.get("config_fingerprint") == config_fingerprint
+                and stage_dir.is_dir()
+            ):
+                journal_path = stage_dir / "journal.json"
+                journal = (
+                    json.loads(journal_path.read_text(encoding="utf-8"))
+                    if journal_path.is_file()
+                    else {"candidates": [], "shards": []}
+                )
+                if journal.get("config_fingerprint") not in (
+                    None,
+                    config_fingerprint,
+                ):
+                    raise ShardWriteError(
+                        "staged generation configuration fingerprint mismatch"
+                    )
+                return generation_id, stage_dir, journal
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+            pass
+    generation_id = uuid.uuid4().hex
+    stage_dir = staging_root / generation_id
+    stage_dir.mkdir(parents=False, exist_ok=False)
+    _write_json_atomic(
+        active_path,
+        {
+            "generation_id": generation_id,
+            "config_fingerprint": config_fingerprint,
+        },
+    )
+    journal = {
+        "config_fingerprint": config_fingerprint,
+        "candidates": [],
+        "shards": [],
+    }
+    _write_json_atomic(stage_dir / "journal.json", journal)
+    return generation_id, stage_dir, journal
+
+
+def _write_generation_journal(
+    stage_dir: Path,
+    config_fingerprint: str,
+    candidates: list[dict[str, str]],
+    shards: list[ShardRecord],
+) -> None:
+    """Atomically checkpoint completed candidates and validated staged shards."""
+    _write_json_atomic(
+        stage_dir / "journal.json",
+        {
+            "config_fingerprint": config_fingerprint,
+            "candidates": candidates,
+            "shards": [_shard_record_to_dict(record) for record in shards],
+        },
+    )
+
+
+def _write_json_atomic(path: Path, values: Mapping[str, Any]) -> None:
+    """Write one fsynced JSON control file through an atomic replacement."""
+    partial = path.with_suffix(path.suffix + ".partial")
+    with partial.open("w", encoding="utf-8", newline="\n") as stream:
+        json.dump(values, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(partial, path)
+
+
+def _shard_record_to_dict(record: ShardRecord) -> dict[str, Any]:
+    """Convert a staged shard record to journal primitives."""
+    return {
+        "path": record.path,
+        "sha256": record.sha256,
+        "size_bytes": record.size_bytes,
+        "sample_ids": list(record.sample_ids),
+    }
+
+
+def _shard_record_from_dict(values: Mapping[str, Any]) -> ShardRecord:
+    """Reconstruct a staged shard record from journal primitives."""
+    return ShardRecord(
+        path=str(values["path"]),
+        sha256=str(values["sha256"]),
+        size_bytes=int(values["size_bytes"]),
+        sample_ids=tuple(str(value) for value in values["sample_ids"]),
+    )
+
+
+def _validate_completed_shards(
+    stage_dir: Path, shards: tuple[ShardRecord, ...]
+) -> None:
+    """Verify every journaled staged shard before accepting resume progress."""
+    for shard in shards:
+        path = stage_dir / shard.path
+        if (
+            not path.is_file()
+            or path.stat().st_size != shard.size_bytes
+            or "sha256:" + _sha256_file(path) != shard.sha256
+        ):
+            raise ShardWriteError(f"staged shard validation failed: {shard.path}")
+
+
+def _process_candidate(
+    candidate: object, seen_ids: set[str]
+) -> tuple[
+    ComplexSample | None,
+    bytes | None,
+    SkipRecord | None,
+    dict[str, str],
+]:
+    """Reserve an ID before serialization and return a journalable outcome."""
+    sample_id = str(getattr(candidate, "source_id", "unknown")) or "unknown"
+    try:
+        if not isinstance(candidate, ComplexSample):
+            raise TypeError("record is not a ComplexSample")
+        if candidate.source_id in seen_ids:
+            raise DuplicateSampleError(
+                "duplicate sample identifier was already reserved"
+            )
+        seen_ids.add(candidate.source_id)
+        encoded = _serialize_sample(candidate)
+    except (TypeError, ValueError, RuntimeError, OSError) as error:
+        skip = _skip_record(sample_id, error)
+        return (
+            None,
+            None,
+            skip,
+            {
+                "sample_id": skip.sample_id,
+                "status": "skip",
+                "category": skip.category,
+                "message": skip.message,
+            },
+        )
+    payload_hash = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return (
+        candidate,
+        encoded,
+        None,
+        {
+            "sample_id": candidate.source_id,
+            "status": "success",
+            "payload_hash": payload_hash,
+        },
+    )
+
+
+def _append_sample_metadata(
+    sample: ComplexSample,
+    sample_ids: list[str],
+    source_hashes: dict[str, str],
+) -> None:
+    """Append one accepted sample ID and its role-qualified source hashes."""
+    sample_ids.append(sample.source_id)
+    for role, digest in sample.provenance.file_hashes.items():
+        source_hashes[f"{sample.source_id}:{role}"] = digest
+
+
 def stream_samples(
     paths: Iterable[str | Path],
     *,
@@ -214,6 +483,8 @@ def stream_samples(
     shuffle_buffer: int = 0,
     allowed_sample_ids: set[str] | None = None,
     expected_hashes: Mapping[str, str] | None = None,
+    shard_sample_ids: Mapping[str, tuple[str, ...]] | None = None,
+    cache_dir: str | Path | None = None,
 ) -> Iterator[ComplexSample]:
     """Stream canonical samples after rank-then-worker partitioning.
 
@@ -227,52 +498,92 @@ def stream_samples(
         storage order.
     :param allowed_sample_ids: Optional production sample-level split filter.
     :param expected_hashes: Optional expected SHA-256 values keyed by path name.
+    :param shard_sample_ids: Optional manifest member index keyed by path name;
+        required for split filtering without decoding non-owned members.
+    :param cache_dir: Optional portable local read-through cache directory. Cache
+        use requires expected hashes and verifies every hit and fill.
     :return: Lazy iterator of validated canonical samples.
     :rtype: Iterator[ComplexSample]
     :raises ValueError: If rank/worker arguments or the shuffle size are invalid.
     :raises ShardReadError: If a shard hash, tar member, or sample payload fails.
 
-    Filtering occurs before the global ordinal is assigned. The ordinal is
-    first modulo-partitioned across ranks; the rank-local ordinal is then
-    modulo-partitioned across workers. This order guarantees exact once-only
-    coverage for every selected sample without loading a shard into memory.
+    When shards outnumber consumers, whole-shard ownership is assigned rank
+    first and worker second so non-owners never open the tar. Sparse shard sets
+    use manifest/member indices to choose ownership before extraction and
+    deserialization. Filtering occurs before within-shard ordinals, preserving
+    exact once-only coverage without N-times sample decoding.
     """
     _validate_partition(rank, world_size, worker_id, num_workers, shuffle_buffer)
     ordered_paths = sorted((Path(path) for path in paths), key=lambda path: path.name)
+    consumer_count = world_size * num_workers
+    if cache_dir is not None and expected_hashes is None:
+        raise ValueError("cache_dir requires expected_hashes for verified reads")
+    if allowed_sample_ids is not None and shard_sample_ids is None:
+        raise ValueError("allowed_sample_ids requires shard_sample_ids")
 
     def selected() -> Iterator[ComplexSample]:
         ordinal = 0
-        for path in ordered_paths:
-            if expected_hashes is not None:
-                expected = expected_hashes.get(path.name)
-                actual = "sha256:" + _sha256_file(path)
-                if expected is None or actual != expected:
-                    raise ShardReadError(f"shard hash mismatch: {path.name}")
+        whole_shard_ownership = len(ordered_paths) >= consumer_count
+        for shard_index, source_path in enumerate(ordered_paths):
+            if whole_shard_ownership and (
+                shard_index % world_size != rank
+                or (shard_index // world_size) % num_workers != worker_id
+            ):
+                continue
+            expected = _lookup_by_path(expected_hashes, source_path)
+            if expected_hashes is not None and expected is None:
+                raise ShardReadError(f"missing expected shard hash: {source_path.name}")
+            path = _resolve_cached_shard(source_path, cache_dir, expected)
+            if expected is not None and "sha256:" + _sha256_file(path) != expected:
+                raise ShardReadError(f"shard hash mismatch: {source_path.name}")
+            indexed_ids = _lookup_by_path(shard_sample_ids, source_path)
             try:
                 with tarfile.open(path, "r:*") as archive:
+                    member_index = 0
                     for member in archive:
                         if not member.isfile() or not member.name.endswith(
                             ".sample.pt"
                         ):
                             continue
+                        indexed_id = (
+                            indexed_ids[member_index]
+                            if indexed_ids is not None
+                            and member_index < len(indexed_ids)
+                            else None
+                        )
+                        member_index += 1
+                        if indexed_ids is not None and member_index > len(indexed_ids):
+                            raise ShardReadError(
+                                f"manifest member index is shorter than {source_path.name}"
+                            )
+                        if (
+                            allowed_sample_ids is not None
+                            and indexed_id not in allowed_sample_ids
+                        ):
+                            continue
+                        if not whole_shard_ownership:
+                            global_ordinal = ordinal
+                            ordinal += 1
+                            if global_ordinal % world_size != rank:
+                                continue
+                            rank_ordinal = global_ordinal // world_size
+                            if rank_ordinal % num_workers != worker_id:
+                                continue
                         extracted = archive.extractfile(member)
                         if extracted is None:
                             raise ShardReadError(
                                 f"cannot read tar member {member.name}"
                             )
                         sample = _deserialize_sample(extracted.read())
-                        if (
-                            allowed_sample_ids is not None
-                            and sample.source_id not in allowed_sample_ids
-                        ):
-                            continue
-                        global_ordinal = ordinal
-                        ordinal += 1
-                        if global_ordinal % world_size != rank:
-                            continue
-                        rank_ordinal = global_ordinal // world_size
-                        if rank_ordinal % num_workers == worker_id:
-                            yield sample
+                        if indexed_id is not None and sample.source_id != indexed_id:
+                            raise ShardReadError(
+                                f"manifest member ID mismatch in {source_path.name}"
+                            )
+                        yield sample
+                    if indexed_ids is not None and member_index != len(indexed_ids):
+                        raise ShardReadError(
+                            f"manifest member index length mismatch: {source_path.name}"
+                        )
             except (OSError, tarfile.TarError) as error:
                 raise ShardReadError(
                     f"failed to stream shard {path}: {error}"
@@ -281,6 +592,63 @@ def stream_samples(
     yield from _buffered_shuffle(
         selected(), shuffle_buffer, seed + rank * 1_000_003 + worker_id
     )
+
+
+def _lookup_by_path(values: Mapping[str, Any] | None, path: Path) -> Any | None:
+    """Find manifest metadata by absolute string, POSIX string, or basename."""
+    if values is None:
+        return None
+    for key in (str(path), path.as_posix(), path.name):
+        if key in values:
+            return values[key]
+    return None
+
+
+def _resolve_cached_shard(
+    source_path: Path,
+    cache_dir: str | Path | None,
+    expected_hash: str | None,
+) -> Path:
+    """Return a verified cache hit or atomically fill it from the source shard."""
+    if cache_dir is None:
+        return source_path
+    if expected_hash is None or not _valid_sha256(expected_hash):
+        raise ShardReadError(f"missing cache verification hash: {source_path.name}")
+    destination_root = Path(cache_dir)
+    destination_root.mkdir(parents=True, exist_ok=True)
+    destination = destination_root / f"{expected_hash.removeprefix('sha256:')}.tar"
+    if destination.is_file() and "sha256:" + _sha256_file(destination) == expected_hash:
+        return destination
+    partial = destination.with_suffix(f".{uuid.uuid4().hex}.partial")
+    try:
+        with source_path.open("rb") as source, partial.open("wb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        if "sha256:" + _sha256_file(partial) != expected_hash:
+            raise ShardReadError(f"source shard hash mismatch: {source_path.name}")
+        os.replace(partial, destination)
+    except OSError as error:
+        raise ShardReadError(
+            f"failed to fill shard cache: {source_path.name}"
+        ) from error
+    finally:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return destination
+
+
+def _valid_sha256(value: str) -> bool:
+    """Validate a cache-key digest before using it as a filename."""
+    if not value.startswith("sha256:") or len(value) != 71:
+        return False
+    try:
+        int(value.removeprefix("sha256:"), 16)
+    except ValueError:
+        return False
+    return True
 
 
 def sample_ids_for_partition(
@@ -417,7 +785,7 @@ def _deserialize_sample(payload: bytes) -> ComplexSample:
         if values.get("serialization_version") != _SERIALIZATION_VERSION:
             raise ValueError("unsupported sample serialization version")
         return _sample_from_payload(values)
-    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+    except Exception as error:
         raise ShardReadError(f"invalid canonical sample payload: {error}") from error
 
 

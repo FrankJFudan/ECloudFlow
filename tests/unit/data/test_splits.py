@@ -74,3 +74,78 @@ def test_grouped_split_is_order_independent_and_strict() -> None:
         build_grouped_split(_records(), ligand_tanimoto=1.1)
     with pytest.raises(KeyError, match="unknown split identifier"):
         forward.partition_of("missing")
+
+
+def test_global_sequence_alignment_groups_one_residue_indel() -> None:
+    """An insertion must not shift homolog identity below the split threshold."""
+    records = [
+        {
+            "sample_id": "indel-a",
+            "protein_id": "protein-indel-a",
+            "protein_sequence": "ACDEFGHIKLMN",
+            "ligand_id": "ligand-indel-a",
+            "ligand_group": "ligand-group-a",
+        },
+        {
+            "sample_id": "indel-b",
+            "protein_id": "protein-indel-b",
+            "protein_sequence": "ACDDEFGHIKLMN",
+            "ligand_id": "ligand-indel-b",
+            "ligand_group": "ligand-group-b",
+        },
+        {
+            "sample_id": "unrelated",
+            "protein_id": "protein-unrelated",
+            "protein_sequence": "YYYYYYYYYYYY",
+            "ligand_id": "ligand-unrelated",
+            "ligand_group": "ligand-group-c",
+        },
+    ]
+    split = build_grouped_split(records, sequence_identity=0.9, seed=9)
+    assert split.partition_of(
+        "protein-indel-a", entity_kind="protein"
+    ) == split.partition_of("protein-indel-b", entity_kind="protein")
+
+
+def test_split_rejects_missing_identifiers_or_grouping_evidence() -> None:
+    """Leakage-controlled labels require traceable entities and comparisons."""
+    base = {
+        "sample_id": "missing",
+        "protein_id": "protein",
+        "sequence_cluster": "cluster",
+        "ligand_id": "ligand",
+        "ligand_smiles": "CCO",
+    }
+    missing_identifier = dict(base)
+    del missing_identifier["protein_id"]
+    with pytest.raises(ValueError, match="protein_id is required"):
+        build_grouped_split([missing_identifier])
+    missing_evidence = dict(base)
+    del missing_evidence["sequence_cluster"]
+    with pytest.raises(ValueError, match="protein grouping evidence"):
+        build_grouped_split([missing_evidence])
+
+
+def test_equal_text_entity_ids_require_qualified_lookup() -> None:
+    """Protein and ligand namespaces cannot collide in persisted audit metadata."""
+    records = [
+        {
+            "sample_id": "namespace-a",
+            "protein_id": "shared",
+            "sequence_cluster": "protein-a",
+            "ligand_id": "ligand-a",
+            "ligand_group": "ligand-a",
+        },
+        {
+            "sample_id": "namespace-b",
+            "protein_id": "protein-b",
+            "sequence_cluster": "protein-b",
+            "ligand_id": "shared",
+            "ligand_group": "ligand-b",
+        },
+    ]
+    split = build_grouped_split(records, fractions=(0.5, 0.0, 0.5), seed=3)
+    assert "protein:shared" in split.entity_partitions
+    assert "ligand:shared" in split.entity_partitions
+    assert split.partition_of("shared", entity_kind="protein") in {"train", "test"}
+    assert split.audit.input_hashes.keys() == split.sample_partitions.keys()
