@@ -53,7 +53,7 @@ class JointLigandBackbone(nn.Module):  # type: ignore[misc]
             nn.Linear(3, scalar_dim), nn.SiLU(), nn.Linear(scalar_dim, scalar_dim)
         )
         self.task_projection = nn.Linear(8, scalar_dim)
-        self.property_projection = nn.Linear(9, scalar_dim)
+        self.property_projection = nn.Linear(17, scalar_dim)
         self.interaction_projection = nn.Linear(2, scalar_dim)
         self.field_projection = nn.Linear(4, scalar_dim)
         self.field_vector_weights = nn.Linear(4, vector_dim)

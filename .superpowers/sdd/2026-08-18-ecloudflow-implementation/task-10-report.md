@@ -396,3 +396,91 @@ The unchanged operational concerns from Fix Round 1 remain: exact dense radius
 graphs can have quadratic output size, and the deterministic portable segment
 softmax may later benefit from a compiled implementation. No correctness
 blocker remains from this review.
+
+## Fix Round 3
+
+### Review finding addressed
+
+Property conditioning now preserves each name-value association before
+permutation-invariant aggregation. Every property contributes three pieces to
+a 17-channel invariant representation: eight stable SHA-256 identity values,
+one differentiable numeric value, and eight identity-times-value joint values.
+The independent identity component cannot be erased by any finite numeric
+value, while the joint component distinguishes swapped assignments such as
+`{"affinity": 1, "logp": 2}` and `{"affinity": 2, "logp": 1}`. Properties
+are still processed in sorted-name order and summed, so mapping insertion order
+does not affect floating-point evaluation. The complete vector remains absent
+from the classifier-free null branch.
+
+### RED evidence
+
+All new behavioral regressions were written before the 17-channel production
+change. The focused RED command on `1807d29` was:
+
+`conda run -n 3dmolecule python -m pytest
+tests/unit/models/test_ecloudflow.py -k "property or null_branch" -v`
+
+Result: **1 failed, 11 passed, 25 deselected in 3.59s**. The swapped-pair test
+failed because the two mappings produced the exact same affinity tensor
+`tensor([1.1246, 1.1257])`. This held property names and the per-complex sum of
+values constant, isolating the missing association rather than merely detecting
+another name or value change.
+
+The 11 companion cases were independently GREEN on the reviewed code: reversed
+mapping insertion order was identical; single versus multiple names stayed
+distinct at negative, zero, and positive values; explicit zero differed from
+omission; each tensor value had a finite nonzero gradient; repeated seeded
+model construction was deterministic; and multi-property changes remained
+fully removed by the null branch. Together, these cases constrain the minimal
+fix without depending on source text, private structure, or mocks.
+
+### GREEN evidence and exact commands
+
+- The RED command after the joint encoder change: **12 passed, 25 deselected in
+  3.59s**.
+- `conda run -n 3dmolecule python -m pytest tests/unit/models
+  tests/integration/test_model_equivariance.py -q`: **52 passed in 4.40s**,
+  including the available CUDA test.
+- `conda run -n 3dmolecule python -m pytest -q`: **278 passed, 1 skipped, 14
+  warnings in 16.78s**. The skip and Matplotlib/PyParsing warnings are unchanged.
+- `conda run -n 3dmolecule python -m ruff format src/ecloudflow/models
+  tests/unit/models tests/integration/test_model_equivariance.py
+  tests/unit/test_source_docs.py tools/check_python_docs.py`: one file
+  reformatted, 12 unchanged.
+- The equivalent `ruff format --check` command: 13 files already formatted.
+- `conda run -n 3dmolecule python -m ruff check src/ecloudflow/models
+  tests/unit/models tests/integration/test_model_equivariance.py
+  tests/unit/test_source_docs.py tools/check_python_docs.py`: all checks passed.
+- `conda run -n 3dmolecule python tools/check_python_docs.py
+  src/ecloudflow/models tools/check_python_docs.py`: exit code 0 with no output.
+- `conda run -n 3dmolecule python -m mypy src/ecloudflow/models`: success, no
+  issues in 7 source files.
+- `git diff --check`: passed; only ordinary Windows LF-to-CRLF checkout
+  notices were emitted.
+
+### Files changed
+
+- `src/ecloudflow/models/backbone.py`
+- `src/ecloudflow/models/ecloudflow.py`
+- `tests/unit/models/test_ecloudflow.py`
+- this report.
+
+The existing semantic documentation registry already requires stable property
+identity; the designated forward doc now additionally explains independent and
+joint name-value slots, so no registry edit was needed.
+
+### Self-review and concerns
+
+The association term is formed per property before summation, and sorted-name
+iteration makes the aggregate deterministic for equivalent mappings regardless
+of insertion order. Separate identity slots preserve explicit zero as a real
+condition and prevent the earlier `-1` erasure. Separate leaves for both values
+receive finite nonzero gradients. Existing dtype/device/batch validation occurs
+before every contribution, and the null backbone path still skips the complete
+property projection.
+
+The fixed 17-channel representation is intentionally small and collision risk
+is limited to the documented eight-byte SHA-256 identity prefix; no new global
+vocabulary or distributed state was introduced. The unchanged radius-output
+and portable segment-softmax performance concerns remain. No correctness
+blocker remains from this review.

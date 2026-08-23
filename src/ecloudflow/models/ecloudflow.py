@@ -352,7 +352,8 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         :param condition: Pocket, optional pocket field, named property values,
             invariant interaction targets, and optional exact fragment task
             condition. Property names use stable SHA-256 numeric identities in
-            feature slots independent of their differentiable numeric values.
+            feature slots independent of their differentiable numeric values;
+            joint name-value slots preserve each association before summation.
         :param pocket_encoding: Optional explicitly cached representation from
             :meth:`encode_pocket`; omitted values are computed for this call.
         :return: Coordinate/electron velocities and scores; invariant atom,
@@ -564,8 +565,8 @@ def _task_features(
 def _property_features(
     condition: GenerationCondition, batch_size: int, reference: torch.Tensor
 ) -> torch.Tensor:
-    """Encode stable property-name identity separately from its numeric value."""
-    encoded = reference.new_zeros((batch_size, 9))
+    """Aggregate stable identity, value, and joint name-value features."""
+    encoded = reference.new_zeros((batch_size, 17))
     if not condition.property_targets:
         return encoded
     for name, value in sorted(condition.property_targets.items()):
@@ -588,6 +589,7 @@ def _property_features(
         )
         encoded[:, :8] = encoded[:, :8] + identity[None, :]
         encoded[:, 8] = encoded[:, 8] + tensor
+        encoded[:, 9:] = encoded[:, 9:] + identity[None, :] * tensor[:, None]
     return encoded
 
 

@@ -297,6 +297,93 @@ def test_property_identity_is_independent_of_any_finite_value(
         assert torch.any(gradient != 0)
 
 
+def test_property_encoding_preserves_name_value_association_and_mapping_order() -> None:
+    """Mutation caught: separately summing names and values aliases swapped pairs."""
+    model = _model().eval()
+    state = _state()
+    condition = _rich_condition(state)
+    affinity_value = torch.tensor([1.0, -2.0], requires_grad=True)
+    logp_value = torch.tensor([2.0, 3.0], requires_grad=True)
+    assigned = replace(
+        condition,
+        property_targets={"affinity": affinity_value, "logp": logp_value},
+    )
+    reordered = replace(
+        condition,
+        property_targets={"logp": logp_value, "affinity": affinity_value},
+    )
+    swapped = replace(
+        condition,
+        property_targets={
+            "affinity": logp_value.detach(),
+            "logp": affinity_value.detach(),
+        },
+    )
+
+    assigned_prediction = model(state, torch.tensor([0.3, 0.7]), assigned)
+    reordered_prediction = model(state, torch.tensor([0.3, 0.7]), reordered)
+    swapped_prediction = model(state, torch.tensor([0.3, 0.7]), swapped)
+
+    assert torch.equal(assigned_prediction.affinity, reordered_prediction.affinity)
+    assert not torch.allclose(assigned_prediction.affinity, swapped_prediction.affinity)
+    gradients = torch.autograd.grad(
+        assigned_prediction.affinity.sum(), (affinity_value, logp_value)
+    )
+    for gradient in gradients:
+        assert torch.isfinite(gradient).all()
+        assert torch.any(gradient != 0)
+
+
+@pytest.mark.parametrize("target_value", [-2.0, 0.0, 3.0])
+def test_single_and_multiple_property_names_remain_distinct(
+    target_value: float,
+) -> None:
+    """Mutation caught: aggregation drops additional names at signed values."""
+    model = _model().eval()
+    state = _state()
+    condition = _rich_condition(state)
+    value = torch.full((2,), target_value)
+    single = replace(condition, property_targets={"affinity": value})
+    multiple = replace(condition, property_targets={"affinity": value, "logp": value})
+
+    single_prediction = model(state, torch.tensor([0.3, 0.7]), single)
+    multiple_prediction = model(state, torch.tensor([0.3, 0.7]), multiple)
+
+    assert not torch.allclose(single_prediction.affinity, multiple_prediction.affinity)
+
+
+def test_explicit_zero_property_is_distinct_from_omitted_property() -> None:
+    """Mutation caught: treating a present zero target as an omitted condition."""
+    model = _model().eval()
+    state = _state()
+    condition = _rich_condition(state)
+    omitted = replace(condition, property_targets={})
+    explicit = replace(condition, property_targets={"affinity": torch.zeros(2)})
+
+    omitted_prediction = model(state, torch.tensor([0.3, 0.7]), omitted)
+    explicit_prediction = model(state, torch.tensor([0.3, 0.7]), explicit)
+
+    assert not torch.allclose(omitted_prediction.affinity, explicit_prediction.affinity)
+
+
+def test_property_conditioning_is_deterministic_across_repeated_construction() -> None:
+    """Mutation caught: process-random name hashing changes reconstructed models."""
+    state = _state()
+    condition = replace(
+        _rich_condition(state),
+        property_targets={
+            "affinity": torch.tensor([-1.0, 0.0]),
+            "logp": torch.tensor([2.5, -3.0]),
+        },
+    )
+
+    first = _model().eval()(state, torch.tensor([0.3, 0.7]), condition)
+    second = _model().eval()(state, torch.tensor([0.3, 0.7]), condition)
+
+    assert torch.equal(first.affinity, second.affinity)
+    assert torch.equal(first.atom_logits, second.atom_logits)
+
+
 @pytest.mark.parametrize("vector_dim", [1, 2])
 def test_constructor_rejects_vector_width_without_chirality_capacity(
     vector_dim: int,
@@ -381,7 +468,10 @@ def test_null_branch_is_independent_of_all_pocket_and_target_content() -> None:
             positions=first.pocket_field.positions * -2.0,
             values=first.pocket_field.values + 7.0,
         ),
-        property_targets={"different": torch.tensor([-5.0, 9.0])},
+        property_targets={
+            "different": torch.tensor([-5.0, 9.0]),
+            "second": torch.tensor([9.0, -5.0]),
+        },
         interaction_targets=torch.tensor([[8.0, -3.0], [4.0, 6.0]]),
         fragment=FragmentCondition.from_atom_mask(fixed, reference, task_id="link"),
     )
