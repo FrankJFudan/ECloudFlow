@@ -85,6 +85,24 @@ def test_task8_designated_apis_keep_scientific_tensor_contracts() -> None:
     assert check_paths(paths, designated=required) == []
 
 
+def test_task9_designated_apis_keep_stochastic_path_contracts() -> None:
+    """Task 9 paths retain endpoint, mask, and gradient API semantics."""
+    required = {
+        "continuous.ContinuousPath.sample",
+        "continuous.ContinuousPath.targets",
+        "continuous.ContinuousPath.velocity_loss",
+        "categorical.CategoricalPath.sample",
+        "categorical.CategoricalPath.endpoint_loss",
+    }
+    assert required <= DESIGNATED_APIS
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        root / "src/ecloudflow/process/continuous.py",
+        root / "src/ecloudflow/process/categorical.py",
+    ]
+    assert check_paths(paths, designated=required) == []
+
+
 def test_checker_rejects_missing_designated_api(tmp_path: Path) -> None:
     """A registry entry must resolve to a real module-qualified callable."""
     source = tmp_path / "missing.py"

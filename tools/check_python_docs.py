@@ -336,6 +336,22 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
             _FAILURE,
         ),
     ),
+    "continuous.ContinuousPath.sample": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
+    "continuous.ContinuousPath.targets": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MUTATION, _FAILURE, _GRADIENT)
+    ),
+    "continuous.ContinuousPath.velocity_loss": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MASK, _MUTATION, _FAILURE, _GRADIENT)
+    ),
+    "categorical.CategoricalPath.sample": APIDocContract(
+        True,
+        (_DEVICE, _DTYPE, _SHAPE, _MASK, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT),
+    ),
+    "categorical.CategoricalPath.endpoint_loss": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _MASK, _MUTATION, _FAILURE, _GRADIENT)
+    ),
 }
 DESIGNATED_APIS = frozenset(API_DOC_CONTRACTS)
 
