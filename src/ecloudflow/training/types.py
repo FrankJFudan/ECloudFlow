@@ -32,6 +32,7 @@ class TrainingTargets:
     electron_count: torch.Tensor | None = None
     dipole: torch.Tensor | None = None
     latent_cycle: torch.Tensor | None = None
+    latent_cycle_mask: torch.Tensor | None = None
     valence_limits: torch.Tensor | None = None
     bond_order_values: torch.Tensor | None = None
     bond_length_mean: torch.Tensor | None = None
@@ -75,7 +76,6 @@ class LossBreakdown:
 class ElectronDecoderContext:
     """Describe the real padded Task 8 decoder boundary for flattened tokens.
 
-    :param centers: Padded atom centers ``[B,Nmax,3]`` in centered-frame angstroms.
     :param query_grid: Field query coordinates ``[B,G,3]`` in the same frames.
     :param atom_mask: Boolean physical-atom mask ``[B,Nmax]``.
     :param flat_index: Long mapping ``[B,Nmax]`` into flattened model nodes;
@@ -83,13 +83,13 @@ class ElectronDecoderContext:
     :return: Immutable decoder context that fabricates no scientific values.
     :rtype: ElectronDecoderContext
 
-    The training module gathers the model's differentiable first-order endpoint
-    electron tokens through ``flat_index`` and calls the supplied real field
-    decoder. All tensors retain caller dtype/device; validation occurs before
-    decoding and no input is mutated or detached.
+    The training module gathers both the model's differentiable first-order
+    endpoint positions and electron tokens through the same ``flat_index``.
+    Context therefore carries query/mask/mapping metadata, never an external
+    geometry prediction. All tensors retain caller dtype/device; validation
+    occurs before decoding and no input is mutated or detached.
     """
 
-    centers: torch.Tensor
     query_grid: torch.Tensor
     atom_mask: torch.Tensor
     flat_index: torch.Tensor

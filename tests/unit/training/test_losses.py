@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -81,7 +82,7 @@ def _targets() -> TrainingTargets:
         bond_order_values=torch.tensor([0.0, 1.0]),
         bond_length_mean=torch.tensor([1.4, 1.4]),
         bond_length_std=torch.tensor([0.1, 0.1]),
-        nonbonded_halfedge_index=torch.tensor([[0], [2]]),
+        nonbonded_halfedge_index=torch.tensor([[1], [2]]),
         protein_positions=torch.tensor([[3.0, 0.0, 0.0], [10.0, 0.0, 0.0]]),
         protein_batch=torch.tensor([0, 1]),
         ring_triplets=torch.empty(3, 0, dtype=torch.long),
@@ -124,6 +125,170 @@ def test_all_fixed_and_all_missing_supervision_is_differentiable_zero() -> None:
 
     assert result.total.item() == 0.0
     assert torch.isfinite(result.total)
+
+
+def _leaf_with_row(tensor: torch.Tensor, row: int, value: float) -> torch.Tensor:
+    """Return a fresh gradient leaf with one deliberately invalid excluded row."""
+    changed = tensor.detach().clone()
+    changed[row] = value
+    return changed.requires_grad_(True)
+
+
+def test_excluded_nonfinite_and_class_sentinel_rows_are_never_evaluated() -> None:
+    """Mutation caught: multiplying post-arithmetic NaN by zero contaminates loss."""
+    prediction = _prediction()
+    assert prediction.electron_reconstruction is not None
+    reconstruction = ElectronReconstruction(
+        density=_leaf_with_row(
+            prediction.electron_reconstruction.density, 1, float("nan")
+        ),
+        gradient=_leaf_with_row(
+            prediction.electron_reconstruction.gradient, 1, float("inf")
+        ),
+        electron_count=_leaf_with_row(
+            prediction.electron_reconstruction.electron_count, 1, float("nan")
+        ),
+        dipole=_leaf_with_row(
+            prediction.electron_reconstruction.dipole, 1, float("inf")
+        ),
+        latent_round_trip=_leaf_with_row(
+            prediction.electron_reconstruction.latent_round_trip, 1, float("nan")
+        ),
+    )
+    prediction = replace(
+        prediction,
+        position_velocity=_leaf_with_row(prediction.position_velocity, 1, float("nan")),
+        position_score=_leaf_with_row(prediction.position_score, 1, float("inf")),
+        electron_velocity=_leaf_with_row(prediction.electron_velocity, 1, float("nan")),
+        electron_score=_leaf_with_row(prediction.electron_score, 1, float("inf")),
+        atom_logits=_leaf_with_row(prediction.atom_logits, 1, float("nan")),
+        charge_logits=_leaf_with_row(prediction.charge_logits, 1, float("inf")),
+        bond_logits=_leaf_with_row(prediction.bond_logits, 1, float("nan")),
+        count_logits=_leaf_with_row(prediction.count_logits, 1, float("inf")),
+        affinity=_leaf_with_row(prediction.affinity, 1, float("nan")),
+        affinity_log_variance=_leaf_with_row(
+            prediction.affinity_log_variance, 1, float("inf")
+        ),
+        interaction_logits=_leaf_with_row(
+            prediction.interaction_logits, 1, float("nan")
+        ),
+        electron_reconstruction=reconstruction,
+    )
+    targets = replace(
+        _targets(),
+        atom_classes=torch.tensor([0, -1, 0]),
+        charge_classes=torch.tensor([0, 999, 0]),
+        bond_classes=torch.tensor([1, -1]),
+        count_classes=torch.tensor([1, -1]),
+        count_mask=torch.tensor([True, False]),
+        density=torch.tensor([[1.2, 1.8], [float("nan"), float("inf")]]),
+        density_gradient=torch.tensor(
+            [
+                [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[float("nan"), 0.0, 0.0], [float("inf"), 0.0, 0.0]],
+            ]
+        ),
+        electron_count=torch.tensor([3.0, float("nan")]),
+        dipole=torch.tensor([[0.0, 0.0, 0.0], [float("inf"), 0.0, 0.0]]),
+        latent_cycle=torch.tensor(
+            [
+                [[0.0, 0.0], [0.0, 0.0]],
+                [[float("nan"), 0.0], [float("inf"), 0.0]],
+            ]
+        ),
+        interaction=torch.tensor([1.0, float("nan")]),
+        interaction_mask=torch.tensor([True, False]),
+        affinity=torch.tensor([1.0, float("nan")]),
+        affinity_mask=torch.tensor([True, False]),
+    )
+
+    result = compute_ecloudflow_loss(prediction, targets, LossConfig())
+    result.total.backward()
+
+    assert torch.isfinite(result.total)
+    for tensor in (
+        prediction.position_velocity,
+        prediction.position_score,
+        prediction.electron_velocity,
+        prediction.electron_score,
+        prediction.atom_logits,
+        prediction.charge_logits,
+        prediction.bond_logits,
+        prediction.count_logits,
+        prediction.affinity,
+        prediction.affinity_log_variance,
+        prediction.interaction_logits,
+        reconstruction.density,
+        reconstruction.gradient,
+        reconstruction.electron_count,
+        reconstruction.dipole,
+        reconstruction.latent_round_trip,
+    ):
+        assert tensor.grad is not None
+        assert torch.equal(tensor.grad[1], torch.zeros_like(tensor.grad[1]))
+
+
+def test_all_false_masks_ignore_nonfinite_placeholders_with_exact_zero_gradient() -> (
+    None
+):
+    """Mutation caught: empty selection still sums nonfinite backing storage."""
+    prediction = replace(
+        _prediction(),
+        position_velocity=torch.full((3, 3), float("nan"), requires_grad=True),
+        atom_logits=torch.full((3, 2), float("inf"), requires_grad=True),
+    )
+    targets = replace(
+        _targets(),
+        editable_atom_mask=torch.zeros(3, dtype=torch.bool),
+        editable_bond_mask=torch.zeros(2, dtype=torch.bool),
+        count_mask=torch.zeros(2, dtype=torch.bool),
+        qm_mask=torch.zeros(2, dtype=torch.bool),
+        interaction_mask=torch.zeros(2, dtype=torch.bool),
+        affinity_mask=torch.zeros(2, dtype=torch.bool),
+    )
+
+    result = compute_ecloudflow_loss(prediction, targets, LossConfig())
+    result.total.backward()
+
+    assert result.total.item() == 0.0
+    assert torch.equal(
+        prediction.position_velocity.grad,
+        torch.zeros_like(prediction.position_velocity.grad),
+    )
+    assert torch.equal(
+        prediction.atom_logits.grad, torch.zeros_like(prediction.atom_logits.grad)
+    )
+
+
+def test_missing_cycle_tokens_are_selected_before_nonfinite_arithmetic() -> None:
+    """Mutation caught: padded cycle entries had no typed missing-label mask."""
+    prediction = _prediction()
+    assert prediction.electron_reconstruction is not None
+    cycle = prediction.electron_reconstruction.latent_round_trip.detach().clone()
+    cycle[0, 1] = float("nan")
+    cycle = cycle.requires_grad_(True)
+    prediction = replace(
+        prediction,
+        electron_reconstruction=prediction.electron_reconstruction._replace(
+            latent_round_trip=cycle
+        ),
+    )
+    target_cycle = _targets().latent_cycle
+    assert target_cycle is not None
+    target_cycle = target_cycle.clone()
+    target_cycle[0, 1] = float("inf")
+    targets = replace(
+        _targets(),
+        latent_cycle=target_cycle,
+        latent_cycle_mask=torch.tensor([[True, False], [True, True]]),
+    )
+
+    result = compute_ecloudflow_loss(prediction, targets, LossConfig())
+    result.raw["ecloud"].backward()
+
+    assert torch.isfinite(result.raw["ecloud"])
+    assert cycle.grad is not None
+    assert torch.count_nonzero(cycle.grad[0, 1]) == 0
 
 
 def test_empty_flattened_ligand_with_missing_labels_is_finite_zero() -> None:
@@ -265,8 +430,8 @@ def test_qm_target_shape_cannot_broadcast_across_field_points() -> None:
 @pytest.mark.parametrize(
     ("field", "bad"),
     [
-        ("atom_classes", torch.tensor([0, 2, 0])),
-        ("bond_classes", torch.tensor([1, -1])),
+        ("atom_classes", torch.tensor([2, 1, 0])),
+        ("bond_classes", torch.tensor([-1, 0])),
     ],
 )
 def test_class_targets_are_range_validated(field: str, bad: torch.Tensor) -> None:
@@ -282,6 +447,112 @@ def test_sparse_halfedges_must_be_canonical_and_same_complex() -> None:
     bad = replace(_targets(), halfedge_index=torch.tensor([[1, 0], [0, 2]]))
     with pytest.raises(ValueError, match="unordered halfedge"):
         compute_ecloudflow_loss(_prediction(), bad, LossConfig())
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"nonbonded_halfedge_index": torch.tensor([[0], [1]])}, "disjoint"),
+        (
+            {"nonbonded_halfedge_index": torch.tensor([[1, 1], [2, 2]])},
+            "unique",
+        ),
+        (
+            {
+                "ring_triplets": torch.tensor([[0], [0], [2]]),
+                "ring_angle_mean": torch.tensor([1.0]),
+                "ring_angle_std": torch.tensor([0.1]),
+            },
+            "distinct",
+        ),
+        (
+            {
+                "ring_triplets": torch.tensor([[0], [1], [2]]),
+                "ring_angle_mean": torch.tensor([1.0]),
+                "ring_angle_std": torch.tensor([-0.1]),
+            },
+            "positive",
+        ),
+    ],
+)
+def test_sparse_scientific_topology_is_validated_without_dense_allocation(
+    change: dict[str, torch.Tensor], message: str
+) -> None:
+    """Mutation caught: invalid sparse scientific edges/triplets reach geometry math."""
+    with pytest.raises(ValueError, match=message):
+        compute_ecloudflow_loss(
+            _prediction(), replace(_targets(), **change), LossConfig()
+        )
+
+
+def test_active_bond_prior_requires_positive_finite_stddev() -> None:
+    """Mutation caught: clamping an invalid active prior silently changes supervision."""
+    targets = replace(_targets(), bond_length_std=torch.tensor([-1.0, float("nan")]))
+    with pytest.raises(ValueError, match="positive"):
+        compute_ecloudflow_loss(_prediction(), targets, LossConfig())
+
+
+def test_diagnostics_count_actual_enabled_observations_per_subterm() -> None:
+    """Mutation caught: broad graph/QM masks over-report pair and point supervision."""
+    result = compute_ecloudflow_loss(_prediction(), _targets(), LossConfig())
+    counts = {
+        name: int(value) for name, value in result.diagnostics.supervised_counts.items()
+    }
+
+    assert counts["flow_position"] == 2
+    assert counts["flow_electron"] == 2
+    assert counts["score_position"] == 2
+    assert counts["discrete_bond"] == 1
+    assert counts["ecloud_density"] == 2
+    assert counts["ecloud_electron_count"] == 1
+    assert counts["chem_bond_length"] == 1
+    assert counts["chem_ligand_clash"] == 1
+    assert counts["chem_ring_strain"] == 0
+    assert counts["interaction"] == 2
+
+
+def test_disabled_component_does_not_initialize_or_decay_running_scale() -> None:
+    """Mutation caught: broad masks update a scale for a zero-weight component."""
+    base = LossConfig()
+    config = base.model_copy(
+        update={"ecloud": base.ecloud.model_copy(update={"weight": 0.0})}
+    )
+    scaler = RunningLossScaler(decay=0.5)
+    compute_ecloudflow_loss(_prediction(), _targets(), config, scaler=scaler)
+
+    assert not scaler.initialized[scaler.component_names.index("ecloud")]
+
+
+def test_zero_weight_ecloud_component_requires_no_decoder_prediction() -> None:
+    """Mutation caught: inactive expensive reconstruction still required context/output."""
+    base = LossConfig()
+    config = base.model_copy(
+        update={"ecloud": base.ecloud.model_copy(update={"weight": 0.0})}
+    )
+    prediction = replace(_prediction(), electron_reconstruction=None)
+
+    result = compute_ecloudflow_loss(prediction, _targets(), config)
+
+    assert result.raw["ecloud"].item() == 0.0
+    assert result.weighted["ecloud"].item() == 0.0
+
+
+def test_zero_component_factor_does_not_multiply_inactive_nonfinite_raw() -> None:
+    """Mutation caught: IEEE NaN times a zero component factor remained NaN."""
+    base = LossConfig()
+    config = base.model_copy(
+        update={"flow": base.flow.model_copy(update={"weight": 0.0})}
+    )
+    prediction = replace(
+        _prediction(),
+        position_velocity=torch.full((3, 3), float("nan"), requires_grad=True),
+        electron_velocity=torch.full((3, 2), float("inf"), requires_grad=True),
+    )
+
+    result = compute_ecloudflow_loss(prediction, _targets(), config)
+
+    assert result.weighted["flow"].item() == 0.0
+    assert torch.isfinite(result.total)
 
 
 def test_zero_degree_connectivity_is_finite_and_has_bond_gradient() -> None:
@@ -398,6 +669,79 @@ def test_running_scaler_synchronizes_detached_statistics_across_gloo_ranks(
     """Mutation caught: rank-local scale updates silently diverge under DDP."""
     init_file = tmp_path / "gloo-init"
     mp.spawn(_distributed_scaler_worker, args=(str(init_file),), nprocs=2, join=True)
+
+
+def _distributed_nonfinite_worker(rank: int, init_file: str) -> None:
+    """Require every rank to raise the same diagnostic without collective deadlock."""
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=Path(init_file).as_uri(),
+        timeout=timedelta(seconds=5),
+    )
+    try:
+        prediction = _prediction()
+        if rank == 1:
+            changed = prediction.position_velocity.detach().clone()
+            changed[0, 0] = float("nan")
+            prediction = replace(
+                prediction, position_velocity=changed.requires_grad_(True)
+            )
+        scaler = RunningLossScaler()
+        message = "no error"
+        try:
+            compute_ecloudflow_loss(prediction, _targets(), LossConfig(), scaler=scaler)
+        except FloatingPointError as error:
+            message = str(error)
+        gathered: list[str | None] = [None, None]
+        dist.all_gather_object(gathered, message)
+        assert gathered[0] == gathered[1]
+        assert gathered[0] is not None and "flow" in gathered[0]
+    finally:
+        dist.destroy_process_group()
+
+
+def test_nonfinite_on_one_gloo_rank_raises_consistently_without_deadlock(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: local fail-fast strands peers inside scaler all-reduce."""
+    mp.spawn(
+        _distributed_nonfinite_worker,
+        args=(str(tmp_path / "gloo-nonfinite"),),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _distributed_asymmetric_presence_worker(rank: int, init_file: str) -> None:
+    """Verify a missing rank neither adds a zero observation nor blocks updates."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=Path(init_file).as_uri()
+    )
+    try:
+        scaler = RunningLossScaler()
+        zero = torch.tensor(0.0)
+        values = {name: zero for name in scaler.component_names}
+        values["flow"] = torch.tensor(3.0 if rank else 0.0)
+        active = {name: name == "flow" and rank == 1 for name in scaler.component_names}
+        scaler.update(values, active)
+        assert scaler.initialized[0]
+        assert scaler.mean_square[0].item() == 9.0
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gloo_scaler_handles_asymmetric_finite_and_missing_supervision(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: missing-rank zeros bias globally present sufficient statistics."""
+    mp.spawn(
+        _distributed_asymmetric_presence_worker,
+        args=(str(tmp_path / "gloo-asymmetric"),),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_affinity_log_variance_is_clamped_per_example() -> None:

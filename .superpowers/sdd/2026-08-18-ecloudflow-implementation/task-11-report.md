@@ -213,3 +213,145 @@ not establish chemical validity or binding-quality benefit.
   outside this task. They were not modified. The Task 11 scope is fully formatted.
 - The one full-suite skip is the existing external xTB integration test. Warnings
   are third-party pyparsing deprecations plus Lightning environment/worker hints.
+
+## Fix round 1/5 — active selection, collective fail-fast, and decoder geometry
+
+Review base: `b6faa96`.
+
+### RED evidence
+
+Each behavior below was exercised independently rather than being hidden by a
+missing-module collection failure:
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_excluded_nonfinite_and_class_sentinel_rows_are_never_evaluated \
+  tests/unit/training/test_losses.py::test_all_false_masks_ignore_nonfinite_placeholders_with_exact_zero_gradient -q
+2 failed
+```
+
+The first failure was the pre-mask global class-range check; the second reached a
+non-finite total because an empty reduction used `values.sum() * 0`. An accidental
+initial invocation with the base interpreter failed to import Torch and is not
+claimed as scientific RED evidence; every reported RED/GREEN run used the pinned
+`3dmolecule` environment.
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_nonfinite_on_one_gloo_rank_raises_consistently_without_deadlock -q
+1 failed in 15.23s
+rank 0: Gloo recv timed out after 5000 ms while rank 1 had raised locally
+```
+
+The bounded process-group timeout demonstrated the actual stranded-rank failure
+without leaving Windows spawn children hung.
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_decoder_is_not_required_without_enabled_genuine_qm_supervision \
+  tests/integration/test_training_step.py::test_real_decoder_uses_predicted_centers_and_all_qm_terms_are_differentiable \
+  tests/integration/test_training_step.py::test_decoder_mapping_rejects_duplicates -q
+3 failed: ElectronDecoderContext still required external centers
+```
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_sparse_scientific_topology_is_validated_without_dense_allocation \
+  tests/unit/training/test_losses.py::test_active_bond_prior_requires_positive_finite_stddev \
+  tests/unit/training/test_losses.py::test_diagnostics_count_actual_enabled_observations_per_subterm \
+  tests/unit/training/test_losses.py::test_disabled_component_does_not_initialize_or_decay_running_scale -q
+7 failed
+```
+
+Those failures independently exposed bonded/nonbonded overlap, duplicate pairs,
+repeated ring nodes, invalid active ring/bond standard deviations, missing exact
+counts, and broad-mask scaler presence. Further focused RED tests failed because
+`latent_cycle_mask` did not exist and because a zero-weight ecloud component still
+required a reconstruction prediction. A final IEEE-zeroing RED showed that an
+inactive non-finite raw component multiplied by numerical zero still contaminated
+the total; weighted components now branch to a differentiable zero when their
+typed weight/warm-up factor is zero. An explicit-context RED also confirmed that
+active QM `forward` previously deferred a missing context; it now raises at the
+module boundary, while genuinely inactive paths still require no context.
+
+### GREEN behavior and contracts
+
+Masking now expands only boolean prefix metadata, selects active tensor entries,
+and performs CE/MSE/NLL/focal/geometry arithmetic only on the selection. Empty
+selection uses an empty view sum, yielding finite differentiable zero even when
+excluded backing storage is NaN/Inf. Masked class sentinels are not range checked;
+selected classes are. Fixed, missing, non-QM, and padded cycle entries have exact
+zero loss and gradient. `TrainingTargets.latent_cycle_mask [B,Nmax]` makes missing
+cycle-token supervision explicit.
+
+Each finite stage first creates fixed `[6,2]` detached presence/nonfinite
+sufficient statistics and performs the same all-reduce on every initialized
+rank. All ranks then raise the same ordered component diagnostic, or all proceed
+to scaler square/count reductions in fixed order. Locally absent but globally
+present supervision contributes no zero observation. Component presence is the
+sum of enabled observed subterms and additionally respects component weight and
+explicit-step warm-up; disabled/empty terms neither initialize nor decay RMS.
+
+`ElectronDecoderContext` now contains only `query_grid`, `atom_mask`, and
+`flat_index`. Both centers and electron latents are gathered from
+`ModelPrediction.endpoint_positions` and `endpoint_electron_latent` with the same
+mapping. Physical mappings must be complete, unique, in range, and match
+`TrainingTargets.node_batch`; duplicate, cross-complex, and incomplete mappings
+raise. Only genuine-QM rows needed by enabled, warmed-up terms enter the real
+decoder, and results scatter back as differentiable zeros for inactive rows.
+Thus density, gradient, count, dipole, and cycle losses reach predicted centers,
+while an inactive row may safely carry non-finite placeholders.
+
+Sparse validation remains `O(N+E+P+R)`: canonical pairs are encoded as integer
+keys for uniqueness/disjointness, without a dense adjacency. Nonbonded pairs are
+same-complex and disjoint from bonds; ring triplets use three distinct in-range
+same-complex nodes and positive finite active priors. Optional scientific values
+use exact shape/dtype/device checks and active-only finiteness/range checks.
+Diagnostics now report actual enabled node, edge, pair, triplet, field-point,
+cycle-token, and labeled-example counts.
+
+The real Lightning tests use `ElectronFieldDecoder`, not a mock of scientific
+behavior. They exercise all five reconstruction terms, a mixed-QM batch with
+NaN/Inf inactive labels/query points, nonzero predicted-center gradient on the
+QM complex, exact zero gradient on the non-QM complex, and an optimizer update.
+On the available RTX 4060, Lightning's real CUDA FP16 precision plugin/GradScaler
+skips a deliberately overflowing step; the parameter and EMA update counter stay
+unchanged. EMA/scaler buffers remain normal persistent `state_dict` entries; the
+Task 12-owned interrupted/resumed Trainer scenario was intentionally not copied.
+
+These are verified algebraic, mask, topology, collective-order, precision-plugin,
+and state-mutation invariants. We still make no empirical conclusion about loss
+weights, focal gamma, warm-ups, surrogate chemical utility, or binding quality;
+those remain real-data ablation hypotheses.
+
+### Fix-round verification
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training tests/integration/test_training_step.py tests/unit/models/test_ecloudflow.py -q
+88 passed, 20 warnings in 24.33s
+
+conda run -n 3dmolecule python -m pytest -q
+331 passed, 1 skipped, 20 warnings in 34.87s
+
+conda run -n 3dmolecule ruff check <fix-round source/test scope>
+All checks passed!
+
+conda run -n 3dmolecule ruff format --check <fix-round source/test scope>
+all files formatted
+
+conda run -n 3dmolecule python tools/check_python_docs.py src/ecloudflow
+exit 0
+
+conda run -n 3dmolecule python -m mypy --no-site-packages \
+  --ignore-missing-imports --follow-imports=normal \
+  src/ecloudflow/training src/ecloudflow/config/schema.py \
+  src/ecloudflow/models/ecloudflow.py
+Success: no issues found in 7 source files
+
+git diff --check
+exit 0 (only Git LF-to-CRLF checkout warnings)
+```
+
+Warnings are the prior third-party pyparsing deprecations and Lightning GPU/
+dataloader-worker hints. The single skip remains the external xTB integration.

@@ -80,6 +80,7 @@ class RunningLossScaler(nn.Module):  # type: ignore[misc]
         reference = next(iter(values.values()))
         if reference.device != self.mean_square.device:
             raise ValueError("running scaler buffers and losses must share one device.")
+        _collective_finite_status("scaler", values, active)
         squares = torch.zeros_like(self.mean_square)
         counts = torch.zeros_like(self.mean_square)
         for index, name in enumerate(COMPONENT_NAMES):
@@ -88,8 +89,6 @@ class RunningLossScaler(nn.Module):  # type: ignore[misc]
                 raise ValueError("running scaler values must be same-device scalars.")
             if active[name]:
                 detached = value.detach().float()
-                if not bool(torch.isfinite(detached)):
-                    raise ValueError(f"running scaler received non-finite {name} loss.")
                 squares[index] = detached.square()
                 counts[index] = 1.0
         if dist.is_available() and dist.is_initialized():
@@ -213,6 +212,14 @@ def compute_ecloudflow_loss(
         score_position=score_position,
         score_electron=score_electron,
     )
+    atom_count = editable_atoms.sum()
+    bond_count = editable_bonds.sum()
+    counts.update(
+        flow_position=atom_count if config.flow.position else atom_count * 0,
+        flow_electron=atom_count if config.flow.electron else atom_count * 0,
+        score_position=atom_count if config.score.position else atom_count * 0,
+        score_electron=atom_count if config.score.electron else atom_count * 0,
+    )
     flow = config.flow.position * flow_position + config.flow.electron * flow_electron
     score = (
         config.score.position * score_position + config.score.electron * score_electron
@@ -232,6 +239,16 @@ def compute_ecloudflow_loss(
         discrete_bond=bond,
         discrete_count=count,
     )
+    counts.update(
+        discrete_atom=atom_count if config.discrete.atom else atom_count * 0,
+        discrete_charge=atom_count if config.discrete.charge else atom_count * 0,
+        discrete_bond=bond_count if config.discrete.bond else bond_count * 0,
+        discrete_count=(
+            targets.count_mask.sum()
+            if config.discrete.count
+            else targets.count_mask.sum() * 0
+        ),
+    )
     discrete = (
         config.discrete.atom * atom
         + config.discrete.charge * charge
@@ -239,22 +256,20 @@ def compute_ecloudflow_loss(
         + config.discrete.count * count
     )
 
-    qm_active = bool(targets.qm_mask.any()) and any(
-        (
-            config.ecloud.density,
-            config.ecloud.gradient,
-            config.ecloud.electron_count,
-            config.ecloud.dipole,
-            config.ecloud.cycle,
-        )
+    ecloud_terms = _ecloud_terms(
+        prediction,
+        targets,
+        config,
+        subterms,
+        counts,
+        enabled=config.ecloud.weight > 0.0 and _warmup(config.ecloud, step) > 0.0,
     )
-    ecloud_terms = _ecloud_terms(prediction, targets, config, subterms, counts)
     ecloud = sum(ecloud_terms, _zero_from_prediction(prediction))
 
     chemistry_terms = _chemistry_terms(prediction, targets, config, subterms, counts)
     chem = sum(chemistry_terms, _zero_from_prediction(prediction))
 
-    interaction, interaction_active = _interaction_term(prediction, targets, config)
+    interaction, _ = _interaction_term(prediction, targets, config)
     subterms["interaction_focal"] = interaction
     counts["interaction"] = _mask_count(targets.interaction_mask, prediction.affinity)
 
@@ -266,36 +281,6 @@ def compute_ecloudflow_loss(
         "chem": chem,
         "interaction": interaction,
     }
-    graph_active = bool(editable_atoms.any())
-    chemistry_graph_active = graph_active and any(
-        (
-            config.chem.valence,
-            config.chem.bond_length,
-            config.chem.ligand_clash,
-            config.chem.protein_clash,
-            config.chem.ring_strain,
-            config.chem.connectivity,
-        )
-    )
-    active = {
-        "flow": graph_active,
-        "score": graph_active,
-        "discrete": graph_active
-        or bool(editable_bonds.any())
-        or bool(targets.count_mask.any()),
-        "ecloud": qm_active,
-        "chem": chemistry_graph_active
-        or (bool(config.chem.affinity) and _optional_mask_any(targets.affinity_mask)),
-        "interaction": interaction_active,
-    }
-    _raise_nonfinite("raw", raw, active)
-    if scaler is not None and config.normalization.enabled:
-        scaler.update(raw, active)
-        normalized = {
-            name: scaler.normalize(name, raw[name]) for name in COMPONENT_NAMES
-        }
-    else:
-        normalized = dict(raw)
     component_configs: dict[str, WeightedLossConfig] = {
         "flow": config.flow,
         "score": config.score,
@@ -304,25 +289,65 @@ def compute_ecloudflow_loss(
         "chem": config.chem,
         "interaction": config.interaction,
     }
-    weighted = {
-        name: normalized[name]
-        * component_configs[name].weight
-        * _warmup(component_configs[name], step)
+    observed = {
+        "flow": counts["flow_position"] + counts["flow_electron"],
+        "score": counts["score_position"] + counts["score_electron"],
+        "discrete": sum(
+            (counts[name] for name in counts if name.startswith("discrete_")),
+            atom_count * 0,
+        ),
+        "ecloud": sum(
+            (counts[name] for name in counts if name.startswith("ecloud_")),
+            atom_count * 0,
+        ),
+        "chem": sum(
+            (counts[name] for name in counts if name.startswith("chem_")),
+            atom_count * 0,
+        ),
+        "interaction": counts["interaction"],
+    }
+    active = {
+        name: bool(observed[name] > 0)
+        and component_configs[name].weight > 0.0
+        and _warmup(component_configs[name], step) > 0.0
         for name in COMPONENT_NAMES
     }
+    _collective_finite_status("raw", raw, active)
+    if scaler is not None and config.normalization.enabled:
+        scaler.update(raw, active)
+        normalized = {
+            name: scaler.normalize(name, raw[name]) for name in COMPONENT_NAMES
+        }
+    else:
+        normalized = dict(raw)
+    weighted: dict[str, torch.Tensor] = {}
+    for name in COMPONENT_NAMES:
+        factor = component_configs[name].weight * _warmup(component_configs[name], step)
+        weighted[name] = (
+            normalized[name] * factor
+            if factor > 0.0
+            else _zero_from_prediction(prediction)
+        )
     total = sum(weighted.values(), _zero_from_prediction(prediction))
-    _raise_nonfinite("normalized", normalized, active)
-    _raise_nonfinite("weighted", weighted, active)
-    if not bool(torch.isfinite(total)):
-        raise FloatingPointError("non-finite total loss after component weighting")
+    _collective_finite_status("normalized", normalized, active)
+    _collective_finite_status("weighted", weighted, active)
+    total_values = {name: total for name in COMPONENT_NAMES}
+    total_active = {name: name == "flow" for name in COMPONENT_NAMES}
+    _collective_finite_status("total", total_values, total_active)
     fixed = ~editable_atoms
-    flow_fixed = prediction.position_velocity[fixed].sum() * 0.0
-    score_fixed = prediction.position_score[fixed].sum() * 0.0
-    log_variance = prediction.affinity_log_variance.clamp(
+    flow_fixed = prediction.position_velocity[fixed].reshape(-1)[:0].sum()
+    score_fixed = prediction.position_score[fixed].reshape(-1)[:0].sum()
+    affinity_mask = targets.affinity_mask
+    selected_log_variance = (
+        prediction.affinity_log_variance[affinity_mask]
+        if affinity_mask is not None
+        else prediction.affinity_log_variance[:0]
+    )
+    log_variance = selected_log_variance.clamp(
         config.chem.affinity_log_variance_min,
         config.chem.affinity_log_variance_max,
     )
-    zero = prediction.affinity.sum() * 0.0
+    zero = prediction.affinity.reshape(-1)[:0].sum()
     diagnostics = LossDiagnostics(
         flow_fixed=flow_fixed,
         score_fixed=score_fixed,
@@ -370,8 +395,13 @@ def _validate_core_contract(
         (targets.editable_bond_mask, (edge_count,), "editable_bond_mask"),
         (targets.count_mask, (batch_size,), "count_mask"),
         (targets.qm_mask, (batch_size,), "qm_mask"),
+        (targets.interaction_mask, (batch_size,), "interaction_mask"),
+        (targets.affinity_mask, (batch_size,), "affinity_mask"),
     )
     for tensor, shape, name in masks:
+        if tensor is None and name in {"interaction_mask", "affinity_mask"}:
+            continue
+        assert tensor is not None
         if (
             tensor.shape != shape
             or tensor.dtype != torch.bool
@@ -381,17 +411,16 @@ def _validate_core_contract(
                 f"{name} must be a boolean tensor with shape {shape} on prediction device."
             )
     classes = (
-        (targets.atom_classes, prediction.atom_logits.shape[1], node_count, "atom"),
+        (targets.atom_classes, node_count, "atom"),
         (
             targets.charge_classes,
-            prediction.charge_logits.shape[1],
             node_count,
             "charge",
         ),
-        (targets.bond_classes, prediction.bond_logits.shape[1], edge_count, "bond"),
-        (targets.count_classes, prediction.count_logits.shape[1], batch_size, "count"),
+        (targets.bond_classes, edge_count, "bond"),
+        (targets.count_classes, batch_size, "count"),
     )
-    for tensor, width, size, name in classes:
+    for tensor, size, name in classes:
         if (
             tensor.shape != (size,)
             or tensor.dtype != torch.long
@@ -400,12 +429,6 @@ def _validate_core_contract(
             raise ValueError(
                 f"{name} class targets must be torch.long with the expected shape/device."
             )
-        if tensor.numel() and (
-            bool((tensor < 0).any()) or bool((tensor >= width).any())
-        ):
-            raise ValueError(
-                f"{name} class target is outside its configured vocabulary."
-            )
     if (
         targets.node_batch.shape != (node_count,)
         or targets.node_batch.dtype != torch.long
@@ -413,10 +436,18 @@ def _validate_core_contract(
         or targets.halfedge_batch.dtype != torch.long
         or targets.halfedge_index.shape != (2, edge_count)
         or targets.halfedge_index.dtype != torch.long
+        or targets.node_batch.device != reference.device
+        or targets.halfedge_batch.device != reference.device
+        or targets.halfedge_index.device != reference.device
     ):
         raise ValueError(
             "node and halfedge batch/index tensors have invalid shapes or dtypes."
         )
+    if targets.node_batch.numel() and (
+        bool((targets.node_batch < 0).any())
+        or bool((targets.node_batch >= batch_size).any())
+    ):
+        raise ValueError("node_batch contains an index outside the batch range.")
     if targets.halfedge_index.numel():
         source, target = targets.halfedge_index
         if bool((source >= target).any()):
@@ -429,6 +460,9 @@ def _validate_core_contract(
             raise ValueError("unordered halfedge endpoints must belong to one complex.")
         if not torch.equal(targets.node_batch[source], targets.halfedge_batch):
             raise ValueError("halfedge_batch must match endpoint complex membership.")
+        codes = source * node_count + target
+        if codes.unique().numel() != codes.numel():
+            raise ValueError("canonical unordered halfedges must be unique.")
 
 
 def _ecloud_terms(
@@ -437,6 +471,8 @@ def _ecloud_terms(
     config: LossConfig,
     diagnostics: dict[str, torch.Tensor],
     counts: dict[str, torch.Tensor],
+    *,
+    enabled: bool,
 ) -> list[torch.Tensor]:
     """Compute genuine-QM reconstruction terms or an inactive differentiable zero."""
     zero = _zero_from_prediction(prediction)
@@ -447,10 +483,10 @@ def _ecloud_terms(
         "dipole": config.ecloud.dipole,
         "cycle": config.ecloud.cycle,
     }
-    if not bool(targets.qm_mask.any()) or not any(weights.values()):
+    if not enabled or not bool(targets.qm_mask.any()) or not any(weights.values()):
         for name in ("density", "gradient", "electron_count", "dipole", "cycle"):
             diagnostics[f"ecloud_{name}"] = zero
-            counts[f"ecloud_{name}"] = targets.qm_mask.sum()
+            counts[f"ecloud_{name}"] = targets.qm_mask.sum() * 0
         return [zero]
     reconstruction = prediction.electron_reconstruction
     if reconstruction is None:
@@ -494,20 +530,31 @@ def _ecloud_terms(
     if weights["cycle"]:
         if targets.latent_cycle is None:
             raise ValueError("enabled electron cycle requires latent cycle targets.")
+        cycle_mask = (
+            targets.latent_cycle_mask
+            if targets.latent_cycle_mask is not None
+            else torch.ones(
+                reconstruction.latent_round_trip.shape[:2],
+                dtype=torch.bool,
+                device=reconstruction.latent_round_trip.device,
+            )
+        )
         values["cycle"] = _masked_mse(
             reconstruction.latent_round_trip,
             targets.latent_cycle,
-            targets.qm_mask[:, None],
+            targets.qm_mask[:, None] & cycle_mask,
         )
     for name in weights.keys() - values.keys():
         values[name] = zero
     for name, value in values.items():
         diagnostics[f"ecloud_{name}"] = value
-        counts[f"ecloud_{name}"] = (
-            (targets.qm_mask[:, None] & field_mask).sum()
-            if name in {"density", "gradient"} and field_mask is not None
-            else targets.qm_mask.sum()
-        )
+        if name in {"density", "gradient"} and field_mask is not None:
+            observed = (targets.qm_mask[:, None] & field_mask).sum()
+        elif name == "cycle" and targets.latent_cycle_mask is not None:
+            observed = (targets.qm_mask[:, None] & targets.latent_cycle_mask).sum()
+        else:
+            observed = targets.qm_mask.sum()
+        counts[f"ecloud_{name}"] = observed if weights[name] else observed * 0
     return [weights[name] * value for name, value in values.items()]
 
 
@@ -543,7 +590,11 @@ def _chemistry_terms(
     }
     if bool(editable.any()):
         source, target = targets.halfedge_index
-        bond_probability = prediction.bond_logits.float().softmax(-1)
+        active_edges = targets.editable_bond_mask
+        active_source = source[active_edges]
+        active_target = target[active_edges]
+        selected_bond_logits = prediction.bond_logits[active_edges].float()
+        bond_probability = selected_bond_logits.softmax(-1)
         needs_order = weights["valence"] or weights["connectivity"]
         if needs_order:
             if targets.bond_order_values is None:
@@ -551,6 +602,14 @@ def _chemistry_terms(
             if targets.bond_order_values.shape != (prediction.bond_logits.shape[1],):
                 raise ValueError(
                     "bond_order_values must have one value per bond class."
+                )
+            if (
+                not targets.bond_order_values.is_floating_point()
+                or targets.bond_order_values.device != prediction.bond_logits.device
+                or not bool(torch.isfinite(targets.bond_order_values).all())
+            ):
+                raise ValueError(
+                    "bond_order_values must be finite floating model context."
                 )
             expected_order = (
                 (bond_probability * targets.bond_order_values.float().unsqueeze(0))
@@ -562,22 +621,34 @@ def _chemistry_terms(
                 dtype=expected_order.dtype,
                 device=expected_order.device,
             )
-            valence.index_add_(0, source, expected_order)
-            valence.index_add_(0, target, expected_order)
+            valence.index_add_(0, active_source, expected_order)
+            valence.index_add_(0, active_target, expected_order)
             if weights["valence"]:
                 if targets.valence_limits is None:
                     raise ValueError(
                         "enabled valence overflow requires valence limits."
                     )
-                overflow = functional.relu(
-                    valence - targets.valence_limits.float()
-                ).square()
-                values["valence"] = _masked_mean(overflow, editable)
+                if (
+                    targets.valence_limits.shape != (editable.shape[0],)
+                    or not targets.valence_limits.is_floating_point()
+                    or targets.valence_limits.device != editable.device
+                ):
+                    raise ValueError(
+                        "valence_limits must be floating [N] on model device."
+                    )
+                selected_limits = targets.valence_limits[editable]
+                if not bool(torch.isfinite(selected_limits).all()):
+                    raise ValueError("active valence limits must be finite.")
+                values["valence"] = (
+                    functional.relu(valence[editable] - selected_limits.float())
+                    .square()
+                    .mean()
+                )
             if weights["connectivity"]:
                 present_probability = 1.0 - bond_probability[:, 0]
                 degree = torch.zeros_like(valence)
-                degree.index_add_(0, source, present_probability)
-                degree.index_add_(0, target, present_probability)
+                degree.index_add_(0, active_source, present_probability)
+                degree.index_add_(0, active_target, present_probability)
                 values["connectivity"] = _masked_mean(
                     functional.relu(config.chem.minimum_degree - degree).square(),
                     editable,
@@ -591,19 +662,30 @@ def _chemistry_terms(
         if weights["bond_length"]:
             if targets.bond_length_mean is None or targets.bond_length_std is None:
                 raise ValueError("enabled bond length requires conditioned mean/std.")
+            selected_mean = targets.bond_length_mean[active_edges]
+            selected_std = targets.bond_length_std[active_edges]
+            if (
+                not selected_mean.is_floating_point()
+                or not selected_std.is_floating_point()
+            ):
+                raise ValueError("bond length mean/std must be floating tensors.")
+            if (
+                not bool(torch.isfinite(selected_mean).all())
+                or not bool(torch.isfinite(selected_std).all())
+                or bool((selected_std <= 0).any())
+            ):
+                raise ValueError("active bond length std must be finite and positive.")
             distances = (
                 (
-                    prediction.endpoint_positions[source]
-                    - prediction.endpoint_positions[target]
+                    prediction.endpoint_positions[active_source]
+                    - prediction.endpoint_positions[active_target]
                 )
                 .float()
                 .norm(dim=-1)
             )
-            standardized = (
-                distances - targets.bond_length_mean.float()
-            ) / targets.bond_length_std.float().clamp_min(config.chem.epsilon)
-            values["bond_length"] = _masked_mean(
-                standardized.square(), targets.editable_bond_mask
+            standardized = (distances - selected_mean.float()) / selected_std.float()
+            values["bond_length"] = (
+                standardized.square().mean() if standardized.numel() else zero
             )
         if weights["ligand_clash"]:
             if targets.nonbonded_halfedge_index is None:
@@ -614,21 +696,25 @@ def _chemistry_terms(
             _validate_sparse_pairs(
                 nonbonded, editable.shape[0], "nonbonded_halfedge_index"
             )
+            _validate_nonbonded_topology(nonbonded, targets)
             left, right = nonbonded
             pair_editable = editable[left] | editable[right]
+            selected_left = left[pair_editable]
+            selected_right = right[pair_editable]
             nonbonded_distance = (
                 (
-                    prediction.endpoint_positions[left]
-                    - prediction.endpoint_positions[right]
+                    prediction.endpoint_positions[selected_left]
+                    - prediction.endpoint_positions[selected_right]
                 )
                 .float()
                 .norm(dim=-1)
             )
-            values["ligand_clash"] = _masked_mean(
-                functional.relu(
-                    config.chem.ligand_clash_distance - nonbonded_distance
-                ).square(),
-                pair_editable,
+            values["ligand_clash"] = (
+                functional.relu(config.chem.ligand_clash_distance - nonbonded_distance)
+                .square()
+                .mean()
+                if nonbonded_distance.numel()
+                else zero
             )
         if weights["protein_clash"]:
             if targets.protein_positions is None or targets.protein_batch is None:
@@ -655,22 +741,47 @@ def _chemistry_terms(
             raise ValueError(
                 "affinity availability requires per-example labels and mask."
             )
-        clamped = prediction.affinity_log_variance.float().clamp(
-            config.chem.affinity_log_variance_min,
-            config.chem.affinity_log_variance_max,
+        selected_affinity = prediction.affinity[affinity_mask].float()
+        selected_target = targets.affinity[affinity_mask].float()
+        clamped = (
+            prediction.affinity_log_variance[affinity_mask]
+            .float()
+            .clamp(
+                config.chem.affinity_log_variance_min,
+                config.chem.affinity_log_variance_max,
+            )
         )
-        residual = prediction.affinity.float() - targets.affinity.float()
+        residual = selected_affinity - selected_target
         nll = 0.5 * (torch.exp(-clamped) * residual.square() + clamped)
-        values["affinity"] = _masked_mean(nll, affinity_mask)
+        values["affinity"] = nll.mean()
     else:
         values["affinity"] = zero
     for name, value in values.items():
         diagnostics[f"chem_{name}"] = value
-        counts[f"chem_{name}"] = (
-            affinity_mask.sum()
-            if name == "affinity" and affinity_mask is not None
-            else editable.sum()
-        )
+        if name in {"valence", "connectivity"}:
+            observed = editable.sum()
+        elif name == "bond_length":
+            observed = targets.editable_bond_mask.sum()
+        elif name == "ligand_clash" and targets.nonbonded_halfedge_index is not None:
+            left, right = targets.nonbonded_halfedge_index
+            observed = (editable[left] | editable[right]).sum()
+        elif name == "protein_clash" and targets.protein_batch is not None:
+            observed = sum(
+                int(
+                    ((targets.node_batch == batch) & editable).sum()
+                    * (targets.protein_batch == batch).sum()
+                )
+                for batch in torch.unique(targets.node_batch)
+            )
+            observed = torch.tensor(observed, device=editable.device)
+        elif name == "ring_strain" and targets.ring_triplets is not None:
+            left, center, right = targets.ring_triplets
+            observed = (editable[left] | editable[center] | editable[right]).sum()
+        elif name == "affinity" and affinity_mask is not None:
+            observed = affinity_mask.sum()
+        else:
+            observed = editable.sum() * 0
+        counts[f"chem_{name}"] = observed if weights[name] else observed * 0
     return [weights[name] * value for name, value in values.items()]
 
 
@@ -682,14 +793,34 @@ def _protein_clash(
     assert targets.protein_batch is not None
     if targets.protein_positions.ndim != 2 or targets.protein_positions.shape[1] != 3:
         raise ValueError("protein_positions must have shape [P, 3].")
+    protein_count = targets.protein_positions.shape[0]
+    if (
+        not targets.protein_positions.is_floating_point()
+        or targets.protein_positions.device != prediction.endpoint_positions.device
+        or targets.protein_batch.shape != (protein_count,)
+        or targets.protein_batch.dtype != torch.long
+        or targets.protein_batch.device != prediction.endpoint_positions.device
+    ):
+        raise ValueError(
+            "protein positions/batch must be typed [P,3]/[P] on model device."
+        )
+    batch_size = prediction.affinity.shape[0]
+    if targets.protein_batch.numel() and (
+        bool((targets.protein_batch < 0).any())
+        or bool((targets.protein_batch >= batch_size).any())
+    ):
+        raise ValueError("protein_batch contains an index outside the batch range.")
     losses: list[torch.Tensor] = []
     for complex_index in torch.unique(targets.node_batch):
         ligand_mask = (targets.node_batch == complex_index) & targets.editable_atom_mask
         protein_mask = targets.protein_batch == complex_index
         if bool(ligand_mask.any()) and bool(protein_mask.any()):
+            selected_protein = targets.protein_positions[protein_mask]
+            if not bool(torch.isfinite(selected_protein).all()):
+                raise ValueError("active protein clash positions must be finite.")
             distances = torch.cdist(
                 prediction.endpoint_positions[ligand_mask].float(),
-                targets.protein_positions[protein_mask].float(),
+                selected_protein.float(),
             )
             losses.append(
                 functional.relu(config.chem.protein_clash_distance - distances)
@@ -716,27 +847,58 @@ def _ring_strain(
         triplets, prediction.position_velocity.shape[0], "ring_triplets"
     )
     left, center, right = triplets
-    first = (
-        prediction.endpoint_positions[left].float()
-        - prediction.endpoint_positions[center].float()
-    )
-    second = (
-        prediction.endpoint_positions[right].float()
-        - prediction.endpoint_positions[center].float()
-    )
-    cosine = functional.cosine_similarity(first, second, dim=-1, eps=1.0e-8).clamp(
-        -1.0 + 1.0e-6, 1.0 - 1.0e-6
-    )
-    angles = torch.acos(cosine)
-    standardized = (
-        angles - targets.ring_angle_mean.float()
-    ) / targets.ring_angle_std.float().clamp_min(1.0e-8)
+    if bool(((left == center) | (left == right) | (center == right)).any()):
+        raise ValueError("ring triplets must contain three distinct nodes.")
+    if not (
+        torch.equal(targets.node_batch[left], targets.node_batch[center])
+        and torch.equal(targets.node_batch[left], targets.node_batch[right])
+    ):
+        raise ValueError("ring triplets must stay within one complex.")
     ring_editable = (
         targets.editable_atom_mask[left]
         | targets.editable_atom_mask[center]
         | targets.editable_atom_mask[right]
     )
-    return _masked_mean(standardized.square(), ring_editable)
+    expected_shape = (triplets.shape[1],)
+    for prior, name in (
+        (targets.ring_angle_mean, "ring_angle_mean"),
+        (targets.ring_angle_std, "ring_angle_std"),
+    ):
+        if (
+            prior.shape != expected_shape
+            or not prior.is_floating_point()
+            or prior.device != triplets.device
+        ):
+            raise ValueError(f"{name} must be floating [R] on the topology device.")
+    selected_mean = targets.ring_angle_mean[ring_editable]
+    selected_std = targets.ring_angle_std[ring_editable]
+    if (
+        not bool(torch.isfinite(selected_mean).all())
+        or not bool(torch.isfinite(selected_std).all())
+        or bool((selected_std <= 0).any())
+    ):
+        raise ValueError("active ring angle std must be finite and positive.")
+    selected_left = left[ring_editable]
+    selected_center = center[ring_editable]
+    selected_right = right[ring_editable]
+    first = (
+        prediction.endpoint_positions[selected_left].float()
+        - prediction.endpoint_positions[selected_center].float()
+    )
+    second = (
+        prediction.endpoint_positions[selected_right].float()
+        - prediction.endpoint_positions[selected_center].float()
+    )
+    cosine = functional.cosine_similarity(first, second, dim=-1, eps=1.0e-8).clamp(
+        -1.0 + 1.0e-6, 1.0 - 1.0e-6
+    )
+    angles = torch.acos(cosine)
+    standardized = (angles - selected_mean.float()) / selected_std.float()
+    return (
+        standardized.square().mean()
+        if standardized.numel()
+        else _zero_from_prediction(prediction)
+    )
 
 
 def _interaction_term(
@@ -749,15 +911,15 @@ def _interaction_term(
         raise ValueError("interaction availability requires labels and mask.")
     if targets.interaction.shape != prediction.interaction_logits.shape:
         raise ValueError("interaction labels must have shape [B].")
-    labels = targets.interaction.float()
+    labels = targets.interaction[targets.interaction_mask].float()
     if bool(((labels < 0.0) | (labels > 1.0)).any()):
         raise ValueError("interaction labels must be probabilities in [0, 1].")
-    logits = prediction.interaction_logits.float()
+    logits = prediction.interaction_logits[targets.interaction_mask].float()
     bce = functional.binary_cross_entropy_with_logits(logits, labels, reduction="none")
     probability = torch.sigmoid(logits)
     correct_probability = labels * probability + (1.0 - labels) * (1.0 - probability)
     focal = (1.0 - correct_probability).pow(config.interaction.focal_gamma) * bce
-    return _masked_mean(focal, targets.interaction_mask), True
+    return focal.mean(), True
 
 
 def _masked_mse(
@@ -773,32 +935,55 @@ def _masked_mse(
         raise ValueError(
             "masked MSE prediction and target must have identical shape/device and floating dtype."
         )
+    expanded = _expanded_mask(mask, prediction)
+    selected_prediction = prediction[expanded]
+    selected_target = target[expanded]
     compute_prediction = (
-        prediction.float()
+        selected_prediction.float()
         if prediction.dtype in (torch.float16, torch.bfloat16)
-        else prediction
+        else selected_prediction
     )
     compute_target = (
-        target.float() if target.dtype in (torch.float16, torch.bfloat16) else target
+        selected_target.float()
+        if target.dtype in (torch.float16, torch.bfloat16)
+        else selected_target
     )
-    return _masked_mean((compute_prediction - compute_target).square(), mask)
+    if compute_prediction.numel() == 0:
+        return compute_prediction.sum()
+    return (compute_prediction - compute_target).square().mean()
 
 
 def _masked_ce(
     logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
     """Return selected-row cross entropy or a differentiable empty zero."""
+    selected_logits = logits[mask]
+    selected_target = target[mask]
     compute_logits = (
-        logits.float() if logits.dtype in (torch.float16, torch.bfloat16) else logits
+        selected_logits.float()
+        if logits.dtype in (torch.float16, torch.bfloat16)
+        else selected_logits
     )
-    if logits.shape[0] == 0:
-        return compute_logits.sum() * 0.0
-    row = functional.cross_entropy(compute_logits, target, reduction="none")
-    return _masked_mean(row, mask)
+    if compute_logits.shape[0] == 0:
+        return compute_logits.sum()
+    if bool((selected_target < 0).any()) or bool(
+        (selected_target >= logits.shape[1]).any()
+    ):
+        raise ValueError("class target is outside its configured vocabulary.")
+    return functional.cross_entropy(compute_logits, selected_target)
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Average selected scalar entries after broadcasting a boolean prefix mask."""
+    expanded = _expanded_mask(mask, values)
+    selected = values[expanded]
+    if selected.numel() == 0:
+        return selected.sum()
+    return selected.mean()
+
+
+def _expanded_mask(mask: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """Expand a same-device boolean prefix mask without touching excluded values."""
     if (
         mask.dtype != torch.bool
         or mask.device != values.device
@@ -806,20 +991,16 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     ):
         raise ValueError("loss mask must be a same-device boolean prefix tensor.")
     try:
-        expanded = torch.broadcast_to(
+        return torch.broadcast_to(
             mask.reshape(*mask.shape, *([1] * (values.ndim - mask.ndim))), values.shape
         )
     except RuntimeError as error:
         raise ValueError("loss mask does not broadcast to the value shape.") from error
-    denominator = expanded.sum()
-    if not bool(denominator):
-        return values.sum() * 0.0
-    return (values * expanded.to(values.dtype)).sum() / denominator
 
 
 def _zero_from_prediction(prediction: ModelPrediction) -> torch.Tensor:
     """Create a finite differentiable scalar zero on the prediction device."""
-    return prediction.position_velocity.sum() * 0.0
+    return prediction.position_velocity.reshape(-1)[:0].sum()
 
 
 def _mask_count(mask: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor:
@@ -847,18 +1028,30 @@ def _warmup(config: WeightedLossConfig, step: int) -> float:
     return (step - config.warmup_start) / (config.warmup_end - config.warmup_start)
 
 
-def _raise_nonfinite(
+def _collective_finite_status(
     stage: str, values: Mapping[str, torch.Tensor], active: Mapping[str, bool]
-) -> None:
-    """Raise with component diagnostics before a non-finite active value escapes."""
-    bad = [
-        name
-        for name, value in values.items()
-        if active[name] and not bool(torch.isfinite(value))
-    ]
+) -> dict[str, bool]:
+    """Synchronize presence/nonfinite flags before any rank may raise.
+
+    Every initialized rank performs exactly one fixed-shape reduction for this
+    stage.  This prevents a locally invalid component from stranding peers in a
+    later scaler collective.  Only detached boolean sufficient statistics cross
+    ranks; differentiable losses never do.
+    """
+    reference = next(iter(values.values()))
+    status = torch.zeros((len(COMPONENT_NAMES), 2), device=reference.device)
+    for index, name in enumerate(COMPONENT_NAMES):
+        present = bool(active[name])
+        status[index, 0] = float(present)
+        status[index, 1] = float(present and not bool(torch.isfinite(values[name])))
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(status, op=dist.ReduceOp.SUM)
+    bad = [name for index, name in enumerate(COMPONENT_NAMES) if status[index, 1] > 0]
     if bad:
-        details = ", ".join(f"{name}={values[name].detach()}" for name in bad)
-        raise FloatingPointError(f"non-finite {stage} components: {details}")
+        raise FloatingPointError(f"non-finite {stage} components: {', '.join(bad)}")
+    return {
+        name: bool(status[index, 0] > 0) for index, name in enumerate(COMPONENT_NAMES)
+    }
 
 
 def _validate_sparse_pairs(index: torch.Tensor, size: int, name: str) -> None:
@@ -874,3 +1067,21 @@ def _validate_sparse_indices(index: torch.Tensor, size: int, name: str) -> None:
     """Validate a sparse integer index range without allocating dense topology."""
     if index.numel() and (bool((index < 0).any()) or bool((index >= size).any())):
         raise ValueError(f"{name} contains an index outside the node range.")
+
+
+def _validate_nonbonded_topology(
+    nonbonded: torch.Tensor, targets: TrainingTargets
+) -> None:
+    """Validate sparse nonbonded uniqueness, membership, and bond disjointness."""
+    if nonbonded.shape[1] == 0:
+        return
+    left, right = nonbonded
+    if not torch.equal(targets.node_batch[left], targets.node_batch[right]):
+        raise ValueError("nonbonded pairs must stay within one complex.")
+    node_count = targets.node_batch.shape[0]
+    codes = left * node_count + right
+    if codes.unique().numel() != codes.numel():
+        raise ValueError("nonbonded pairs must be unique.")
+    bond_codes = targets.halfedge_index[0] * node_count + targets.halfedge_index[1]
+    if torch.isin(codes, bond_codes).any():
+        raise ValueError("nonbonded pairs must be disjoint from bonded halfedges.")

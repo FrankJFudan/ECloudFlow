@@ -17,7 +17,11 @@ from ecloudflow.ecloud.decoder import ElectronReconstruction
 from ecloudflow.models import ModelPrediction
 from ecloudflow.training.ema import ExponentialMovingAverage
 from ecloudflow.training.losses import RunningLossScaler, compute_ecloudflow_loss
-from ecloudflow.training.types import ElectronDecoderContext, TrainingBatch
+from ecloudflow.training.types import (
+    ElectronDecoderContext,
+    TrainingBatch,
+    TrainingTargets,
+)
 
 
 class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
@@ -120,10 +124,14 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         prediction = self.joint_backbone(batch.state, batch.time, batch.condition)
         if not isinstance(prediction, ModelPrediction):
             raise TypeError("joint_backbone must return ModelPrediction.")
-        if batch.decoder_context is None:
+        if not self._decoder_is_observed(batch.targets):
             return prediction
+        if batch.decoder_context is None:
+            raise ValueError(
+                "enabled observed QM reconstruction terms require decoder_context."
+            )
         reconstruction = self._decode_electrons(
-            prediction.endpoint_electron_latent, batch.decoder_context
+            prediction, batch.decoder_context, batch.targets
         )
         return replace(prediction, electron_reconstruction=reconstruction)
 
@@ -263,10 +271,42 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         )
         self.ema.update_after_step(self, step_succeeded=succeeded)
 
+    def _decoder_is_observed(self, targets: TrainingTargets) -> bool:
+        """Return whether an enabled decoder subterm has genuine-QM observations."""
+        loss = self.loss_config.ecloud
+        step = int(self.global_step)
+        if loss.warmup_end == loss.warmup_start:
+            warmup = float(step >= loss.warmup_end)
+        elif step <= loss.warmup_start:
+            warmup = 0.0
+        elif step >= loss.warmup_end:
+            warmup = 1.0
+        else:
+            warmup = (step - loss.warmup_start) / (loss.warmup_end - loss.warmup_start)
+        if not bool(targets.qm_mask.any()) or loss.weight == 0.0 or warmup == 0.0:
+            return False
+        field_observed = targets.field_mask is None or bool(
+            (targets.qm_mask[:, None] & targets.field_mask).any()
+        )
+        return any(
+            (
+                self.loss_config.ecloud.density and field_observed,
+                self.loss_config.ecloud.gradient and field_observed,
+                self.loss_config.ecloud.electron_count,
+                self.loss_config.ecloud.dipole,
+                self.loss_config.ecloud.cycle,
+            )
+        )
+
     def _decode_electrons(
-        self, flat_latent: torch.Tensor, context: ElectronDecoderContext
+        self,
+        prediction: ModelPrediction,
+        context: ElectronDecoderContext,
+        targets: TrainingTargets,
     ) -> ElectronReconstruction:
-        """Gather flattened tokens into the sole padded decoder boundary."""
+        """Gather mapped predicted tokens/centers into active QM decoder rows."""
+        flat_latent = prediction.endpoint_electron_latent
+        flat_centers = prediction.endpoint_positions
         index = context.flat_index
         mask = context.atom_mask
         if (
@@ -285,16 +325,79 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
             raise ValueError(
                 "physical decoder flat_index is outside flattened node range."
             )
+        if (
+            context.query_grid.ndim != 3
+            or context.query_grid.shape[0] != index.shape[0]
+            or context.query_grid.shape[2] != 3
+        ):
+            raise ValueError("decoder query_grid must have shape [B, G, 3].")
+        if (
+            context.query_grid.device != flat_latent.device
+            or not context.query_grid.is_floating_point()
+        ):
+            raise ValueError(
+                "decoder query_grid must be floating on prediction device."
+            )
+        if index.shape[0] != prediction.affinity.shape[0]:
+            raise ValueError(
+                "decoder mapping batch dimension must equal prediction batch size."
+            )
+        selected_index = index[mask]
+        if selected_index.unique().numel() != selected_index.numel():
+            raise ValueError("decoder mapping contains duplicate flattened nodes.")
+        expected = torch.arange(flat_latent.shape[0], device=index.device)
+        if selected_index.numel() != expected.numel() or not torch.equal(
+            selected_index.sort().values, expected
+        ):
+            raise ValueError(
+                "decoder mapping is misaligned with flattened model nodes."
+            )
+        rows = torch.arange(index.shape[0], device=index.device)[:, None].expand_as(
+            index
+        )
+        if not torch.equal(targets.node_batch[selected_index], rows[mask]):
+            raise ValueError("decoder mapping crosses declared complex membership.")
         safe_index = index.clamp_min(0)
         padded = flat_latent[safe_index]
+        centers = flat_centers[safe_index]
         padded = torch.where(mask[..., None], padded, torch.zeros_like(padded))
+        centers = torch.where(mask[..., None], centers, torch.zeros_like(centers))
+        active_rows = targets.qm_mask
+        active_padded = padded[active_rows]
+        active_centers = centers[active_rows]
+        active_query = context.query_grid[active_rows]
+        active_mask = mask[active_rows]
         decode = getattr(self.field_decoder, "decode", None)
         if not callable(decode):
             raise TypeError("field_decoder must expose a compatible decode method.")
-        reconstruction = decode(padded, context.centers, context.query_grid, mask)
+        reconstruction = decode(
+            active_padded, active_centers, active_query, active_mask
+        )
         if not isinstance(reconstruction, ElectronReconstruction):
             raise TypeError("field_decoder.decode must return ElectronReconstruction.")
-        return reconstruction
+        batch_size = index.shape[0]
+        active_index = active_rows.nonzero(as_tuple=False).flatten()
+
+        def scatter(value: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+            base = value.new_zeros(shape)
+            return base.index_copy(0, active_index, value)
+
+        return ElectronReconstruction(
+            density=scatter(
+                reconstruction.density,
+                (batch_size, reconstruction.density.shape[1]),
+            ),
+            gradient=scatter(
+                reconstruction.gradient,
+                (batch_size, *reconstruction.gradient.shape[1:]),
+            ),
+            electron_count=scatter(reconstruction.electron_count, (batch_size,)),
+            dipole=scatter(reconstruction.dipole, (batch_size, 3)),
+            latent_round_trip=scatter(
+                reconstruction.latent_round_trip,
+                (batch_size, *reconstruction.latent_round_trip.shape[1:]),
+            ),
+        )
 
 
 def _move_immutable(value: Any, device: torch.device) -> Any:
