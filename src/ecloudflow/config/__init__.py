@@ -1,6 +1,6 @@
 """Typed configuration models and Hydra composition utilities."""
 
 from ecloudflow.config.loader import load_config
-from ecloudflow.config.schema import AppConfig, ModelConfig, SampleConfig
+from ecloudflow.config.schema import AppConfig, DataConfig, ModelConfig, SampleConfig
 
-__all__ = ["AppConfig", "ModelConfig", "SampleConfig", "load_config"]
+__all__ = ["AppConfig", "DataConfig", "ModelConfig", "SampleConfig", "load_config"]

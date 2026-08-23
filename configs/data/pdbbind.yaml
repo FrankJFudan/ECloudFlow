@@ -1,0 +1,14 @@
+dataset: pdbbind
+manifest: null
+shard_dir: data/processed/pdbbind
+partition: train
+batch_size: 8
+num_workers: 8
+seed: 2026
+shuffle_buffer: 2048
+bucket_width: 32
+target_shard_size_gb: 1.0
+persistent_workers: true
+prefetch_factor: 2
+pin_memory: true
+verify_shard_hashes: false
