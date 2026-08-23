@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from tools.check_python_docs import API_DOC_CONTRACTS, DESIGNATED_APIS, check_paths
 
 
@@ -96,9 +98,22 @@ def test_checker_rejects_placeholder_and_missing_semantic_contracts(
         assert any(f"missing semantic topic {topic}" in error for error in errors)
 
 
-def test_checker_rejects_false_canonical_device_claim(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Tensors preserve their original device placement.",
+        "The reader retains tensors on their input GPU.",
+        "Serialization keeps tensors on their original accelerator.",
+        "Original CUDA placement is retained by the stored payload.",
+        "The tensors remain on the source device.",
+    ],
+)
+def test_checker_rejects_false_canonical_device_claim(
+    tmp_path: Path, claim: str
+) -> None:
     """Shard persistence may not claim to preserve accelerator placement."""
     assert API_DOC_CONTRACTS["shards.ShardWriter.write"].forbidden_patterns
+    assert API_DOC_CONTRACTS["shards.stream_samples"].forbidden_patterns
     body = (
         "CPU dtype shape frame mask mutation deterministic resume failure power loss "
         "validation checkpoint cache worker publication recovery angstrom metadata "
@@ -114,7 +129,7 @@ def test_checker_rejects_false_canonical_device_claim(tmp_path: Path) -> None:
         "        :return: Manifest.\n"
         "        :rtype: object\n"
         "        :raises RuntimeError: On failure.\n\n"
-        f"        {body} Tensors preserve their original device and are never moved to CPU. "
+        f"        {body} {claim} "
         "This detailed placeholder describes validation and publication behavior repeatedly.\n"
         '        """\n'
         "        return object()\n",
@@ -122,3 +137,31 @@ def test_checker_rejects_false_canonical_device_claim(tmp_path: Path) -> None:
     )
     errors = check_paths([source], designated={"shards.ShardWriter.write"})
     assert any("false canonical CPU/device claim" in error for error in errors)
+
+
+def test_checker_allows_explicit_caller_accelerator_transfer(tmp_path: Path) -> None:
+    """A correct later-transfer instruction is not a placement-preservation claim."""
+    body = (
+        "CPU dtype shape frame mask mutation deterministic resume failure power loss "
+        "validation checkpoint cache worker publication recovery angstrom metadata "
+    )
+    source = tmp_path / "shards.py"
+    source.write_text(
+        "class ShardWriter:\n"
+        "    def write(self, samples, output_dir, *, split=None):\n"
+        '        """Persist deterministic canonical CPU data.\n\n'
+        "        :param samples: Canonical samples.\n"
+        "        :param output_dir: Dataset path.\n"
+        "        :param split: Optional split.\n"
+        "        :return: Manifest.\n"
+        "        :rtype: object\n"
+        "        :raises RuntimeError: On failure.\n\n"
+        f"        {body} Stored CPU copies preserve dtype and shape; the caller "
+        "explicitly transfers reconstructed batches to an accelerator for training. "
+        "This detailed contract describes validation and publication behavior.\n"
+        '        """\n'
+        "        return object()\n",
+        encoding="utf-8",
+    )
+    errors = check_paths([source], designated={"shards.ShardWriter.write"})
+    assert not any("false canonical CPU/device claim" in error for error in errors)

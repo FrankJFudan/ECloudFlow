@@ -66,7 +66,23 @@ _UNITS = _topic("units", r"angstrom", r"\bunits\b")
 _CACHE = _topic("cache", r"\bcache\b", r"sha-256", r"content-addressed")
 _ALIGNMENT = _topic("alignment", r"global alignment", r"affine-gap", r"gap column")
 _CHECKPOINT = _topic("checkpoint", r"checkpoint", r"manifest hash", r"restore")
+_PLACEMENT_RETENTION_VERB = (
+    r"(?:preserv\w*|retain\w*|keep\w*|kept|maintain\w*|remain\w*|stay\w*)"
+)
+_ORIGINAL_DEVICE_PLACEMENT = (
+    r"(?:(?:(?:their|its|the)\s+)?(?:original|input|source)\s+"
+    r"(?:accelerator|gpu|cuda|device)(?:\s+placement)?|"
+    r"(?:accelerator|gpu|cuda|device)\s+placement)"
+)
 _FALSE_STORAGE_DEVICE_CLAIMS = (
+    (
+        rf"\b{_PLACEMENT_RETENTION_VERB}\b"
+        rf"(?:\s+[A-Za-z-]+){{0,6}}\s+{_ORIGINAL_DEVICE_PLACEMENT}\b"
+    ),
+    (
+        rf"\b{_ORIGINAL_DEVICE_PLACEMENT}\b"
+        rf"(?:\s+[A-Za-z-]+){{0,6}}\s+{_PLACEMENT_RETENTION_VERB}\b"
+    ),
     r"preserv\w*.{0,80}(?:original\s+)?device",
     r"retain\w*.{0,80}\bdevice\b",
     r"never.{0,80}(?:mov\w*|transfer\w*).{0,40}(?:cpu|device)",

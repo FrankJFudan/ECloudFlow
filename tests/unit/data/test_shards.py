@@ -224,6 +224,7 @@ def test_publication_uses_durable_hooks_in_state_machine_order(
     original_sync = durability.sync_file
     original_replace = durability.durable_replace
     original_unlink = durability.durable_unlink
+    original_flush = durability.flush_directory
     original_state = shard_module._set_active_generation
 
     def sync(stream) -> None:
@@ -239,6 +240,10 @@ def test_publication_uses_durable_hooks_in_state_machine_order(
     def unlink_path(path: Path, *, missing_ok: bool = False) -> None:
         events.append(("unlink", Path(path).name, Path(path).parent.name))
         original_unlink(path, missing_ok=missing_ok)
+
+    def flush_path(path: Path) -> None:
+        events.append(("flush", Path(path).name, ""))
+        original_flush(path)
 
     def set_state(
         output_dir: Path,
@@ -258,6 +263,7 @@ def test_publication_uses_durable_hooks_in_state_machine_order(
     monkeypatch.setattr(durability, "sync_file", sync)
     monkeypatch.setattr(durability, "durable_replace", replace_path)
     monkeypatch.setattr(durability, "durable_unlink", unlink_path)
+    monkeypatch.setattr(durability, "flush_directory", flush_path)
     monkeypatch.setattr(shard_module, "_set_active_generation", set_state)
     ShardWriter(max_samples_per_shard=1).write(_samples(fixture_dir, 1), tmp_path)
 
@@ -276,6 +282,13 @@ def test_publication_uses_durable_hooks_in_state_machine_order(
         for index, event in enumerate(events)
         if event[0] == "replace" and event[2] == "generations"
     )
+    promotion_flushes = [
+        event for event in events[promotion_index + 1 :] if event[0] == "flush"
+    ][:2]
+    assert promotion_flushes == [
+        ("flush", "generations", ""),
+        ("flush", ".staging", ""),
+    ]
     manifest_index = next(
         index
         for index, event in enumerate(events)
