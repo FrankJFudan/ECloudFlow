@@ -271,18 +271,57 @@ def test_condition_tensors_receive_finite_nonzero_gradients() -> None:
         assert torch.any(tensor.grad != 0)
 
 
-def test_zero_valued_property_still_preserves_property_identity() -> None:
-    """Mutation caught: multiplying identity by value erases names at value zero."""
+@pytest.mark.parametrize("target_value", [-1.0, 0.0, 2.5])
+def test_property_identity_is_independent_of_any_finite_value(
+    target_value: float,
+) -> None:
+    """Mutation caught: a value-dependent identity aliases names at special values."""
     model = _model().eval()
     state = _state()
     condition = _rich_condition(state)
-    first = replace(condition, property_targets={"affinity": torch.zeros(2)})
-    second = replace(condition, property_targets={"logp": torch.zeros(2)})
+    first_value = torch.full((2,), target_value, requires_grad=True)
+    second_value = torch.full((2,), target_value, requires_grad=True)
+    first = replace(condition, property_targets={"affinity": first_value})
+    second = replace(condition, property_targets={"logp": second_value})
 
     first_prediction = model(state, torch.tensor([0.3, 0.7]), first)
     second_prediction = model(state, torch.tensor([0.3, 0.7]), second)
 
     assert not torch.allclose(first_prediction.affinity, second_prediction.affinity)
+    gradients = torch.autograd.grad(
+        first_prediction.affinity.sum() + second_prediction.affinity.sum(),
+        (first_value, second_value),
+    )
+    for gradient in gradients:
+        assert torch.isfinite(gradient).all()
+        assert torch.any(gradient != 0)
+
+
+@pytest.mark.parametrize("vector_dim", [1, 2])
+def test_constructor_rejects_vector_width_without_chirality_capacity(
+    vector_dim: int,
+) -> None:
+    """Mutation caught: fewer than three vectors makes the triple product zero."""
+    with pytest.raises(ValueError, match="vector_dim must be at least 3"):
+        ECloudFlowModel(
+            scalar_dim=16,
+            vector_dim=vector_dim,
+            num_blocks=2,
+            lmax=2,
+        )
+
+
+@pytest.mark.parametrize("vector_dim", [1, 2])
+def test_from_config_rejects_vector_width_without_chirality_capacity(
+    vector_dim: int,
+) -> None:
+    """Mutation caught: from_config bypasses the public chirality-width contract."""
+    config = ModelConfig.model_construct(
+        name="tiny", scalar_dim=16, vector_dim=vector_dim, num_blocks=2, lmax=2
+    )
+
+    with pytest.raises(ValueError, match="vector_dim must be at least 3"):
+        ECloudFlowModel.from_config(config)
 
 
 @pytest.mark.parametrize(

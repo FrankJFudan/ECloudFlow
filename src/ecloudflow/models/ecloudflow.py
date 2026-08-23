@@ -165,7 +165,8 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
     """First joint SE(3)-equivariant pocket-conditioned ligand backbone.
 
     :param scalar_dim: Positive invariant hidden width.
-    :param vector_dim: Positive pocket/backbone Cartesian vector multiplicity.
+    :param vector_dim: Pocket/backbone Cartesian vector multiplicity, at least
+        three so the parity-sensitive scalar triple product is non-degenerate.
     :param num_blocks: Positive pocket and cross-message block count.
     :param lmax: Largest packed electron irrep order, in ``[0,4]``.
     :param electron_latent_dim: Exact packed electron channel width ``C``.
@@ -218,6 +219,10 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer.")
+        if vector_dim < 3:
+            raise ValueError(
+                "vector_dim must be at least 3 for parity-sensitive chirality."
+            )
         if not isinstance(lmax, int) or isinstance(lmax, bool) or not 0 <= lmax <= 4:
             raise ValueError("lmax must be an integer in [0, 4].")
         if pocket_cutoff <= 0 or cross_cutoff <= 0:
@@ -268,7 +273,8 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
     ) -> ECloudFlowModel:
         """Construct from canonical widths plus explicit portable model defaults.
 
-        :param config: Strict model name/width/block/order configuration.
+        :param config: Strict model name/width/block/order configuration. Its
+            vector width must be at least three; canonical presets use at least four.
         :param electron_latent_dim: Overrideable packed electron width, default 48.
         :param electron_vector_dim: Overrideable ``1o`` multiplicity, default 8.
         :param atom_classes: Explicit atom endpoint class count, default 6.
@@ -279,7 +285,8 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         :param cross_cutoff: Pocket-ligand radius in angstroms.
         :return: Validated device-agnostic joint model.
         :rtype: ECloudFlowModel
-        :raises ValueError: If any explicit default or latent layout is invalid.
+        :raises ValueError: If any explicit default, vector width, or latent
+            layout is invalid.
 
         No machine path, device, distributed rank, dtype, or global cache is
         inferred. Callers may override dataset vocabulary-independent values
@@ -344,7 +351,8 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
             the same dtype/device as state and pocket tensors.
         :param condition: Pocket, optional pocket field, named property values,
             invariant interaction targets, and optional exact fragment task
-            condition. Property names use stable SHA-256 numeric identities.
+            condition. Property names use stable SHA-256 numeric identities in
+            feature slots independent of their differentiable numeric values.
         :param pocket_encoding: Optional explicitly cached representation from
             :meth:`encode_pocket`; omitted values are computed for this call.
         :return: Coordinate/electron velocities and scores; invariant atom,
@@ -556,7 +564,7 @@ def _task_features(
 def _property_features(
     condition: GenerationCondition, batch_size: int, reference: torch.Tensor
 ) -> torch.Tensor:
-    """Encode stable property-name identity and value without losing either."""
+    """Encode stable property-name identity separately from its numeric value."""
     encoded = reference.new_zeros((batch_size, 9))
     if not condition.property_targets:
         return encoded
@@ -578,7 +586,7 @@ def _property_features(
         identity = _stable_identity(
             name, dtype=reference.dtype, device=reference.device
         )
-        encoded[:, :8] = encoded[:, :8] + (1.0 + tensor[:, None]) * identity[None, :]
+        encoded[:, :8] = encoded[:, :8] + identity[None, :]
         encoded[:, 8] = encoded[:, 8] + tensor
     return encoded
 

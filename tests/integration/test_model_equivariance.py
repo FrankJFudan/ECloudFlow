@@ -5,7 +5,6 @@ from dataclasses import replace
 import torch
 from e3nn import o3
 
-from ecloudflow.config import ModelConfig
 from ecloudflow.core.types import GenerationCondition, MolecularState, PocketGraph
 from ecloudflow.models import ECloudFlowModel
 
@@ -43,8 +42,11 @@ def _batch() -> tuple[MolecularState, GenerationCondition]:
 def test_model_is_se3_equivariant_and_scalar_outputs_are_invariant() -> None:
     """Mutation caught: absolute geometry or component-wise mixing breaks SE(3)."""
     torch.manual_seed(33)
-    model = ECloudFlowModel.from_config(
-        ModelConfig(name="tiny", scalar_dim=16, vector_dim=4, num_blocks=2, lmax=2),
+    model = ECloudFlowModel(
+        scalar_dim=16,
+        vector_dim=3,
+        num_blocks=2,
+        lmax=2,
         electron_vector_dim=8,
         max_atoms=12,
     ).eval()
@@ -105,8 +107,11 @@ def test_model_is_se3_equivariant_and_scalar_outputs_are_invariant() -> None:
 def test_chiral_mirror_is_not_forced_to_have_identical_scalar_predictions() -> None:
     """Mutation caught: dot products alone accidentally impose full O(3) invariance."""
     torch.manual_seed(34)
-    model = ECloudFlowModel.from_config(
-        ModelConfig(name="tiny", scalar_dim=16, vector_dim=4, num_blocks=2, lmax=2),
+    model = ECloudFlowModel(
+        scalar_dim=16,
+        vector_dim=3,
+        num_blocks=2,
+        lmax=2,
         electron_vector_dim=8,
         max_atoms=12,
         atom_classes=6,

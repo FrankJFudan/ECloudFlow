@@ -263,8 +263,8 @@ text assertions are used.
   no issues in 7 source files.
 - `conda run -n 3dmolecule python tools/check_python_docs.py
   src/ecloudflow/models tools/check_python_docs.py`: exit code 0 with no output.
-- `git diff --check`: passed; only ordinary Windows LF-to-CRLF checkout notices
-  were emitted.
+- `git diff --check`: passed; only ordinary Windows LF-to-CRLF checkout
+  notices were emitted.
 
 ### Files changed
 
@@ -301,3 +301,98 @@ charge, and bond class counts. No correctness blocker remains for this review.
 
 All fix-round source, tests, registry, and report changes are included in the
 follow-up commit reported in the task handoff.
+
+## Fix Round 2
+
+### Review findings addressed
+
+- Stable SHA-256 property identity now occupies eight invariant feature slots
+  independently of the numeric target value in the ninth slot. No finite value,
+  including the prior alias at exactly `-1`, can algebraically erase a name.
+  Tensor values remain differentiable and retain the existing dtype, device,
+  scalar/`[B]`, batch, and classifier-free-null contracts.
+- The public `ECloudFlowModel` constructor now rejects `vector_dim < 3` because
+  the chosen parity-sensitive scalar triple product requires three vector
+  channels. `from_config` reaches the same validation, including for an
+  externally constructed invalid configuration; ordinary `ModelConfig`
+  presets already require at least four channels. Constructor and factory
+  documentation state the mathematical lower bound.
+- Both complete-model equivariance regressions now instantiate the exact
+  minimum supported width of three. They prove that this boundary retains
+  proper-rotation/translation equivariance while allowing mirrored chiral
+  inputs to produce different invariant predictions.
+
+### RED evidence
+
+The new behavior tests were added before production changes. This command was
+run against the `707845b` implementation:
+
+`conda run -n 3dmolecule python -m pytest tests/unit/models/test_ecloudflow.py
+tests/integration/test_model_equivariance.py -k "property_identity or
+vector_width or model_is_se3 or chiral_mirror" -v`
+
+Result: **5 failed, 4 passed, 24 deselected in 3.62s**. At value `-1`, names
+`"affinity"` and `"logp"` produced the identical affinity tensor
+`tensor([1.3219, 1.2601])`. Direct construction and `from_config` each failed
+to raise for both vector widths 1 and 2. The value 0 and 2.5 cases, including
+their independent value-gradient checks, and both minimum-width-3 proper-SE(3)
+and mirror tests passed; thus the failures isolated the two reviewed defects.
+
+The name regression catches reintroducing any numeric multiplier that can zero
+the identity. The boundary regressions catch deleting either direct or factory
+validation. Expectations use public predictions and real gradients, with no
+mocks or implementation-derived expected values.
+
+### GREEN evidence and exact commands
+
+- The RED command above after the minimal fixes: **9 passed, 24 deselected in
+  3.36s**.
+- `conda run -n 3dmolecule python -m pytest tests/unit/models
+  tests/integration/test_model_equivariance.py -v`: **46 passed in 4.22s**,
+  including available CUDA coverage.
+- `conda run -n 3dmolecule python -m pytest -q`: **272 passed, 1 skipped, 14
+  warnings in 16.80s**. The skip and third-party Matplotlib/PyParsing warnings
+  are unchanged.
+- `conda run -n 3dmolecule python -m ruff format src/ecloudflow/models
+  tests/unit/models tests/integration/test_model_equivariance.py
+  tests/unit/test_source_docs.py tools/check_python_docs.py`: 13 files left
+  unchanged.
+- The equivalent `ruff format --check` command: 13 files already formatted.
+- `conda run -n 3dmolecule python -m ruff check src/ecloudflow/models
+  tests/unit/models tests/integration/test_model_equivariance.py
+  tests/unit/test_source_docs.py tools/check_python_docs.py`: all checks passed.
+- `conda run -n 3dmolecule python -m mypy src/ecloudflow/models`: success, no
+  issues in 7 source files.
+- `conda run -n 3dmolecule python tools/check_python_docs.py
+  src/ecloudflow/models tools/check_python_docs.py`: exit code 0 with no output.
+- `git diff --check`: passed; only ordinary Windows LF-to-CRLF checkout
+  notices were emitted.
+
+An initial concurrent gate launch exposed a Windows `conda run` temporary-file
+activation race before Python started for format-check, Mypy, and pytest. Each
+affected command was rerun serially with the successful results above; this was
+an environment orchestration failure, not a source or test failure.
+
+### Files changed
+
+- `src/ecloudflow/models/ecloudflow.py`
+- `tests/unit/models/test_ecloudflow.py`
+- `tests/integration/test_model_equivariance.py`
+- this report.
+
+The semantic documentation registry already enforced property identity and
+parity topics, so no registry change was required in this round.
+
+### Self-review and concerns
+
+Property name bytes are now unconditionally present when conditioning is
+enabled, while value gradients are finite and nonzero at `-1`, 0, and 2.5.
+The null path still excludes the entire property feature vector. The minimum
+width check occurs before allocating submodules and is shared naturally by the
+factory. Width three exercises all operands of the existing triple product and
+passes the full packed-electron SE(3) transform test.
+
+The unchanged operational concerns from Fix Round 1 remain: exact dense radius
+graphs can have quadratic output size, and the deterministic portable segment
+softmax may later benefit from a compiled implementation. No correctness
+blocker remains from this review.
