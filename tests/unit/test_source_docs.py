@@ -65,6 +65,24 @@ def test_task7_designated_apis_keep_detailed_sphinx_contracts() -> None:
     assert check_paths(paths, designated=required) == []
 
 
+def test_task8_designated_apis_keep_scientific_tensor_contracts() -> None:
+    """Task 8 encoding and decoding APIs retain complete semantic contracts."""
+    required = {
+        "tokenizer.EquivariantFieldTokenizer.forward",
+        "tokenizer.EquivariantFieldTokenizer.encode",
+        "tokenizer.EquivariantFieldTokenizer.decode",
+        "decoder.ElectronFieldDecoder.forward",
+        "decoder.ElectronFieldDecoder.decode",
+    }
+    assert required <= DESIGNATED_APIS
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        root / "src/ecloudflow/ecloud/tokenizer.py",
+        root / "src/ecloudflow/ecloud/decoder.py",
+    ]
+    assert check_paths(paths, designated=required) == []
+
+
 def test_checker_rejects_missing_designated_api(tmp_path: Path) -> None:
     """A registry entry must resolve to a real module-qualified callable."""
     source = tmp_path / "missing.py"

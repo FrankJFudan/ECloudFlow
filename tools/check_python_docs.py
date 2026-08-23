@@ -66,6 +66,9 @@ _UNITS = _topic("units", r"angstrom", r"\bunits\b")
 _CACHE = _topic("cache", r"\bcache\b", r"sha-256", r"content-addressed")
 _ALIGNMENT = _topic("alignment", r"global alignment", r"affine-gap", r"gap column")
 _CHECKPOINT = _topic("checkpoint", r"checkpoint", r"manifest hash", r"restore")
+_GRADIENT = _topic("gradient", r"gradient", r"autograd", r"differentiab")
+_IRREP = _topic("irrep", r"irrep", r"0e", r"1o", r"spherical-harmonic")
+_CHUNK = _topic("chunk", r"chunk")
 _PLACEMENT_RETENTION_VERB = (
     r"(?:preserv\w*|retain\w*|keep\w*|kept|maintain\w*|remain\w*|stay\w*)"
 )
@@ -90,6 +93,94 @@ _FALSE_STORAGE_DEVICE_CLAIMS = (
 )
 
 API_DOC_CONTRACTS: dict[str, APIDocContract] = {
+    "tokenizer.EquivariantFieldTokenizer.forward": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _IRREP,
+        ),
+        min_words=100,
+    ),
+    "tokenizer.EquivariantFieldTokenizer.encode": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _IRREP,
+        ),
+        min_words=55,
+    ),
+    "tokenizer.EquivariantFieldTokenizer.decode": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _IRREP,
+            _CHUNK,
+        ),
+        min_words=70,
+    ),
+    "decoder.ElectronFieldDecoder.forward": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _IRREP,
+            _CHUNK,
+        ),
+        min_words=110,
+    ),
+    "decoder.ElectronFieldDecoder.decode": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _IRREP,
+            _CHUNK,
+        ),
+        min_words=60,
+    ),
     "durability.sync_file": APIDocContract(True, (_MUTATION, _FAILURE, _POWER_LOSS)),
     "durability.flush_directory": APIDocContract(
         True, (_MUTATION, _FAILURE, _POWER_LOSS)
