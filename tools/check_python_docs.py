@@ -72,6 +72,11 @@ _CHUNK = _topic("chunk", r"chunk")
 _LATENT_LAYOUT = _topic(
     "latent-layout", r"19x0e\s*\+\s*8x1o\s*\+\s*1x2e.*every configured"
 )
+_EQUIVARIANCE = _topic("equivariance", r"equivarian", r"proper rotations?", r"se\(3\)")
+_NULL_CONDITION = _topic("null-conditioning", r"classifier-free", r"null condition")
+_SPARSE_PAIR = _topic(
+    "sparse-pair", r"unordered halfedge", r"dense \[n,n,c\]", r"symmetric"
+)
 _PLACEMENT_RETENTION_VERB = (
     r"(?:preserv\w*|retain\w*|keep\w*|kept|maintain\w*|remain\w*|stay\w*)"
 )
@@ -369,6 +374,88 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
     ),
     "continuous._normalize_shape": APIDocContract(
         True, (_DEVICE, _DTYPE, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT)
+    ),
+    "pocket_encoder.PocketEncoding.__post_init__": APIDocContract(
+        True,
+        (_DEVICE, _DTYPE, _SHAPE, _FRAME, _MUTATION, _FAILURE, _EQUIVARIANCE, _CACHE),
+    ),
+    "pocket_encoder.PocketEncoder.encode": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _EQUIVARIANCE,
+            _CACHE,
+            _NULL_CONDITION,
+        ),
+        min_words=90,
+    ),
+    "count_predictor.AtomCountPredictor.forward": APIDocContract(
+        True,
+        (_DEVICE, _DTYPE, _SHAPE, _MASK, _MUTATION, _DETERMINISM, _FAILURE, _GRADIENT),
+    ),
+    "ecloudflow.ECloudFlowModel.encode_pocket": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _EQUIVARIANCE,
+            _CACHE,
+            _NULL_CONDITION,
+            _DISTRIBUTED,
+        ),
+        min_words=80,
+    ),
+    "ecloudflow.ECloudFlowModel.forward": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+            _GRADIENT,
+            _IRREP,
+            _EQUIVARIANCE,
+            _CACHE,
+            _NULL_CONDITION,
+            _SPARSE_PAIR,
+            _DISTRIBUTED,
+        ),
+        min_words=160,
+    ),
+    "ecloudflow.ModelPrediction.__post_init__": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _MASK,
+            _MUTATION,
+            _FAILURE,
+            _GRADIENT,
+            _IRREP,
+            _EQUIVARIANCE,
+            _SPARSE_PAIR,
+        ),
     ),
 }
 DESIGNATED_APIS = frozenset(API_DOC_CONTRACTS)

@@ -113,6 +113,26 @@ def test_task9_designated_apis_keep_stochastic_path_contracts() -> None:
     assert ":raises TypeError:" in inspect.getdoc(ContinuousPath.sample_times)
 
 
+def test_task10_designated_apis_keep_equivariance_and_cache_contracts() -> None:
+    """Task 10 joint model APIs retain tensor and distributed semantics."""
+    required = {
+        "pocket_encoder.PocketEncoding.__post_init__",
+        "pocket_encoder.PocketEncoder.encode",
+        "count_predictor.AtomCountPredictor.forward",
+        "ecloudflow.ECloudFlowModel.encode_pocket",
+        "ecloudflow.ECloudFlowModel.forward",
+        "ecloudflow.ModelPrediction.__post_init__",
+    }
+    assert required <= DESIGNATED_APIS
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        root / "src/ecloudflow/models/pocket_encoder.py",
+        root / "src/ecloudflow/models/count_predictor.py",
+        root / "src/ecloudflow/models/ecloudflow.py",
+    ]
+    assert check_paths(paths, designated=required) == []
+
+
 def test_checker_rejects_missing_designated_api(tmp_path: Path) -> None:
     """A registry entry must resolve to a real module-qualified callable."""
     source = tmp_path / "missing.py"
