@@ -8,6 +8,7 @@ import torch
 from ecloudflow.config import ModelConfig
 from ecloudflow.core.frames import CoordinateFrame
 from ecloudflow.core.types import (
+    ElectronField,
     FragmentCondition,
     GenerationCondition,
     MolecularState,
@@ -80,6 +81,31 @@ def _model() -> ECloudFlowModel:
         ModelConfig(name="tiny", scalar_dim=16, vector_dim=4, num_blocks=2, lmax=2),
         max_atoms=8,
         electron_vector_dim=8,
+        atom_classes=6,
+        charge_classes=4,
+        bond_classes=5,
+    )
+
+
+def _rich_condition(state: MolecularState) -> GenerationCondition:
+    """Build explicit field/property/interaction conditioning for ablations."""
+    base = _condition(state)
+    frame = CoordinateFrame(origin=torch.zeros(3))
+    pocket = replace(base.pocket, frame=frame)
+    field = ElectronField(
+        positions=torch.tensor(
+            [[-1.0, 0.2, 0.3], [0.6, 0.4, -0.2], [1.1, -0.8, 0.5], [0.2, 1.0, -0.7]]
+        ),
+        values=torch.tensor([[0.2, 1.0], [0.7, -0.3], [1.2, 0.4], [-0.5, 0.8]]),
+        mask=torch.tensor([True, True, True, True]),
+        batch=torch.tensor([0, 0, 1, 1]),
+        frame=frame,
+    )
+    return GenerationCondition(
+        pocket=pocket,
+        pocket_field=field,
+        property_targets={"affinity": torch.tensor([1.0, 2.0])},
+        interaction_targets=torch.tensor([[0.2, 0.8], [0.5, -0.1]]),
     )
 
 
@@ -113,6 +139,253 @@ def test_forward_outputs_flattened_heads_and_applies_fragment_masks() -> None:
     probabilities = prediction.count_logits.exp()
     assert torch.equal(probabilities[0, :1], torch.zeros(1))
     assert torch.equal(probabilities[1, :2], torch.zeros(2))
+
+
+def test_categorical_heads_change_probabilities_per_class_and_receive_gradients() -> (
+    None
+):
+    """Mutation caught: one broadcast scalar leaves every categorical softmax unchanged."""
+    model = _model()
+    state = _state()
+    prediction = model(state, torch.tensor([0.2, 0.8]), _condition(state))
+
+    assert not torch.allclose(
+        prediction.atom_logits.softmax(-1), state.atom_logits.softmax(-1)
+    )
+    assert not torch.allclose(
+        prediction.charge_logits.softmax(-1), state.charge_logits.softmax(-1)
+    )
+    assert not torch.allclose(
+        prediction.bond_logits.softmax(-1), state.bond_logits.softmax(-1)
+    )
+    class_weights = torch.arange(1, 7, dtype=state.positions.dtype)
+    loss = (prediction.atom_logits * class_weights).sum()
+    loss = (
+        loss
+        + (
+            prediction.charge_logits * torch.arange(1, 5, dtype=state.positions.dtype)
+        ).sum()
+    )
+    loss = (
+        loss
+        + (
+            prediction.bond_logits * torch.arange(1, 6, dtype=state.positions.dtype)
+        ).sum()
+    )
+    loss.backward()
+
+    for head in (model.atom_head, model.charge_head, model.bond_head):
+        final_weight = head.network[-1].weight
+        assert final_weight.grad is not None
+        assert torch.all(final_weight.grad.abs().sum(dim=1) > 0)
+
+
+def test_model_rejects_state_vocabulary_width_mismatch() -> None:
+    """Mutation caught: dynamic broadcasting silently accepts a wrong vocabulary."""
+    state = _state()
+    malformed = state.replace(atom_logits=state.atom_logits[:, :-1])
+
+    with pytest.raises(ValueError, match="atom class"):
+        _model()(malformed, torch.tensor([0.2, 0.8]), _condition(malformed))
+
+
+@pytest.mark.parametrize(
+    ("change", "label"),
+    [
+        ("field", "pocket field"),
+        ("interaction", "interaction target"),
+        ("property_name", "property name"),
+        ("property_value", "property value"),
+    ],
+)
+def test_each_explicit_condition_signal_changes_predictions(
+    change: str, label: str
+) -> None:
+    """Mutation caught: dropping a named condition makes its ablation an alias."""
+    model = _model().eval()
+    state = _state()
+    condition = _rich_condition(state)
+    if change == "field":
+        changed = replace(
+            condition,
+            pocket_field=replace(
+                condition.pocket_field,
+                values=condition.pocket_field.values
+                + torch.tensor([[0.3, -0.1], [0.1, 0.2], [-0.2, 0.4], [0.5, 0.1]]),
+            ),
+        )
+    elif change == "interaction":
+        changed = replace(
+            condition,
+            interaction_targets=condition.interaction_targets
+            + torch.tensor([[0.4, -0.2], [0.1, 0.3]]),
+        )
+    elif change == "property_name":
+        changed = replace(
+            condition,
+            property_targets={"logp": torch.tensor([1.0, 2.0])},
+        )
+    else:
+        changed = replace(
+            condition,
+            property_targets={"affinity": torch.tensor([2.0, 3.0])},
+        )
+
+    original = model(state, torch.tensor([0.3, 0.7]), condition)
+    ablated = model(state, torch.tensor([0.3, 0.7]), changed)
+
+    assert not torch.allclose(original.affinity, ablated.affinity), label
+
+
+def test_condition_tensors_receive_finite_nonzero_gradients() -> None:
+    """Mutation caught: detaching a condition encoder hides its training signal."""
+    model = _model()
+    state = _state()
+    condition = _rich_condition(state)
+    field_positions = condition.pocket_field.positions.detach().requires_grad_(True)
+    field_values = condition.pocket_field.values.detach().requires_grad_(True)
+    property_values = torch.tensor([1.0, 2.0], requires_grad=True)
+    interaction = condition.interaction_targets.detach().requires_grad_(True)
+    condition = replace(
+        condition,
+        pocket_field=replace(
+            condition.pocket_field,
+            positions=field_positions,
+            values=field_values,
+        ),
+        property_targets={"affinity": property_values},
+        interaction_targets=interaction,
+    )
+
+    prediction = model(state, torch.tensor([0.3, 0.7]), condition)
+    loss = (
+        prediction.position_velocity.square().sum()
+        + prediction.atom_logits.square().sum()
+        + prediction.affinity.square().sum()
+    )
+    loss.backward()
+
+    for tensor in (field_positions, field_values, property_values, interaction):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert torch.any(tensor.grad != 0)
+
+
+def test_zero_valued_property_still_preserves_property_identity() -> None:
+    """Mutation caught: multiplying identity by value erases names at value zero."""
+    model = _model().eval()
+    state = _state()
+    condition = _rich_condition(state)
+    first = replace(condition, property_targets={"affinity": torch.zeros(2)})
+    second = replace(condition, property_targets={"logp": torch.zeros(2)})
+
+    first_prediction = model(state, torch.tensor([0.3, 0.7]), first)
+    second_prediction = model(state, torch.tensor([0.3, 0.7]), second)
+
+    assert not torch.allclose(first_prediction.affinity, second_prediction.affinity)
+
+
+@pytest.mark.parametrize(
+    ("condition", "match"),
+    [
+        (
+            lambda state: replace(
+                _rich_condition(state), property_targets={"bad": torch.ones(3)}
+            ),
+            r"shape \[B",
+        ),
+        (
+            lambda state: replace(
+                _rich_condition(state), interaction_targets=torch.ones(3, 2)
+            ),
+            r"shape \[B",
+        ),
+        (
+            lambda state: replace(
+                _rich_condition(state),
+                interaction_targets=torch.ones(2, 2, dtype=torch.float64),
+            ),
+            "dtype and device",
+        ),
+    ],
+)
+def test_model_rejects_malformed_condition_batch_shapes(condition, match: str) -> None:
+    """Mutation caught: condition broadcasting mixes targets between complexes."""
+    state = _state()
+
+    with pytest.raises(ValueError, match=match):
+        _model()(state, torch.tensor([0.2, 0.8]), condition(state))
+
+
+def test_null_branch_is_independent_of_all_pocket_and_target_content() -> None:
+    """Mutation caught: null cross edges leak pocket geometry into unconditional CFG."""
+    model = _model().eval()
+    state = _state()
+    first = _rich_condition(state)
+    frame = first.pocket.frame
+    assert frame is not None
+    fixed = torch.tensor([True, False, True, True])
+    reference = state.replace(frame=frame)
+    first = replace(
+        first,
+        fragment=FragmentCondition.from_atom_mask(fixed, reference, task_id="grow"),
+    )
+    second = replace(
+        first,
+        pocket=replace(
+            first.pocket,
+            positions=first.pocket.positions * 3.0 + torch.tensor([4.0, -2.0, 1.0]),
+            features=first.pocket.features.flip(-1) + 5.0,
+        ),
+        pocket_field=replace(
+            first.pocket_field,
+            positions=first.pocket_field.positions * -2.0,
+            values=first.pocket_field.values + 7.0,
+        ),
+        property_targets={"different": torch.tensor([-5.0, 9.0])},
+        interaction_targets=torch.tensor([[8.0, -3.0], [4.0, 6.0]]),
+        fragment=FragmentCondition.from_atom_mask(fixed, reference, task_id="link"),
+    )
+    first_null = model.encode_pocket(first.pocket, use_null=True)
+    second_null = model.encode_pocket(second.pocket, use_null=True)
+
+    prediction = model(state, torch.tensor([0.4, 0.6]), first, first_null)
+    changed = model(state, torch.tensor([0.4, 0.6]), second, second_null)
+
+    for left, right in (
+        (prediction.position_velocity, changed.position_velocity),
+        (prediction.atom_logits, changed.atom_logits),
+        (prediction.bond_logits, changed.bond_logits),
+        (prediction.count_logits, changed.count_logits),
+        (prediction.affinity, changed.affinity),
+        (prediction.interaction_logits, changed.interaction_logits),
+    ):
+        assert torch.equal(left, right)
+
+
+def test_ligand_backbone_retains_and_uses_all_vector_channels_and_time_films() -> None:
+    """Mutation caught: collapsing vectors or one-time injection leaves channels/blocks unused."""
+    model = _model()
+    state = _state()
+    captured = []
+    handle = model.backbone.register_forward_hook(
+        lambda _module, _inputs, output: captured.append(output.vectors)
+    )
+    prediction = model(state, torch.tensor([0.2, 0.8]), _condition(state))
+    handle.remove()
+
+    assert captured[0].shape == (4, 4, 3)
+    assert torch.all(captured[0].square().sum(dim=(0, 2)) > 0)
+    loss = (
+        prediction.atom_logits.square().sum()
+        + prediction.position_velocity.square().sum()
+    )
+    loss.backward()
+    assert len(model.backbone.time_films) == 2
+    assert all(
+        film.weight.grad is not None and torch.any(film.weight.grad != 0)
+        for film in model.backbone.time_films
+    )
 
 
 def test_cached_pocket_encoding_is_reused_and_wrong_cache_is_rejected() -> None:

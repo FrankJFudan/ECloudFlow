@@ -47,26 +47,61 @@ def radius_edges(
 
 
 def _native_radius_edges(
-    positions: torch.Tensor, batch: torch.Tensor, cutoff: float
+    positions: torch.Tensor,
+    batch: torch.Tensor,
+    cutoff: float,
+    *,
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
-    """Provide the same sparse contract when PyG's torch-cluster extra is absent."""
+    """Provide bounded-memory sparse edges when PyG's compiled extra is absent.
+
+    Candidate source rows are deterministically chunked so at most roughly
+    65,536 pairs are resident by default. Batch boundaries, caller device,
+    strict cutoff semantics, directed ordering, and exact edge values match the
+    PyG path without a global Cartesian-product allocation.
+    """
     pieces: list[torch.Tensor] = []
     for complex_index in torch.unique(batch, sorted=True):
         nodes = torch.nonzero(batch == complex_index, as_tuple=False).flatten()
         if nodes.numel() < 2:
             continue
-        source = nodes.repeat_interleave(nodes.numel())
-        target = nodes.repeat(nodes.numel())
-        keep = source != target
-        source = source[keep]
-        target = target[keep]
-        distance = (positions[source] - positions[target]).norm(dim=-1)
-        keep = distance < cutoff
-        if bool(keep.any()):
-            pieces.append(torch.stack((source[keep], target[keep])))
+        rows = chunk_size or max(1, 65536 // nodes.numel())
+        for source, target in _candidate_pair_chunks(nodes, rows):
+            keep = source != target
+            source = source[keep]
+            target = target[keep]
+            distance = (positions[source] - positions[target]).norm(dim=-1)
+            keep = distance < cutoff
+            if bool(keep.any()):
+                pieces.append(torch.stack((source[keep], target[keep])))
     if not pieces:
         return torch.empty((2, 0), dtype=torch.long, device=positions.device)
     return torch.cat(pieces, dim=1)
+
+
+def _candidate_pair_chunks(nodes: torch.Tensor, chunk_size: int):
+    """Yield deterministic Cartesian index chunks with bounded source rows."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    for start in range(0, nodes.numel(), chunk_size):
+        source_rows = nodes[start : start + chunk_size]
+        yield (
+            source_rows.repeat_interleave(nodes.numel()),
+            nodes.repeat(source_rows.numel()),
+        )
+
+
+def _candidate_bipartite_chunks(
+    source: torch.Tensor, target: torch.Tensor, max_candidates: int = 65536
+):
+    """Yield deterministic bipartite candidates under a fixed memory bound."""
+    rows = max(1, max_candidates // max(target.numel(), 1))
+    for start in range(0, source.numel(), rows):
+        source_rows = source[start : start + rows]
+        yield (
+            source_rows.repeat_interleave(target.numel()),
+            target.repeat(source_rows.numel()),
+        )
 
 
 def bipartite_radius_edges(
@@ -109,14 +144,13 @@ def bipartite_radius_edges(
         target = torch.nonzero(target_batch == complex_index, as_tuple=False).flatten()
         if source.numel() == 0 or target.numel() == 0:
             continue
-        source_grid = source.repeat_interleave(target.numel())
-        target_grid = target.repeat(source.numel())
-        distance = (source_positions[source_grid] - target_positions[target_grid]).norm(
-            dim=-1
-        )
-        keep = distance < float(cutoff)
-        if bool(keep.any()):
-            pieces.append(torch.stack((source_grid[keep], target_grid[keep])))
+        for source_grid, target_grid in _candidate_bipartite_chunks(source, target):
+            distance = (
+                source_positions[source_grid] - target_positions[target_grid]
+            ).norm(dim=-1)
+            keep = distance < float(cutoff)
+            if bool(keep.any()):
+                pieces.append(torch.stack((source_grid[keep], target_grid[keep])))
     if not pieces:
         return torch.empty((2, 0), dtype=torch.long, device=source_positions.device)
     return torch.cat(pieces, dim=1)
@@ -138,6 +172,20 @@ def scatter_sum(values: torch.Tensor, index: torch.Tensor, count: int) -> torch.
     output = values.new_zeros((count, *values.shape[1:]))
     if index.numel():
         output.index_add_(0, index, values)
+    return output
+
+
+def segment_softmax(
+    logits: torch.Tensor, index: torch.Tensor, count: int
+) -> torch.Tensor:
+    """Normalize one-dimensional logits independently for each destination."""
+    if logits.ndim != 1 or index.shape != logits.shape or index.dtype != torch.long:
+        raise ValueError("segment softmax expects logits [E] and long index [E].")
+    output = torch.empty_like(logits)
+    for destination in range(count):
+        selected = index == destination
+        if bool(selected.any()):
+            output[selected] = torch.softmax(logits[selected], dim=0)
     return output
 
 

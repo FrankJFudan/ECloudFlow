@@ -77,6 +77,19 @@ _NULL_CONDITION = _topic("null-conditioning", r"classifier-free", r"null conditi
 _SPARSE_PAIR = _topic(
     "sparse-pair", r"unordered halfedge", r"dense \[n,n,c\]", r"symmetric"
 )
+_PARITY = _topic("parity", r"pseudoscalar", r"triple product", r"chiral")
+_VECTOR_CHANNELS = _topic("vector-channels", r"\[n,v,3\]", r"vector channels")
+_TIME_FILM = _topic("time-film", r"film")
+_NORMALIZED_ATTENTION = _topic(
+    "normalized-attention", r"normalized.*attention", r"attention.*normaliz"
+)
+_POCKET_FIELD = _topic("pocket-field", r"pocket field", r"pocket_field")
+_INTERACTION_TARGET = _topic(
+    "interaction-target", r"interaction target", r"interaction_targets"
+)
+_PROPERTY_IDENTITY = _topic(
+    "property-identity", r"property (?:name|identity)", r"sha-256.*property"
+)
 _PLACEMENT_RETENTION_VERB = (
     r"(?:preserv\w*|retain\w*|keep\w*|kept|maintain\w*|remain\w*|stay\w*)"
 )
@@ -439,6 +452,13 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
             _NULL_CONDITION,
             _SPARSE_PAIR,
             _DISTRIBUTED,
+            _PARITY,
+            _VECTOR_CHANNELS,
+            _TIME_FILM,
+            _NORMALIZED_ATTENTION,
+            _POCKET_FIELD,
+            _INTERACTION_TARGET,
+            _PROPERTY_IDENTITY,
         ),
         min_words=160,
     ),

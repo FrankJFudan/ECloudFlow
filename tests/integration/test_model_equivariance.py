@@ -100,3 +100,36 @@ def test_model_is_se3_equivariant_and_scalar_outputs_are_invariant() -> None:
         (moved.interaction_logits, prediction.interaction_logits),
     ):
         assert torch.allclose(moved_scalar, original, atol=5e-4, rtol=5e-4)
+
+
+def test_chiral_mirror_is_not_forced_to_have_identical_scalar_predictions() -> None:
+    """Mutation caught: dot products alone accidentally impose full O(3) invariance."""
+    torch.manual_seed(34)
+    model = ECloudFlowModel.from_config(
+        ModelConfig(name="tiny", scalar_dim=16, vector_dim=4, num_blocks=2, lmax=2),
+        electron_vector_dim=8,
+        max_atoms=12,
+        atom_classes=6,
+        charge_classes=4,
+        bond_classes=5,
+    ).eval()
+    state, condition = _batch()
+    original = model(state, torch.tensor([0.45]), condition)
+    reflection = torch.diag(torch.tensor([-1.0, 1.0, 1.0]))
+    irreps = o3.Irreps("19x0e + 8x1o + 1x2e")
+    representation = irreps.D_from_matrix(reflection)
+    mirrored_state = state.replace(
+        positions=state.positions @ reflection.T,
+        electron_latent=state.electron_latent @ representation.T,
+    )
+    mirrored_condition = replace(
+        condition,
+        pocket=replace(
+            condition.pocket,
+            positions=condition.pocket.positions @ reflection.T,
+        ),
+    )
+    mirrored = model(mirrored_state, torch.tensor([0.45]), mirrored_condition)
+
+    assert not torch.allclose(mirrored.atom_logits, original.atom_logits)
+    assert not torch.allclose(mirrored.affinity, original.affinity)

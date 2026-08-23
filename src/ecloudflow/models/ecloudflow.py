@@ -13,7 +13,7 @@ from ecloudflow.core.types import GenerationCondition, MolecularState, PocketGra
 from ecloudflow.models.backbone import JointLigandBackbone
 from ecloudflow.models.count_predictor import AtomCountPredictor
 from ecloudflow.models.heads import ScalarHead, SymmetricPairHead
-from ecloudflow.models.layers import safe_rms
+from ecloudflow.models.layers import safe_rms, scatter_sum
 from ecloudflow.models.pocket_encoder import PocketEncoder, PocketEncoding
 
 
@@ -120,23 +120,28 @@ class ModelPrediction:
 class _PackedElectronHead(nn.Module):  # type: ignore[misc]
     """Predict one packed-irrep tensor without mixing representation components."""
 
-    def __init__(self, scalar_dim: int) -> None:
+    def __init__(self, scalar_dim: int, vector_dim: int) -> None:
         super().__init__()
+        self.vector_dim = vector_dim
         self.parameters_head = nn.Sequential(
-            nn.Linear(scalar_dim, scalar_dim), nn.SiLU(), nn.Linear(scalar_dim, 4)
+            nn.Linear(scalar_dim, scalar_dim),
+            nn.SiLU(),
+            nn.Linear(scalar_dim, 3 + vector_dim),
         )
 
     def forward(
         self,
         hidden: torch.Tensor,
         latent: torch.Tensor,
-        direction: torch.Tensor,
+        backbone_vectors: torch.Tensor,
         layout: tuple[int, int, tuple[tuple[int, int, int], ...]],
     ) -> torch.Tensor:
         """Apply scalar gates equally across each irrep component."""
         scalar_copies, vector_copies, higher = layout
         values = self.parameters_head(hidden)
-        scalar_gate, scalar_shift, nonscalar_gate, vector_injection = values.unbind(-1)
+        scalar_gate, scalar_shift, nonscalar_gate = values[:, :3].unbind(-1)
+        vector_weights = values[:, 3:]
+        direction = torch.einsum("nv,nvc->nc", vector_weights, backbone_vectors)
         pieces = [
             latent[:, :scalar_copies] * scalar_gate[:, None] + scalar_shift[:, None]
         ]
@@ -145,10 +150,7 @@ class _PackedElectronHead(nn.Module):  # type: ignore[misc]
         vectors = latent[:, offset : offset + vector_width].reshape(
             -1, vector_copies, 3
         )
-        vectors = (
-            vectors * nonscalar_gate[:, None, None]
-            + vector_injection[:, None, None] * direction[:, None, :]
-        )
+        vectors = vectors * nonscalar_gate[:, None, None] + direction[:, None, :]
         pieces.append(vectors.reshape(-1, vector_width))
         offset += vector_width
         for _, multiplicity, width in higher:
@@ -170,6 +172,9 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
     :param electron_vector_dim: Multiplicity of the packed ``1o`` block. This
         is deliberately distinct from backbone ``vector_dim``; the default 8
         gives ``19x0e + 8x1o + 1x2e`` for ``C=48,lmax=2``.
+    :param atom_classes: Positive configured atom vocabulary width ``A``.
+    :param charge_classes: Positive configured charge vocabulary width ``Q``.
+    :param bond_classes: Positive configured bond vocabulary width ``K``.
     :param max_atoms: Inclusive largest atom-count category.
     :param pocket_cutoff: Pocket radius cutoff in angstroms.
     :param cross_cutoff: Pocket-to-ligand radius cutoff in angstroms.
@@ -192,6 +197,9 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         *,
         electron_latent_dim: int = 48,
         electron_vector_dim: int = 8,
+        atom_classes: int = 6,
+        charge_classes: int = 4,
+        bond_classes: int = 5,
         max_atoms: int = 64,
         pocket_cutoff: float = 8.0,
         cross_cutoff: float = 8.0,
@@ -203,6 +211,9 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
             ("num_blocks", num_blocks),
             ("electron_latent_dim", electron_latent_dim),
             ("electron_vector_dim", electron_vector_dim),
+            ("atom_classes", atom_classes),
+            ("charge_classes", charge_classes),
+            ("bond_classes", bond_classes),
             ("max_atoms", max_atoms),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -218,20 +229,25 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         self.electron_latent_dim = electron_latent_dim
         self.electron_vector_dim = electron_vector_dim
         self.max_atoms = max_atoms
+        self.atom_classes = atom_classes
+        self.charge_classes = charge_classes
+        self.bond_classes = bond_classes
         self.electron_layout = _electron_layout(
             electron_latent_dim, electron_vector_dim, lmax
         )
         self.pocket_encoder = PocketEncoder(
             scalar_dim, vector_dim, num_blocks, cutoff=pocket_cutoff
         )
-        self.backbone = JointLigandBackbone(scalar_dim, num_blocks, cutoff=cross_cutoff)
-        self.position_velocity_head = nn.Linear(scalar_dim, 2)
-        self.position_score_head = nn.Linear(scalar_dim, 2)
-        self.electron_velocity_head = _PackedElectronHead(scalar_dim)
-        self.electron_score_head = _PackedElectronHead(scalar_dim)
-        self.atom_head = ScalarHead(scalar_dim)
-        self.charge_head = ScalarHead(scalar_dim)
-        self.bond_head = SymmetricPairHead(scalar_dim)
+        self.backbone = JointLigandBackbone(
+            scalar_dim, vector_dim, num_blocks, cutoff=cross_cutoff
+        )
+        self.position_velocity_head = nn.Linear(scalar_dim, vector_dim + 1)
+        self.position_score_head = nn.Linear(scalar_dim, vector_dim + 1)
+        self.electron_velocity_head = _PackedElectronHead(scalar_dim, vector_dim)
+        self.electron_score_head = _PackedElectronHead(scalar_dim, vector_dim)
+        self.atom_head = ScalarHead(scalar_dim, atom_classes)
+        self.charge_head = ScalarHead(scalar_dim, charge_classes)
+        self.bond_head = SymmetricPairHead(scalar_dim, bond_classes)
         self.count_predictor = AtomCountPredictor(scalar_dim, max_atoms=max_atoms)
         self.affinity_head = ScalarHead(scalar_dim)
         self.interaction_head = ScalarHead(scalar_dim)
@@ -243,6 +259,9 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         *,
         electron_latent_dim: int = 48,
         electron_vector_dim: int = 8,
+        atom_classes: int = 6,
+        charge_classes: int = 4,
+        bond_classes: int = 5,
         max_atoms: int = 64,
         pocket_cutoff: float = 8.0,
         cross_cutoff: float = 8.0,
@@ -252,6 +271,9 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         :param config: Strict model name/width/block/order configuration.
         :param electron_latent_dim: Overrideable packed electron width, default 48.
         :param electron_vector_dim: Overrideable ``1o`` multiplicity, default 8.
+        :param atom_classes: Explicit atom endpoint class count, default 6.
+        :param charge_classes: Explicit charge endpoint class count, default 4.
+        :param bond_classes: Explicit bond endpoint class count, default 5.
         :param max_atoms: Inclusive count category maximum.
         :param pocket_cutoff: Pocket radius in angstroms.
         :param cross_cutoff: Pocket-ligand radius in angstroms.
@@ -270,6 +292,9 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
             lmax=config.lmax,
             electron_latent_dim=electron_latent_dim,
             electron_vector_dim=electron_vector_dim,
+            atom_classes=atom_classes,
+            charge_classes=charge_classes,
+            bond_classes=bond_classes,
             max_atoms=max_atoms,
             pocket_cutoff=pocket_cutoff,
             cross_cutoff=cross_cutoff,
@@ -317,8 +342,9 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
             electron irreps ``[N,C]``, and explicit node/halfedge batches.
         :param time: Floating per-complex path times ``[B]`` in ``[0,1]`` on
             the same dtype/device as state and pocket tensors.
-        :param condition: Pocket, optional electron/property/interaction data,
-            and optional exact fragment task condition.
+        :param condition: Pocket, optional pocket field, named property values,
+            invariant interaction targets, and optional exact fragment task
+            condition. Property names use stable SHA-256 numeric identities.
         :param pocket_encoding: Optional explicitly cached representation from
             :meth:`encode_pocket`; omitted values are computed for this call.
         :return: Coordinate/electron velocities and scores; invariant atom,
@@ -329,18 +355,27 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         :raises ValueError: If time, batches, channels, packed irreps, devices,
             dtypes, fragment masks, or cached pocket identity are inconsistent.
 
-        Coordinate outputs are scalar-weighted sums of relative displacements,
-        encoded pocket vectors, and packed ``1o`` contractions. Translation
-        cancels and proper rotations act exactly on Cartesian outputs. Electron
+        Coordinate outputs are scalar-weighted sums of all retained ligand
+        vector channels ``[N,V,3]`` and packed ``1o`` contractions. Each block
+        applies time FiLM scale/shift and normalized pocket cross-attention per
+        ligand destination, so uneven neighbor counts do not rescale features.
+        Translation cancels and proper rotations act exactly on Cartesian outputs.
+        Cross products and a scalar triple product supply a chiral pseudoscalar:
+        proper rotations preserve scalar predictions, while a reflection may
+        change them as required by SE(3) rather than forced O(3) symmetry. Electron
         blocks use one learned scalar gate per irrep, preserving the planned
         ``19x0e + 8x1o + 1x2e`` transformation instead of treating orientation
         channels as scalars. Scalar logits/auxiliaries use invariant norms and
         contractions. Bond prediction consumes ``O(E)`` canonical pairs and is
         symmetric under endpoint exchange; no dense ``[N,N,C]`` allocation is
         made. Fragment fixed masks are applied before return and per-complex
-        count probability is zero below fixed atom count. The null cache removes
-        pocket/task/property signals for classifier-free guidance while retaining
-        batch geometry. Empty ligands and multi-complex batches are supported.
+        count probability is zero below fixed atom count. Pocket field invariant
+        moments and translation-free polar moments, interaction targets, and
+        property name/value pairs condition every block through explicit encoders.
+        The null cache removes pocket geometry/features, pocket field, interaction
+        target, property identity/value, and task signals for classifier-free
+        guidance while retaining only batch cardinality. Empty ligands and
+        multi-complex batches are supported.
         Calls are deterministic for fixed inputs/parameters, preserve finite
         autograd paths, never mutate inputs/cache, never move dtype/device, and
         hold no global or distributed rank state, making later Lightning
@@ -361,8 +396,22 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
             device=state.positions.device,
         )
         property_features = _property_features(condition, batch_size, state.positions)
+        interaction_features = _interaction_features(
+            condition, batch_size, state.positions
+        )
+        field_features, field_vectors = _field_features(
+            condition, batch_size, state.positions
+        )
         hidden = self.backbone(
-            state, time, encoding, electron_summary, task_features, property_features
+            state,
+            time,
+            encoding,
+            electron_summary,
+            task_features,
+            property_features,
+            interaction_features,
+            field_features,
+            field_vectors,
         )
         electron_vectors = _electron_vectors(
             state.electron_latent, self.electron_layout
@@ -375,35 +424,36 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         velocity_weights = self.position_velocity_head(hidden.scalars)
         score_weights = self.position_score_head(hidden.scalars)
         position_velocity = (
-            velocity_weights[:, :1] * hidden.directions
-            + velocity_weights[:, 1:] * electron_direction
+            torch.einsum(
+                "nv,nvc->nc", velocity_weights[:, : self.vector_dim], hidden.vectors
+            )
+            + velocity_weights[:, -1:] * electron_direction
         )
         position_score = (
-            score_weights[:, :1] * hidden.directions
-            + score_weights[:, 1:] * electron_direction
+            torch.einsum(
+                "nv,nvc->nc", score_weights[:, : self.vector_dim], hidden.vectors
+            )
+            + score_weights[:, -1:] * electron_direction
         )
         electron_velocity = self.electron_velocity_head(
             hidden.scalars,
             state.electron_latent,
-            hidden.directions,
+            hidden.vectors,
             self.electron_layout,
         )
         electron_score = self.electron_score_head(
             hidden.scalars,
             state.electron_latent,
-            hidden.directions,
+            hidden.vectors,
             self.electron_layout,
         )
-        atom_logits = state.atom_logits + self.atom_head(hidden.scalars)[:, None]
-        charge_logits = state.charge_logits + self.charge_head(hidden.scalars)[:, None]
+        atom_logits = state.atom_logits + self.atom_head(hidden.scalars)
+        charge_logits = state.charge_logits + self.charge_head(hidden.scalars)
         if state.halfedge_index.shape[1]:
             source, target = state.halfedge_index
             distance = (state.positions[source] - state.positions[target]).norm(dim=-1)
-            bond_logits = (
-                state.bond_logits
-                + self.bond_head(
-                    hidden.scalars[source], hidden.scalars[target], distance
-                )[:, None]
+            bond_logits = state.bond_logits + self.bond_head(
+                hidden.scalars[source], hidden.scalars[target], distance
             )
         else:
             bond_logits = state.bond_logits + hidden.scalars.sum() * 0.0
@@ -506,20 +556,100 @@ def _task_features(
 def _property_features(
     condition: GenerationCondition, batch_size: int, reference: torch.Tensor
 ) -> torch.Tensor:
-    """Reduce explicit property targets to one invariant conditioning scalar."""
+    """Encode stable property-name identity and value without losing either."""
+    encoded = reference.new_zeros((batch_size, 9))
     if not condition.property_targets:
-        return reference.new_zeros((batch_size, 1))
-    values: list[torch.Tensor] = []
-    for value in condition.property_targets.values():
-        tensor = torch.as_tensor(value, dtype=reference.dtype, device=reference.device)
+        return encoded
+    for name, value in sorted(condition.property_targets.items()):
+        if isinstance(value, torch.Tensor):
+            if value.dtype != reference.dtype or value.device != reference.device:
+                raise ValueError(
+                    "property target tensors must share the state dtype and device."
+                )
+            tensor = value
+        else:
+            tensor = reference.new_tensor(value)
         if tensor.ndim == 0:
             tensor = tensor.expand(batch_size)
         if tensor.shape != (batch_size,):
             raise ValueError(
                 "property target tensors must be scalar or have shape [B]."
             )
-        values.append(tensor)
-    return torch.stack(values, dim=-1).mean(dim=-1, keepdim=True)
+        identity = _stable_identity(
+            name, dtype=reference.dtype, device=reference.device
+        )
+        encoded[:, :8] = encoded[:, :8] + (1.0 + tensor[:, None]) * identity[None, :]
+        encoded[:, 8] = encoded[:, 8] + tensor
+    return encoded
+
+
+def _interaction_features(
+    condition: GenerationCondition, batch_size: int, reference: torch.Tensor
+) -> torch.Tensor:
+    """Encode arbitrary-width invariant interaction targets by stable moments."""
+    target = condition.interaction_targets
+    if target is None:
+        return reference.new_zeros((batch_size, 2))
+    if target.dtype != reference.dtype or target.device != reference.device:
+        raise ValueError("interaction targets must share the state dtype and device.")
+    if target.ndim == 1:
+        target = target[:, None]
+    if target.ndim != 2 or target.shape[0] != batch_size or target.shape[1] == 0:
+        raise ValueError("interaction targets must have shape [B] or [B, I].")
+    return torch.stack((target.mean(-1), safe_rms(target, -1)), dim=-1)
+
+
+def _field_features(
+    condition: GenerationCondition, batch_size: int, reference: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode invariant field moments and one translation-free polar vector."""
+    field = condition.pocket_field
+    if field is None:
+        return reference.new_zeros((batch_size, 4)), reference.new_zeros(
+            (batch_size, 3)
+        )
+    if field.values.dtype != reference.dtype or field.values.device != reference.device:
+        raise ValueError("pocket field must share the state dtype and device.")
+    pocket = condition.pocket
+    pocket_counts = (
+        torch.bincount(pocket.batch, minlength=batch_size)
+        .clamp_min(1)
+        .to(reference.dtype)
+    )
+    centers = scatter_sum(pocket.positions, pocket.batch, batch_size)
+    centers = centers / pocket_counts[:, None]
+    valid = field.mask
+    counts = torch.bincount(field.batch[valid], minlength=batch_size).to(
+        reference.dtype
+    )
+    safe_counts = counts.clamp_min(1)
+    point_mean = field.values.mean(-1)
+    point_rms = safe_rms(field.values, -1)
+    mean_sum = scatter_sum(point_mean[valid, None], field.batch[valid], batch_size)
+    rms_sum = scatter_sum(point_rms[valid, None], field.batch[valid], batch_size)
+    abs_sum = scatter_sum(point_mean[valid, None].abs(), field.batch[valid], batch_size)
+    features = torch.cat(
+        (
+            mean_sum / safe_counts[:, None],
+            rms_sum / safe_counts[:, None],
+            abs_sum / safe_counts[:, None],
+            (counts / pocket_counts)[:, None],
+        ),
+        dim=-1,
+    )
+    displacement = field.positions - centers[field.batch]
+    moments = point_mean[:, None] * displacement
+    vectors = scatter_sum(moments[valid], field.batch[valid], batch_size)
+    vectors = vectors / safe_counts[:, None]
+    return features, vectors
+
+
+def _stable_identity(
+    name: str, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Map a semantic condition name to a stable SHA-256 numeric identity."""
+    digest = hashlib.sha256(name.encode("utf-8")).digest()[:8]
+    return torch.tensor(list(digest), dtype=dtype, device=device) / 127.5 - 1.0
 
 
 def _validate_public_inputs(
@@ -572,6 +702,18 @@ def _validate_public_inputs(
     if state.electron_latent.shape[1] != model.electron_latent_dim:
         raise ValueError(
             f"electron latent must have configured width {model.electron_latent_dim} and packed irrep layout."
+        )
+    if state.atom_logits.shape[1] != model.atom_classes:
+        raise ValueError(
+            f"atom class channels must equal configured width {model.atom_classes}."
+        )
+    if state.charge_logits.shape[1] != model.charge_classes:
+        raise ValueError(
+            f"charge class channels must equal configured width {model.charge_classes}."
+        )
+    if state.bond_logits.shape[1] != model.bond_classes:
+        raise ValueError(
+            f"bond class channels must equal configured width {model.bond_classes}."
         )
     if (
         condition.fragment is not None
