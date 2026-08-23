@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import os
 import random
 import shutil
 import tarfile
@@ -27,6 +26,7 @@ from ecloudflow.core.types import (
     QMProvenance,
     SampleProvenance,
 )
+from ecloudflow.data import durability
 from ecloudflow.data.manifest import (
     DatasetManifest,
     ShardRecord,
@@ -94,8 +94,9 @@ class ShardWriter:
 
         :param samples: Deterministic stream of canonical complexes. Pocket,
             ligand, and optional field coordinates use ``[N, 3]`` local-frame
-            angstrom tensors; graph tensors, dtypes, devices, batch indices,
-            chemical masks, and fragment fixed masks are preserved exactly.
+            angstrom tensors. Serialization detaches every tensor and stores a
+            CPU copy while preserving dtype, shape, values, batch indices,
+            chemical/field masks, and validated frame/provenance metadata.
         :param output_dir: Dataset root containing ``.staging``, immutable
             ``generations/<id>`` directories, and the current ``manifest.json``.
         :param split: Optional frozen leakage-controlled sample/entity split.
@@ -107,6 +108,8 @@ class ShardWriter:
         :raises ShardWriteError: If resume input changes, grouped coverage is
             incomplete, a staged/promoted shard fails size/hash validation, or
             tar, checkpoint, promotion, synchronization, or publication fails.
+        :raises durability.DurabilityError: If the platform cannot durably flush
+            a required file/directory entry or active-marker removal.
         :raises RuntimeError: If the input iterable itself aborts preprocessing.
 
         Publication is a recoverable state machine: ``STAGING`` journals only
@@ -121,15 +124,27 @@ class ShardWriter:
         completed generation; the previous manifest always references unchanged
         shards until the replacement is durable.
 
+        Power-loss ordering is stronger than process-crash atomicity: file bytes
+        are flushed before every replace, and the affected directory entries are
+        flushed after shard publication, READY descriptor/active checkpoints,
+        cross-directory promotion, top-level manifest replacement, and active
+        marker removal. POSIX uses directory ``fsync``; Windows uses
+        write-through replacement and directory ``FlushFileBuffers``. An
+        unavailable/rejected durability primitive raises a typed error rather
+        than acknowledging a transition.
+
         Candidate IDs are reserved before type validation/serialization. Failed
         candidates become bounded typed skips, and a duplicate can never replace
         the first occurrence. Anonymous invalid objects are recorded but do not
         create a reusable synthetic ID. Serialization performs filesystem I/O
-        only, does not mutate input samples, move tensors between CPU/GPU, change
-        coordinate frames/units, or apply distributed partitioning.
+        without mutating input samples, but its payload is intentionally
+        canonical CPU storage rather than original accelerator placement.
+        Deserialization also returns CPU tensors; training code is responsible
+        for moving reconstructed batches to an accelerator. Coordinate frames,
+        angstrom units, dtypes, shapes, graph features, and masks are unchanged.
         """
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        durability.durable_mkdir(output_dir, parents=True, exist_ok=True)
         config_fingerprint = _generation_config_fingerprint(
             self.target_size_bytes,
             self.max_samples_per_shard,
@@ -283,10 +298,10 @@ class ShardWriter:
                     archive.addfile(member, io.BytesIO(payload))
             # Windows requires a writable descriptor for ``fsync``.
             with partial.open("r+b") as stream:
-                os.fsync(stream.fileno())
+                durability.sync_file(stream)
             digest = _sha256_file(partial)
             size_bytes = partial.stat().st_size
-            os.replace(partial, target)
+            durability.durable_replace(partial, target)
         except (OSError, tarfile.TarError) as error:
             try:
                 partial.unlink(missing_ok=True)
@@ -312,6 +327,8 @@ def _recover_ready_generation(output_dir: Path) -> DatasetManifest | None:
     :rtype: DatasetManifest | None
     :raises ShardWriteError: If a descriptor, generation identity, shard path,
         byte size, digest, promotion, or final manifest publication is invalid.
+    :raises durability.DurabilityError: If an active-state or marker-removal
+        directory entry cannot be durably synchronized.
 
     The active marker is a CPU/filesystem control record only. A descriptor in
     ``.staging/<id>`` denotes READY; the same descriptor in
@@ -319,7 +336,9 @@ def _recover_ready_generation(output_dir: Path) -> DatasetManifest | None:
     top-level manifest replacement. An already matching manifest denotes
     PUBLISHED and only marker cleanup remains. The function never opens the
     caller's sample iterable, deserializes tensors, changes device/dtype/frame,
-    or mutates an older immutable generation.
+    or mutates an older immutable generation. Durable file and directory flushes
+    preserve this ordering across power loss; rejected platform flushes fail the
+    recovery instead of silently weakening the guarantee.
     """
     active_path = output_dir / ".staging" / "active.json"
     if not active_path.is_file():
@@ -399,9 +418,9 @@ def _write_publication_descriptor(manifest: DatasetManifest, stage_dir: Path) ->
 
 def _promote_generation(stage_dir: Path, generation_dir: Path) -> None:
     """Atomically rename a READY stage into its immutable generation path."""
-    generation_dir.parent.mkdir(parents=True, exist_ok=True)
+    durability.durable_mkdir(generation_dir.parent, parents=True, exist_ok=True)
     try:
-        os.replace(stage_dir, generation_dir)
+        durability.durable_replace(stage_dir, generation_dir)
     except OSError as error:
         raise ShardWriteError(
             f"failed to promote dataset generation: {error}"
@@ -443,10 +462,14 @@ def _clear_active_generation(output_dir: Path, generation_id: str) -> None:
     active_path = output_dir / ".staging" / "active.json"
     try:
         active = json.loads(active_path.read_text(encoding="utf-8"))
-        if active.get("generation_id") == generation_id:
-            active_path.unlink(missing_ok=True)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except FileNotFoundError:
         return
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        raise ShardWriteError(
+            f"cannot validate active marker removal: {error}"
+        ) from error
+    if active.get("generation_id") == generation_id:
+        durability.durable_unlink(active_path, missing_ok=True)
 
 
 def _validate_publication_shards(
@@ -502,7 +525,7 @@ def _open_generation(
 ) -> tuple[str, Path, dict[str, Any]]:
     """Resume a compatible staged generation or create a new isolated stage."""
     staging_root = output_dir / ".staging"
-    staging_root.mkdir(parents=True, exist_ok=True)
+    durability.durable_mkdir(staging_root, parents=True, exist_ok=True)
     active_path = staging_root / "active.json"
     if active_path.is_file():
         try:
@@ -531,7 +554,7 @@ def _open_generation(
             pass
     generation_id = uuid.uuid4().hex
     stage_dir = staging_root / generation_id
-    stage_dir.mkdir(parents=False, exist_ok=False)
+    durability.durable_mkdir(stage_dir, parents=False, exist_ok=False)
     _set_active_generation(
         output_dir,
         generation_id,
@@ -566,13 +589,13 @@ def _write_generation_journal(
 
 def _write_json_atomic(path: Path, values: Mapping[str, Any]) -> None:
     """Write one fsynced JSON control file through an atomic replacement."""
+    durability.durable_mkdir(path.parent, parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".partial")
     with partial.open("w", encoding="utf-8", newline="\n") as stream:
         json.dump(values, stream, sort_keys=True, separators=(",", ":"))
         stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(partial, path)
+        durability.sync_file(stream)
+    durability.durable_replace(partial, path)
 
 
 def _shard_record_to_dict(record: ShardRecord) -> dict[str, Any]:
@@ -719,9 +742,9 @@ def stream_samples(
         required for split filtering without decoding non-owned members.
     :param cache_dir: Optional portable local read-through cache directory. Cache
         use requires expected hashes and verifies every hit and fill.
-    :return: Lazy iterator of validated canonical samples whose coordinate
+    :return: Lazy iterator of validated canonical CPU samples whose coordinate
         tensors retain ``[N, 3]`` local binding-frame angstrom values, dtype,
-        device, graph/field masks, chemical attributes, and provenance.
+        shape, graph/field masks, chemical attributes, and provenance.
     :rtype: Iterator[ComplexSample]
     :raises ValueError: If rank/worker arguments or the shuffle size are invalid.
     :raises ShardReadError: If a shard hash, tar member, or sample payload fails.
@@ -733,7 +756,9 @@ def stream_samples(
     exact once-only coverage without N-times sample decoding. Path order and
     the seed/rank/worker tuple completely determine output order. Hash-verified
     cache fills mutate only ``cache_dir`` through fsynced atomic replacement;
-    shards and reconstructed samples are never modified or moved across devices.
+    restricted loading maps every stored tensor to CPU. Callers must move a
+    reconstructed batch to its accelerator explicitly; this iterator preserves
+    dtype, shape, local frame, angstrom units, features, masks, and provenance.
     """
     _validate_partition(rank, world_size, worker_id, num_workers, shuffle_buffer)
     ordered_paths = sorted((Path(path) for path in paths), key=lambda path: path.name)
@@ -847,26 +872,34 @@ def _resolve_cached_shard(
     uniquely named partial file after copy, ``fsync``, and SHA-256 verification.
     Concurrent workers may race safely because every successful replacement has
     identical content. No tar member is decoded and no tensor dtype, device,
-    coordinate frame, units, or mask is changed here.
+    coordinate frame, units, or mask is changed here. The content hash makes
+    cache naming and verified hit/refill selection deterministic.
     """
     if cache_dir is None:
         return source_path
     if expected_hash is None or not _valid_sha256(expected_hash):
         raise ShardReadError(f"missing cache verification hash: {source_path.name}")
     destination_root = Path(cache_dir)
-    destination_root.mkdir(parents=True, exist_ok=True)
-    destination = destination_root / f"{expected_hash.removeprefix('sha256:')}.tar"
-    if destination.is_file() and "sha256:" + _sha256_file(destination) == expected_hash:
-        return destination
+    try:
+        durability.durable_mkdir(destination_root, parents=True, exist_ok=True)
+        destination = destination_root / f"{expected_hash.removeprefix('sha256:')}.tar"
+        if (
+            destination.is_file()
+            and "sha256:" + _sha256_file(destination) == expected_hash
+        ):
+            return destination
+    except OSError as error:
+        raise ShardReadError(
+            f"failed to inspect shard cache: {source_path.name}"
+        ) from error
     partial = destination.with_suffix(f".{uuid.uuid4().hex}.partial")
     try:
         with source_path.open("rb") as source, partial.open("wb") as target:
             shutil.copyfileobj(source, target, length=1024 * 1024)
-            target.flush()
-            os.fsync(target.fileno())
+            durability.sync_file(target)
         if "sha256:" + _sha256_file(partial) != expected_hash:
             raise ShardReadError(f"source shard hash mismatch: {source_path.name}")
-        os.replace(partial, destination)
+        durability.durable_replace(partial, destination)
     except OSError as error:
         raise ShardReadError(
             f"failed to fill shard cache: {source_path.name}"
@@ -911,8 +944,10 @@ def sample_ids_for_partition(
 
     This audit helper applies the same rank-first, worker-second ownership as
     :func:`stream_samples` with shuffling disabled. Across all valid consumers,
-    each sample ID appears exactly once. It performs CPU shard decoding but does
-    not mutate files/samples or change tensor dtype, device, frame, units, or masks.
+    each sample ID appears exactly once. It decodes canonical CPU samples only
+    to read IDs; dtype, shape, frame, units, and masks remain validated, and no
+    accelerator placement is reconstructed or implied. Selection is
+    deterministic and does not mutate the shard or reconstructed sample.
     """
     return [
         sample.source_id

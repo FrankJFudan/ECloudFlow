@@ -6,35 +6,217 @@ import io
 import re
 import tokenize
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 CJK = re.compile(r"[\u3400-\u9fff]")
 REQUIRED_FIELDS = (":param ", ":return:", ":rtype:")
-DESIGNATED_APIS = frozenset(
-    {
-        "types.QMProvenance.__reduce__",
-        "types.SampleProvenance.__reduce__",
-        "types.ComplexSample.__reduce__",
-        "splits.build_grouped_split",
-        "splits._global_alignment_identity",
-        "manifest.DatasetManifest.write",
-        "manifest.DatasetManifest.read",
-        "shards.ShardWriter.write",
-        "shards._recover_ready_generation",
-        "shards.stream_samples",
-        "shards._resolve_cached_shard",
-        "shards.sample_ids_for_partition",
-        "shards.bucketed_batches",
-        "datamodule._ShardBatchDataset.__iter__",
-        "datamodule.ECloudDataModule.setup",
-        "datamodule.ECloudDataModule.set_epoch",
-        "datamodule.ECloudDataModule.state_dict",
-        "datamodule.ECloudDataModule.load_state_dict",
-        "diffgui_lmdb.DiffGuiLMDBImporter.from_config",
-        "diffgui_lmdb.DiffGuiLMDBImporter.__iter__",
-        "diffgui_lmdb.DiffGuiLMDBImporter.iter_samples",
-    }
+
+
+@dataclass(frozen=True)
+class SemanticTopic:
+    """Define one semantic documentation topic through accepted regex patterns."""
+
+    name: str
+    patterns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class APIDocContract:
+    """Define substantive documentation requirements for one important API."""
+
+    require_raises: bool
+    topics: tuple[SemanticTopic, ...]
+    min_words: int = 35
+    forbidden_patterns: tuple[str, ...] = ()
+
+
+def _topic(name: str, *patterns: str) -> SemanticTopic:
+    """Build one immutable semantic-topic requirement."""
+    return SemanticTopic(name=name, patterns=patterns)
+
+
+_DEVICE = _topic("device", r"\bcpu\b", r"\bdevices?\b", r"\baccelerator\b")
+_DTYPE = _topic("dtype", r"\bdtype\b")
+_FRAME = _topic("frame", r"\bframes?\b")
+_MASK = _topic("mask", r"\bmask(?:s)?\b")
+_MUTATION = _topic(
+    "mutation",
+    r"\bmutat",
+    r"\bimmutable\b",
+    r"read-only",
+    r"does not alter",
+    r"never modif",
 )
+_DETERMINISM = _topic(
+    "determinism", r"determin", r"\bstable\b", r"byte-sorted", r"exact(?:ly)? once"
+)
+_RESUME = _topic("resume", r"resum", r"recover", r"checkpoint", r"\bready\b")
+_FAILURE = _topic("failure", r"fail", r"invalid", r"reject", r"error")
+_POWER_LOSS = _topic(
+    "power-loss",
+    r"power.loss",
+    r"directory.*fsync",
+    r"flushfilebuffers",
+    r"write-through",
+)
+_DISTRIBUTED = _topic("distributed", r"\brank\b", r"\bworker\b", r"distributed")
+_SHAPE = _topic("shape", r"\[n,\s*3\]", r"\bshape\b")
+_UNITS = _topic("units", r"angstrom", r"\bunits\b")
+_CACHE = _topic("cache", r"\bcache\b", r"sha-256", r"content-addressed")
+_ALIGNMENT = _topic("alignment", r"global alignment", r"affine-gap", r"gap column")
+_CHECKPOINT = _topic("checkpoint", r"checkpoint", r"manifest hash", r"restore")
+_FALSE_STORAGE_DEVICE_CLAIMS = (
+    r"preserv\w*.{0,80}(?:original\s+)?device",
+    r"retain\w*.{0,80}\bdevice\b",
+    r"never.{0,80}(?:mov\w*|transfer\w*).{0,40}(?:cpu|device)",
+    r"does not.{0,80}(?:move|transfer).{0,40}(?:tensor|device|cpu)",
+)
+
+API_DOC_CONTRACTS: dict[str, APIDocContract] = {
+    "durability.sync_file": APIDocContract(True, (_MUTATION, _FAILURE, _POWER_LOSS)),
+    "durability.flush_directory": APIDocContract(
+        True, (_MUTATION, _FAILURE, _POWER_LOSS)
+    ),
+    "durability.durable_replace": APIDocContract(
+        True, (_MUTATION, _FAILURE, _POWER_LOSS)
+    ),
+    "durability.durable_unlink": APIDocContract(
+        True, (_MUTATION, _FAILURE, _POWER_LOSS)
+    ),
+    "durability.durable_mkdir": APIDocContract(
+        True, (_MUTATION, _FAILURE, _POWER_LOSS)
+    ),
+    "types.QMProvenance.__reduce__": APIDocContract(
+        True, (_DEVICE, _MUTATION, _FAILURE)
+    ),
+    "types.SampleProvenance.__reduce__": APIDocContract(
+        True, (_DEVICE, _DTYPE, _SHAPE, _FRAME, _UNITS, _MUTATION, _FAILURE)
+    ),
+    "types.ComplexSample.__reduce__": APIDocContract(
+        True,
+        (_DEVICE, _DTYPE, _SHAPE, _FRAME, _UNITS, _MASK, _MUTATION, _FAILURE),
+    ),
+    "splits.build_grouped_split": APIDocContract(
+        True, (_DETERMINISM, _ALIGNMENT, _MUTATION, _FAILURE)
+    ),
+    "splits._global_alignment_identity": APIDocContract(
+        True, (_DETERMINISM, _ALIGNMENT, _MUTATION, _FAILURE)
+    ),
+    "manifest.DatasetManifest.write": APIDocContract(
+        True, (_MUTATION, _FAILURE, _POWER_LOSS)
+    ),
+    "manifest.DatasetManifest.read": APIDocContract(
+        True, (_DETERMINISM, _MUTATION, _FAILURE)
+    ),
+    "shards.ShardWriter.write": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _RESUME,
+            _FAILURE,
+            _POWER_LOSS,
+        ),
+        min_words=90,
+        forbidden_patterns=_FALSE_STORAGE_DEVICE_CLAIMS,
+    ),
+    "shards._recover_ready_generation": APIDocContract(
+        True, (_DEVICE, _MUTATION, _RESUME, _FAILURE, _POWER_LOSS)
+    ),
+    "shards.stream_samples": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _DISTRIBUTED,
+            _CACHE,
+            _FAILURE,
+        ),
+        forbidden_patterns=_FALSE_STORAGE_DEVICE_CLAIMS,
+    ),
+    "shards._resolve_cached_shard": APIDocContract(
+        True, (_DEVICE, _MUTATION, _DETERMINISM, _CACHE, _FAILURE)
+    ),
+    "shards.sample_ids_for_partition": APIDocContract(
+        True, (_DEVICE, _MUTATION, _DETERMINISM, _DISTRIBUTED, _FAILURE)
+    ),
+    "shards.bucketed_batches": APIDocContract(
+        True,
+        (_DEVICE, _DTYPE, _FRAME, _UNITS, _MASK, _MUTATION, _DETERMINISM, _FAILURE),
+    ),
+    "datamodule._ShardBatchDataset.__iter__": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _DISTRIBUTED,
+            _FAILURE,
+        ),
+    ),
+    "datamodule.ECloudDataModule.setup": APIDocContract(
+        True, (_DEVICE, _MUTATION, _CHECKPOINT, _FAILURE)
+    ),
+    "datamodule.ECloudDataModule.set_epoch": APIDocContract(
+        True, (_DEVICE, _MUTATION, _DETERMINISM, _DISTRIBUTED, _FAILURE)
+    ),
+    "datamodule.ECloudDataModule.state_dict": APIDocContract(
+        False, (_DEVICE, _MUTATION, _DETERMINISM, _CHECKPOINT)
+    ),
+    "datamodule.ECloudDataModule.load_state_dict": APIDocContract(
+        True, (_DEVICE, _MUTATION, _DETERMINISM, _CHECKPOINT, _FAILURE)
+    ),
+    "diffgui_lmdb.DiffGuiLMDBImporter.from_config": APIDocContract(
+        True, (_DEVICE, _MUTATION, _DETERMINISM, _FAILURE)
+    ),
+    "diffgui_lmdb.DiffGuiLMDBImporter.__iter__": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+        ),
+    ),
+    "diffgui_lmdb.DiffGuiLMDBImporter.iter_samples": APIDocContract(
+        True,
+        (
+            _DEVICE,
+            _DTYPE,
+            _SHAPE,
+            _FRAME,
+            _UNITS,
+            _MASK,
+            _MUTATION,
+            _DETERMINISM,
+            _FAILURE,
+        ),
+    ),
+}
+DESIGNATED_APIS = frozenset(API_DOC_CONTRACTS)
 
 
 def check_paths(paths: Iterable[Path], designated: set[str] | None = None) -> list[str]:
@@ -50,6 +232,8 @@ def check_paths(paths: Iterable[Path], designated: set[str] | None = None) -> li
         DESIGNATED_APIS if designated is None else frozenset(designated)
     )
     errors: list[str] = []
+    found_designated: set[str] = set()
+    inspected_modules: dict[str, Path] = {}
     for path in paths:
         text = path.read_text(encoding="utf-8")
         for token in tokenize.generate_tokens(io.StringIO(text).readline):
@@ -57,6 +241,7 @@ def check_paths(paths: Iterable[Path], designated: set[str] | None = None) -> li
                 errors.append(f"{path}:{token.start[0]} English-only comments required")
         tree = ast.parse(text, filename=str(path))
         module = path.stem
+        inspected_modules[module] = path
         qualified_names = _qualified_function_names(tree, module)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -67,6 +252,7 @@ def check_paths(paths: Iterable[Path], designated: set[str] | None = None) -> li
                         f"{path}:{node.lineno} English-only docstrings required"
                     )
                 if name in selected_designated:
+                    found_designated.add(name)
                     parameter_names = [
                         argument.arg
                         for argument in (
@@ -87,6 +273,41 @@ def check_paths(paths: Iterable[Path], designated: set[str] | None = None) -> li
                     for field in REQUIRED_FIELDS[1:]:
                         if field not in doc:
                             errors.append(f"{path}:{node.lineno} missing {field}")
+                    contract = API_DOC_CONTRACTS.get(
+                        name,
+                        APIDocContract(require_raises=False, topics=(), min_words=20),
+                    )
+                    word_count = len(re.findall(r"[A-Za-z][A-Za-z0-9_-]*", doc))
+                    if word_count < contract.min_words:
+                        errors.append(
+                            f"{path}:{node.lineno} substantive documentation required "
+                            f"({word_count} < {contract.min_words} words)"
+                        )
+                    if contract.require_raises and not re.search(
+                        r"(?m)^\s*:raises\s+[^:]+:", doc
+                    ):
+                        errors.append(f"{path}:{node.lineno} missing :raises semantics")
+                    for topic in contract.topics:
+                        if not any(
+                            re.search(pattern, doc, flags=re.IGNORECASE | re.DOTALL)
+                            for pattern in topic.patterns
+                        ):
+                            errors.append(
+                                f"{path}:{node.lineno} missing semantic topic {topic.name}"
+                            )
+                    if any(
+                        re.search(pattern, doc, flags=re.IGNORECASE | re.DOTALL)
+                        for pattern in contract.forbidden_patterns
+                    ):
+                        errors.append(
+                            f"{path}:{node.lineno} false canonical CPU/device claim"
+                        )
+    for name in sorted(selected_designated - found_designated):
+        module = name.split(".", 1)[0]
+        if module in inspected_modules:
+            errors.append(
+                f"{inspected_modules[module]}: designated API not found: {name}"
+            )
     return errors
 
 

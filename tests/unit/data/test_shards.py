@@ -213,6 +213,102 @@ def test_publication_state_machine_recovers_every_crash_boundary_without_replay(
     assert len(tuple((tmp_path / "generations").iterdir())) == 1
 
 
+def test_publication_uses_durable_hooks_in_state_machine_order(
+    fixture_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shard, READY, promotion, manifest, and marker durability stay ordered."""
+    import ecloudflow.data.shards as shard_module
+    from ecloudflow.data import durability
+
+    events: list[tuple[str, str, str]] = []
+    original_sync = durability.sync_file
+    original_replace = durability.durable_replace
+    original_unlink = durability.durable_unlink
+    original_state = shard_module._set_active_generation
+
+    def sync(stream) -> None:
+        events.append(("sync", Path(stream.name).name, ""))
+        original_sync(stream)
+
+    def replace_path(source: Path, destination: Path) -> None:
+        events.append(
+            ("replace", Path(destination).name, Path(destination).parent.name)
+        )
+        original_replace(source, destination)
+
+    def unlink_path(path: Path, *, missing_ok: bool = False) -> None:
+        events.append(("unlink", Path(path).name, Path(path).parent.name))
+        original_unlink(path, missing_ok=missing_ok)
+
+    def set_state(
+        output_dir: Path,
+        generation_id: str,
+        config_fingerprint: str,
+        *,
+        state: str,
+    ) -> None:
+        events.append(("state", state, ""))
+        original_state(
+            output_dir,
+            generation_id,
+            config_fingerprint,
+            state=state,
+        )
+
+    monkeypatch.setattr(durability, "sync_file", sync)
+    monkeypatch.setattr(durability, "durable_replace", replace_path)
+    monkeypatch.setattr(durability, "durable_unlink", unlink_path)
+    monkeypatch.setattr(shard_module, "_set_active_generation", set_state)
+    ShardWriter(max_samples_per_shard=1).write(_samples(fixture_dir, 1), tmp_path)
+
+    shard_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[0] == "replace" and event[1].endswith(".tar")
+    )
+    ready_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[:2] == ("replace", "publication.json")
+    )
+    promotion_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[0] == "replace" and event[2] == "generations"
+    )
+    manifest_index = next(
+        index
+        for index, event in enumerate(events)
+        if event == ("replace", "manifest.json", tmp_path.name)
+    )
+    unlink_index = events.index(("unlink", "active.json", ".staging"))
+    ready_state_index = events.index(("state", "ready", ""))
+    promoted_state_index = events.index(("state", "promoted", ""))
+    published_state_index = events.index(("state", "published", ""))
+    staging_state_index = events.index(("state", "staging", ""))
+    assert (
+        staging_state_index
+        < shard_index
+        < ready_index
+        < ready_state_index
+        < promotion_index
+        < promoted_state_index
+        < manifest_index
+        < published_state_index
+        < unlink_index
+    )
+    for published_name in ("shard-000000.tar", "publication.json", "manifest.json"):
+        replace_index = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "replace" and event[1] == published_name
+        )
+        assert any(
+            event[0] == "sync" and event[1] == f"{published_name}.partial"
+            for event in events[:replace_index]
+        )
+
+
 def test_size_boundary_checkpoint_never_claims_an_unwritten_candidate(
     fixture_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

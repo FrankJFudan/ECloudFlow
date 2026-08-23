@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ecloudflow.data import durability
 from ecloudflow.data.splits import SplitAudit
 
 
@@ -251,19 +251,22 @@ class DatasetManifest:
         immutable generation paths. Bytes are written to a sibling ``.partial``
         file, flushed and ``fsync``-ed, then atomically replaced. Readers see
         either the previous complete manifest or this complete manifest, never
-        a mixed generation. The method mutates only the destination filesystem;
-        it does not alter this frozen record, shard tensors, coordinate frames,
-        devices, dtypes, masks, or source data.
+        a mixed generation after process failure. The destination directory is
+        then durably flushed (POSIX ``fsync`` or Windows
+        ``FlushFileBuffers``/write-through replacement), so successful return
+        also covers the manifest directory entry across power loss. Unsupported
+        durability fails explicitly through ``OSError``. The method mutates only
+        the destination filesystem; it does not alter this frozen record, shard
+        tensors, coordinate frames, devices, dtypes, masks, or source data.
         """
         destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        durability.durable_mkdir(destination.parent, parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".partial")
         encoded = json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
         with temporary.open("w", encoding="utf-8", newline="\n") as stream:
             stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
+            durability.sync_file(stream)
+        durability.durable_replace(temporary, destination)
 
     @classmethod
     def read(cls, path: str | Path) -> DatasetManifest:
@@ -282,7 +285,8 @@ class DatasetManifest:
         Loading performs no shard decoding, tensor/device transfer, or file
         mutation. Constructor validation requires grouped assignments and audit
         inputs to cover exactly the serialized sample IDs and rejects unsafe
-        shard paths before callers resolve them.
+        shard paths before callers resolve them. Canonical JSON and ordered
+        records reconstruct deterministically to the same manifest hash.
         """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         expected_hash = data.pop("hash", None)

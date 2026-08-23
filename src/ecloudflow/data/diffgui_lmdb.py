@@ -74,6 +74,8 @@ class DiffGuiLMDBImporter:
         existence and source requirements are checked lazily during iteration.
         It does not decode tensors, choose devices/dtypes, or alter coordinate
         frames, angstrom units, chemical masks, the LMDB, or source repository.
+        Equal frozen configuration and callbacks deterministically produce the
+        same importer policy; byte order is resolved only during iteration.
         """
         if config.diffgui_lmdb is None:
             raise DataValidationError("data.diffgui_lmdb must be configured")
@@ -97,9 +99,11 @@ class DiffGuiLMDBImporter:
         A fresh read-only LMDB environment is opened for each iteration. No
         lock, migration flag, source tensor, or external repository file is
         modified. Byte-sorted keys deterministically define order. Records are
-        revalidated during canonical construction, preserving ``[N, 3]`` local
-        binding-frame angstrom coordinates, floating dtype/device, graph/field
-        tensors, chemical masks, formal charges, stereochemistry, and provenance.
+        revalidated during canonical construction. Official source reparsing
+        yields CPU ``[N, 3]`` local binding-frame angstrom coordinates while
+        preserving dtype, graph/field tensors, chemical masks, formal charges,
+        stereochemistry, and provenance. A custom converter owns its device
+        policy; downstream shard serialization canonicalizes storage onto CPU.
         """
         yield from self.iter_samples()
 
@@ -116,9 +120,11 @@ class DiffGuiLMDBImporter:
         Byte-sorted cursor order is deterministic. Official records are reparsed
         from read-only protein/ligand sources to recover stereochemistry, formal
         charge, and pose; custom converters must return ``ComplexSample``.
-        Conversion preserves local ``[N, 3]`` angstrom frames, tensor
-        dtype/device, graph/field masks, and provenance and never updates LMDB
-        bytes, lock files, source files, or caller-owned decoded mappings.
+        Official conversion produces CPU local ``[N, 3]`` angstrom frames while
+        preserving tensor dtype, graph/field masks, and provenance. Custom
+        converters may choose a device, but shard persistence later maps tensors
+        to canonical CPU storage. Neither path updates LMDB bytes, lock files,
+        source files, or caller-owned decoded mappings.
         """
         if not self.path.exists():
             raise DataValidationError(f"DiffGui LMDB does not exist: {self.path}")

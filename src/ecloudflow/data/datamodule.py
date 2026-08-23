@@ -48,16 +48,21 @@ class _ShardBatchDataset(IterableDataset[list[ComplexSample]]):
 
         :return: Iterator of node-count bucketed canonical sample lists.
         :rtype: Iterator[list[ComplexSample]]
+        :raises ValueError: If rank/worker, batching, or shuffle settings are invalid.
+        :raises ShardReadError: If an owned shard, cache entry, or payload fails
+            hash, archive, member-index, or canonical validation.
 
         Distributed identity is read inside each worker. The shared epoch value
         is read when iteration begins, so persistent worker processes observe a
         later :meth:`ECloudDataModule.set_epoch` call without loader recreation.
         Whole-shard ownership is preferred; sparse shards use indexed members
         and never deserialize samples owned by another rank or worker. Returned
-        complexes preserve ``[N, 3]`` local binding-frame coordinates in
-        angstroms, floating dtype/device, graph features, chemical/field masks,
-        and provenance. The worker mutates only its iterator/bucket state and an
-        optional verified cache; manifest mappings and samples remain immutable.
+        complexes are canonical CPU records with ``[N, 3]`` local binding-frame
+        coordinates in angstroms; floating dtype, shape, graph features,
+        chemical/field masks, and provenance are preserved. Accelerator transfer
+        is a later training-loop responsibility. The worker mutates only its
+        iterator/bucket state and optional verified cache; manifest mappings and
+        samples remain immutable.
         """
         worker = get_worker_info()
         worker_id, worker_count = (worker.id, worker.num_workers) if worker else (0, 1)
@@ -247,8 +252,9 @@ class ECloudDataModule(LightningDataModule):
 
         The method performs no filesystem mutation. A manifest hash is absent
         only when Lightning requests state before :meth:`setup`.
-        Returned values contain no tensors/devices and are stable across ranks
-        for equal epoch and manifest; callers receive a new mutable dictionary.
+        Returned values contain no tensors/devices and are deterministically
+        stable across ranks for equal epoch and manifest; callers receive a new
+        mutable dictionary.
         """
         return {
             "epoch": self.epoch,
@@ -273,8 +279,12 @@ class ECloudDataModule(LightningDataModule):
         """
         expected = state_dict.get("manifest_hash")
         if expected is not None and not isinstance(expected, str):
+            self.manifest = None
+            self.paths = ()
             raise DataValidationError("checkpoint manifest hash must be textual")
         self._pending_manifest_hash = expected
         if self.manifest is not None and expected not in (None, self.manifest.hash):
+            self.manifest = None
+            self.paths = ()
             raise DataValidationError("checkpoint dataset manifest hash mismatch")
         self.set_epoch(int(state_dict.get("epoch", 0)))

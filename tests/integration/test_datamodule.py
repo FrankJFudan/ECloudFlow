@@ -193,3 +193,31 @@ def test_checkpoint_hash_loaded_before_setup_is_validated_later(
     )
     second.setup()
     assert second.manifest is not None
+
+
+def test_checkpoint_mismatch_after_setup_invalidates_loader_state(
+    tmp_path: Path,
+) -> None:
+    """A caught post-setup restore mismatch cannot reuse the loaded dataset."""
+    template = _template()
+    dataset_root, other_root = tmp_path / "dataset", tmp_path / "other"
+    ShardWriter().write([replace(template, source_id="dataset")], dataset_root)
+    ShardWriter().write([replace(template, source_id="other")], other_root)
+    module = ECloudDataModule(
+        DataConfig(shard_dir=str(dataset_root), num_workers=0, pin_memory=False)
+    )
+    module.setup()
+    valid_hash = module.state_dict()["manifest_hash"]
+    other_hash = DatasetManifest.read(other_root / "manifest.json").hash
+
+    with pytest.raises(DataValidationError, match="manifest hash mismatch"):
+        module.load_state_dict({"epoch": 1, "manifest_hash": other_hash})
+    assert module.manifest is None
+    assert module.paths == ()
+    with pytest.raises(DataValidationError, match="manifest hash mismatch"):
+        module.train_dataloader()
+
+    module.load_state_dict({"epoch": 1, "manifest_hash": valid_hash})
+    module.setup()
+    assert module.manifest is not None
+    assert module.epoch == 1

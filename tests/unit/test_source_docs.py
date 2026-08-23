@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from tools.check_python_docs import DESIGNATED_APIS, check_paths
+from tools.check_python_docs import API_DOC_CONTRACTS, DESIGNATED_APIS, check_paths
 
 
 def test_checker_rejects_cjk_comment_and_incomplete_core_docstring(tmp_path: Path):
@@ -22,6 +22,11 @@ def test_checker_rejects_cjk_comment_and_incomplete_core_docstring(tmp_path: Pat
 def test_task7_designated_apis_keep_detailed_sphinx_contracts() -> None:
     """Task 7 scientific and distributed public contracts stay documented."""
     required = {
+        "durability.sync_file",
+        "durability.flush_directory",
+        "durability.durable_replace",
+        "durability.durable_unlink",
+        "durability.durable_mkdir",
         "types.QMProvenance.__reduce__",
         "types.SampleProvenance.__reduce__",
         "types.ComplexSample.__reduce__",
@@ -47,6 +52,7 @@ def test_task7_designated_apis_keep_detailed_sphinx_contracts() -> None:
     assert required <= DESIGNATED_APIS
     root = Path(__file__).resolve().parents[2]
     paths = [
+        root / "src/ecloudflow/data/durability.py",
         root / "src/ecloudflow/core/types.py",
         root / "src/ecloudflow/data/splits.py",
         root / "src/ecloudflow/data/manifest.py",
@@ -55,3 +61,64 @@ def test_task7_designated_apis_keep_detailed_sphinx_contracts() -> None:
         root / "src/ecloudflow/data/diffgui_lmdb.py",
     ]
     assert check_paths(paths, designated=required) == []
+
+
+def test_checker_rejects_missing_designated_api(tmp_path: Path) -> None:
+    """A registry entry must resolve to a real module-qualified callable."""
+    source = tmp_path / "missing.py"
+    source.write_text('"""No designated function exists."""\n', encoding="utf-8")
+    errors = check_paths([source], designated={"missing.core_step"})
+    assert any("designated API not found" in error for error in errors)
+
+
+def test_checker_rejects_placeholder_and_missing_semantic_contracts(
+    tmp_path: Path,
+) -> None:
+    """Formal fields alone cannot satisfy a scientific API contract."""
+    source = tmp_path / "shards.py"
+    source.write_text(
+        "class ShardWriter:\n"
+        "    def write(self, samples, output_dir, *, split=None):\n"
+        '        """Placeholder.\n\n'
+        "        :param samples: Value.\n"
+        "        :param output_dir: Value.\n"
+        "        :param split: Value.\n"
+        "        :return: Value.\n"
+        "        :rtype: object\n"
+        '        """\n'
+        "        return object()\n",
+        encoding="utf-8",
+    )
+    errors = check_paths([source], designated={"shards.ShardWriter.write"})
+    assert any("substantive documentation" in error for error in errors)
+    assert any("missing :raises" in error for error in errors)
+    for topic in ("device", "dtype", "mutation", "determinism", "resume", "failure"):
+        assert any(f"missing semantic topic {topic}" in error for error in errors)
+
+
+def test_checker_rejects_false_canonical_device_claim(tmp_path: Path) -> None:
+    """Shard persistence may not claim to preserve accelerator placement."""
+    assert API_DOC_CONTRACTS["shards.ShardWriter.write"].forbidden_patterns
+    body = (
+        "CPU dtype shape frame mask mutation deterministic resume failure power loss "
+        "validation checkpoint cache worker publication recovery angstrom metadata "
+    )
+    source = tmp_path / "shards.py"
+    source.write_text(
+        "class ShardWriter:\n"
+        "    def write(self, samples, output_dir, *, split=None):\n"
+        '        """Persist deterministic data.\n\n'
+        "        :param samples: Canonical samples.\n"
+        "        :param output_dir: Dataset path.\n"
+        "        :param split: Optional split.\n"
+        "        :return: Manifest.\n"
+        "        :rtype: object\n"
+        "        :raises RuntimeError: On failure.\n\n"
+        f"        {body} Tensors preserve their original device and are never moved to CPU. "
+        "This detailed placeholder describes validation and publication behavior repeatedly.\n"
+        '        """\n'
+        "        return object()\n",
+        encoding="utf-8",
+    )
+    errors = check_paths([source], designated={"shards.ShardWriter.write"})
+    assert any("false canonical CPU/device claim" in error for error in errors)
