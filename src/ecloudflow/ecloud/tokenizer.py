@@ -34,7 +34,8 @@ class EquivariantFieldTokenizer(nn.Module):  # type: ignore[misc]
     ``MolecularState.electron_latent`` graph contract. For ``lmax=2``,
     ``latent_dim=48``, and ``vector_dim=8``, the exact layout is
     ``19x0e + 8x1o + 1x2e``. The retained higher-order copies prevent an
-    orientation-bearing input order from being silently discarded.
+    orientation-bearing input order from being silently discarded, and every
+    configured order has explicit latent capacity.
 
     Coefficients use Task 4 units of electrons per angstrom to power ``3/2``.
     Atom features are invariant, unitless graph channels. Every tensor stays
@@ -77,7 +78,6 @@ class EquivariantFieldTokenizer(nn.Module):  # type: ignore[misc]
         self.scalar_dim = scalar_dim
         self.vector_dim = vector_dim
         self.latent_dim = latent_dim
-        self.latent_irreps = self.decoder.latent_irreps
         self.coefficient_irreps = self.decoder.coefficient_irreps
         hidden_entries = [(scalar_dim, (0, 1))]
         hidden_entries.extend(
@@ -92,6 +92,22 @@ class EquivariantFieldTokenizer(nn.Module):  # type: ignore[misc]
             nn.Linear(scalar_dim, vector_dim * lmax) if lmax > 0 else None
         )
         self.to_latent = o3.Linear(self.hidden_irreps, self.latent_irreps, biases=True)
+
+    @property
+    def latent_irreps(self) -> o3.Irreps:
+        """Return the exact packed output representation used by Task 10.
+
+        :return: e3nn irreps of total component width ``C``. With
+            ``K=sum(l=2..lmax, 2*l+1)``, scalar multiplicity is ``S=C-3*V-K``
+            and layout is ``Sx0e + Vx1o + 1x2e + ... + 1xlmax`` with parity
+            ``(-1)**l``. The planned ``C=48``, ``V=8``, ``lmax=2`` layout is
+            ``19x0e + 8x1o + 1x2e``; every configured higher order is retained.
+        :rtype: e3nn.o3.Irreps
+
+        Immutable representation metadata has no tensor dtype/device, mutation,
+        random operation, or autograd edge.
+        """
+        return self.decoder.latent_irreps
 
     def forward(
         self,
@@ -131,19 +147,28 @@ class EquivariantFieldTokenizer(nn.Module):  # type: ignore[misc]
         preserves gradients to physical coefficient and feature rows; masked
         rows receive exactly zero gradient through their values. Input shape,
         dtype, and centered coordinate frame semantics are validated explicitly.
+        For ``C=48``, ``V=8``, and ``lmax=2``, :attr:`latent_irreps` is
+        ``19x0e + 8x1o + 1x2e`` and every configured higher order is retained.
         """
         _validate_encode_inputs(self, coefficients, atom_features, mask)
         parameter = next(self.parameters())
         dtype = parameter.dtype
         if dtype in (torch.float16, torch.bfloat16):
             dtype = torch.float32
-        physical = mask.unsqueeze(-1).to(dtype=dtype)
+        coefficient_mask = mask[..., None, None]
+        feature_mask = mask[..., None]
+        safe_coefficients = torch.where(
+            coefficient_mask, coefficients, torch.zeros_like(coefficients)
+        )
+        safe_features = torch.where(
+            feature_mask, atom_features, torch.zeros_like(atom_features)
+        )
         with torch.autocast(device_type=coefficients.device.type, enabled=False):
             packed = _pack_coefficients(
-                coefficients.to(dtype=dtype), self.n_radial, self.lmax
+                safe_coefficients.to(dtype=dtype), self.n_radial, self.lmax
             )
-            hidden = self.field_linear(packed * physical)
-            conditioned = self.atom_conditioning(atom_features.to(dtype=dtype))
+            hidden = self.field_linear(packed)
+            conditioned = self.atom_conditioning(safe_features.to(dtype=dtype))
             scalar_stop = self.scalar_dim
             scalars = functional.silu(hidden[..., :scalar_stop] + conditioned)
             blocks = [scalars]
@@ -161,8 +186,13 @@ class EquivariantFieldTokenizer(nn.Module):  # type: ignore[misc]
                     blocks.append(block * order_gates)
                     offset += width
                     gate_offset += self.vector_dim
-            activated = torch.cat(blocks, dim=-1) * physical
-            return self.to_latent(activated) * physical
+            activated = torch.where(
+                feature_mask,
+                torch.cat(blocks, dim=-1),
+                torch.zeros((), dtype=dtype, device=coefficients.device),
+            )
+            latent = self.to_latent(activated)
+            return torch.where(feature_mask, latent, torch.zeros_like(latent))
 
     def encode(
         self,
@@ -186,6 +216,8 @@ class EquivariantFieldTokenizer(nn.Module):  # type: ignore[misc]
         Units, explicit padded-to-packed conversion, float32 mixed-precision
         behavior, non-mutation, deterministic evaluation, SE(3) semantics,
         and gradient behavior are exactly those documented by :meth:`forward`.
+        For ``C=48``, ``V=8``, and ``lmax=2``, :attr:`latent_irreps` is
+        ``19x0e + 8x1o + 1x2e`` and every configured higher order is retained.
         """
         return self.forward(coefficients, atom_features, mask)
 
@@ -218,6 +250,8 @@ class EquivariantFieldTokenizer(nn.Module):  # type: ignore[misc]
         Rotation/translation behavior, units, and padding semantics follow
         :class:`ElectronFieldDecoder` and :class:`ElectronReconstruction`.
         Evaluation is deterministic for fixed parameters and tensor inputs.
+        For ``C=48``, ``V=8``, and ``lmax=2``, the packed layout is
+        ``19x0e + 8x1o + 1x2e`` and every configured higher order is retained.
         """
         return self.decoder.decode(latent, centers, query_grid, mask)
 
@@ -268,19 +302,19 @@ def _validate_encode_inputs(
         raise ValueError("atom feature shape must be [B, N, F] with F > 0.")
     if mask.shape != coefficients.shape[:2] or mask.dtype != torch.bool:
         raise ValueError("mask must be a boolean tensor with shape [B, N].")
-    for name, tensor in (
-        ("coefficients", coefficients),
-        ("atom_features", atom_features),
-    ):
-        if not tensor.is_floating_point():
-            raise ValueError(f"{name} must have a floating dtype.")
-        if not bool(torch.isfinite(tensor).all()):
-            raise ValueError(f"{name} must contain only finite values.")
     if (
         coefficients.device != atom_features.device
         or mask.device != coefficients.device
     ):
         raise ValueError("coefficients, atom_features, and mask must share one device.")
+    for name, tensor, physical in (
+        ("coefficients", coefficients, coefficients[mask]),
+        ("atom_features", atom_features, atom_features[mask]),
+    ):
+        if not tensor.is_floating_point():
+            raise ValueError(f"{name} must have a floating dtype.")
+        if not bool(torch.isfinite(physical).all()):
+            raise ValueError(f"physical {name} rows must contain only finite values.")
     parameter = next(module.parameters())
     if parameter.device != coefficients.device:
         raise ValueError("tokenizer parameters and inputs must use the same device.")

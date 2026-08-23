@@ -69,6 +69,9 @@ _CHECKPOINT = _topic("checkpoint", r"checkpoint", r"manifest hash", r"restore")
 _GRADIENT = _topic("gradient", r"gradient", r"autograd", r"differentiab")
 _IRREP = _topic("irrep", r"irrep", r"0e", r"1o", r"spherical-harmonic")
 _CHUNK = _topic("chunk", r"chunk")
+_LATENT_LAYOUT = _topic(
+    "latent-layout", r"19x0e\s*\+\s*8x1o\s*\+\s*1x2e.*every configured"
+)
 _PLACEMENT_RETENTION_VERB = (
     r"(?:preserv\w*|retain\w*|keep\w*|kept|maintain\w*|remain\w*|stay\w*)"
 )
@@ -107,6 +110,7 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
             _FAILURE,
             _GRADIENT,
             _IRREP,
+            _LATENT_LAYOUT,
         ),
         min_words=100,
     ),
@@ -124,6 +128,7 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
             _FAILURE,
             _GRADIENT,
             _IRREP,
+            _LATENT_LAYOUT,
         ),
         min_words=55,
     ),
@@ -141,6 +146,7 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
             _FAILURE,
             _GRADIENT,
             _IRREP,
+            _LATENT_LAYOUT,
             _CHUNK,
         ),
         min_words=70,
@@ -159,6 +165,7 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
             _FAILURE,
             _GRADIENT,
             _IRREP,
+            _LATENT_LAYOUT,
             _CHUNK,
         ),
         min_words=110,
@@ -177,9 +184,16 @@ API_DOC_CONTRACTS: dict[str, APIDocContract] = {
             _FAILURE,
             _GRADIENT,
             _IRREP,
+            _LATENT_LAYOUT,
             _CHUNK,
         ),
         min_words=60,
+    ),
+    "tokenizer.EquivariantFieldTokenizer.latent_irreps": APIDocContract(
+        False, (_IRREP, _LATENT_LAYOUT), min_words=40
+    ),
+    "decoder.ElectronFieldDecoder.latent_irreps": APIDocContract(
+        False, (_IRREP, _LATENT_LAYOUT), min_words=40
     ),
     "durability.sync_file": APIDocContract(True, (_MUTATION, _FAILURE, _POWER_LOSS)),
     "durability.flush_directory": APIDocContract(

@@ -71,8 +71,10 @@ def test_task8_designated_apis_keep_scientific_tensor_contracts() -> None:
         "tokenizer.EquivariantFieldTokenizer.forward",
         "tokenizer.EquivariantFieldTokenizer.encode",
         "tokenizer.EquivariantFieldTokenizer.decode",
+        "tokenizer.EquivariantFieldTokenizer.latent_irreps",
         "decoder.ElectronFieldDecoder.forward",
         "decoder.ElectronFieldDecoder.decode",
+        "decoder.ElectronFieldDecoder.latent_irreps",
     }
     assert required <= DESIGNATED_APIS
     root = Path(__file__).resolve().parents[2]

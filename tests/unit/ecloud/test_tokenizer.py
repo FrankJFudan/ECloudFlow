@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
+import math
+
 import pytest
 import torch
 from e3nn import o3
 
+from ecloudflow.ecloud.decoder import ElectronFieldDecoder
 from ecloudflow.ecloud.tokenizer import EquivariantFieldTokenizer
 
 
@@ -29,8 +33,10 @@ def _rotation() -> torch.Tensor:
 def _rotate_coefficients(
     coefficients: torch.Tensor, rotation: torch.Tensor
 ) -> torch.Tensor:
+    lmax = math.isqrt(coefficients.shape[-1]) - 1
+    assert (lmax + 1) ** 2 == coefficients.shape[-1]
     blocks = []
-    for order in range(3):
+    for order in range(lmax + 1):
         block = coefficients[..., order**2 : (order + 1) ** 2]
         transform = o3.Irrep(order, (-1) ** order).D_from_matrix(rotation)
         blocks.append(block @ transform.T)
@@ -147,6 +153,68 @@ def test_pure_quadrupole_input_reaches_latent_and_decoded_field() -> None:
     assert torch.allclose(rotated.density, reconstruction.density, atol=3e-4, rtol=3e-4)
 
 
+def test_pure_octupole_input_reaches_generic_lmax3_latent_and_field() -> None:
+    generator = torch.Generator().manual_seed(97)
+    coefficients = torch.zeros(1, 3, 2, 16)
+    coefficients[..., 9:] = torch.randn(1, 3, 2, 7, generator=generator)
+    features = torch.randn(1, 3, 9, generator=generator)
+    centers = torch.randn(1, 3, 3, generator=generator) * 0.3
+    queries = torch.randn(1, 9, 3, generator=generator) * 0.6
+    mask = torch.tensor([[True, True, False]])
+    tokenizer = EquivariantFieldTokenizer(
+        n_radial=2,
+        lmax=3,
+        scalar_dim=12,
+        vector_dim=2,
+        latent_dim=24,
+        cutoff=3.0,
+    )
+    rotation = _rotation()
+
+    latent = tokenizer(coefficients, features, mask)
+    reconstruction = tokenizer.decode(latent, centers, queries, mask)
+    scalar_only = tokenizer.decode(
+        tokenizer(torch.zeros_like(coefficients), features, mask),
+        centers,
+        queries,
+        mask,
+    )
+    rotated_latent = tokenizer(
+        _rotate_coefficients(coefficients, rotation), features, mask
+    )
+    rotated = tokenizer.decode(
+        rotated_latent, centers @ rotation.T, queries @ rotation.T, mask
+    )
+
+    assert tokenizer.latent_irreps == o3.Irreps("6x0e + 2x1o + 1x2e + 1x3o")
+    octupole_slice = tokenizer.latent_irreps.slices()[-1]
+    assert torch.count_nonzero(latent[..., octupole_slice]) > 0
+    assert not torch.allclose(reconstruction.density, scalar_only.density)
+    transform = tokenizer.latent_irreps.D_from_matrix(rotation)
+    assert torch.allclose(rotated_latent, latent @ transform.T, atol=4e-4, rtol=4e-4)
+    assert torch.allclose(rotated.density, reconstruction.density, atol=4e-4, rtol=4e-4)
+
+
+def test_layout_rejects_width_that_cannot_retain_lmax3_irreps() -> None:
+    with pytest.raises(ValueError, match="retain every configured higher irrep"):
+        EquivariantFieldTokenizer(
+            n_radial=2,
+            lmax=3,
+            scalar_dim=12,
+            vector_dim=2,
+            latent_dim=18,
+        )
+
+
+def test_decoder_docs_bind_dynamic_layout_and_planned_example() -> None:
+    class_doc = inspect.getdoc(ElectronFieldDecoder) or ""
+    forward_doc = inspect.getdoc(ElectronFieldDecoder.forward) or ""
+    for doc in (class_doc, forward_doc):
+        assert "19x0e + 8x1o + 1x2e" in doc
+        assert "every configured" in doc
+        assert "(C-3V)x0e + Vx1o" not in doc
+
+
 def test_dipole_has_physical_translation_semantics() -> None:
     coefficients, features, centers, queries, mask = _inputs()
     tokenizer = EquivariantFieldTokenizer(
@@ -185,6 +253,81 @@ def test_padding_values_cannot_affect_any_reconstruction_output() -> None:
 
     for left, right in zip(reference, changed, strict=True):
         assert torch.equal(left, right)
+
+
+def test_extreme_finite_padding_is_sanitized_before_numerics_and_backward() -> None:
+    coefficients, features, centers, queries, mask = _inputs()
+    coefficients.requires_grad_()
+    features.requires_grad_()
+    centers.requires_grad_()
+    tokenizer = EquivariantFieldTokenizer(
+        n_radial=3, lmax=2, scalar_dim=16, vector_dim=4, latent_dim=24
+    )
+    reference_latent = tokenizer(coefficients, features, mask)
+    reference = tokenizer.decode(reference_latent, centers, queries, mask)
+    extreme = torch.finfo(coefficients.dtype).max
+
+    changed_coefficients = torch.where(
+        mask[..., None, None], coefficients.detach(), extreme
+    ).requires_grad_()
+    changed_features = torch.where(
+        mask[..., None], features.detach(), extreme
+    ).requires_grad_()
+    changed_centers = torch.where(
+        mask[..., None], centers.detach(), extreme
+    ).requires_grad_()
+    changed_latent = tokenizer(changed_coefficients, changed_features, mask)
+    changed_latent = torch.where(
+        mask[..., None], changed_latent, torch.full_like(changed_latent, extreme)
+    )
+    changed = tokenizer.decode(changed_latent, changed_centers, queries, mask)
+
+    assert torch.equal(reference_latent, tokenizer(coefficients, features, mask))
+    for left, right in zip(reference, changed, strict=True):
+        assert torch.equal(left, right)
+        assert torch.isfinite(right).all()
+
+    reference_loss = sum(value.square().mean() for value in reference)
+    changed_loss = sum(value.square().mean() for value in changed)
+    reference_grads = torch.autograd.grad(
+        reference_loss, (coefficients, features, centers, reference_latent)
+    )
+    changed_grads = torch.autograd.grad(
+        changed_loss,
+        (changed_coefficients, changed_features, changed_centers, changed_latent),
+    )
+    for reference_grad, changed_grad in zip(
+        reference_grads, changed_grads, strict=True
+    ):
+        assert torch.equal(reference_grad, changed_grad)
+        assert torch.isfinite(changed_grad).all()
+    assert torch.count_nonzero(changed_grads[0][~mask]) == 0
+    assert torch.count_nonzero(changed_grads[1][~mask]) == 0
+    assert torch.count_nonzero(changed_grads[2][~mask]) == 0
+    assert torch.count_nonzero(changed_grads[3][~mask]) == 0
+
+
+@pytest.mark.parametrize("extreme", [float("inf"), float("nan")])
+def test_nonfinite_padding_is_safe_substituted_without_zero_multiplication(
+    extreme: float,
+) -> None:
+    coefficients, features, centers, queries, mask = _inputs()
+    tokenizer = EquivariantFieldTokenizer(
+        n_radial=3, lmax=2, scalar_dim=16, vector_dim=4, latent_dim=24
+    )
+    reference_latent = tokenizer(coefficients, features, mask)
+    reference = tokenizer.decode(reference_latent, centers, queries, mask)
+    changed_coefficients = torch.where(mask[..., None, None], coefficients, extreme)
+    changed_features = torch.where(mask[..., None], features, extreme)
+    changed_centers = torch.where(mask[..., None], centers, extreme)
+    changed_latent = tokenizer(changed_coefficients, changed_features, mask)
+    changed_latent = torch.where(mask[..., None], changed_latent, extreme)
+    changed = tokenizer.decode(changed_latent, changed_centers, queries, mask)
+
+    assert torch.equal(changed_latent[mask], reference_latent[mask])
+    for left, right in zip(reference, changed, strict=True):
+        assert torch.equal(left, right)
+        assert torch.isfinite(right).all()
 
 
 def test_decoder_accumulates_float32_under_cpu_autocast() -> None:

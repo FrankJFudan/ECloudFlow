@@ -72,6 +72,10 @@ class ElectronFieldDecoder(nn.Module):  # type: ignore[misc]
     including returned gradients, remains differentiable unless the caller
     invokes it under ``torch.no_grad``. Boolean ``[B,N]`` masks suppress every
     padded token and center exactly before field or moment accumulation.
+    With ``K=sum(l=2..lmax, 2*l+1)``, scalar multiplicity is ``S=C-3*V-K`` and
+    the packed representation is ``Sx0e + Vx1o + 1x2e + ... + 1xlmax``. Thus
+    ``C=48``, ``V=8``, ``lmax=2`` gives ``19x0e + 8x1o + 1x2e``; every
+    configured higher order is retained explicitly.
     """
 
     def __init__(
@@ -94,7 +98,7 @@ class ElectronFieldDecoder(nn.Module):  # type: ignore[misc]
         higher_entries = [(1, (order, (-1) ** order)) for order in range(2, lmax + 1)]
         higher_width = sum(2 * order + 1 for order in range(2, lmax + 1))
         scalar_copies = latent_dim - 3 * vector_dim - higher_width
-        self.latent_irreps = o3.Irreps(
+        self._latent_irreps = o3.Irreps(
             [(scalar_copies, (0, 1)), (vector_dim, (1, -1)), *higher_entries]
         ).simplify()
         self.coefficient_irreps = o3.Irreps(
@@ -112,6 +116,22 @@ class ElectronFieldDecoder(nn.Module):  # type: ignore[misc]
             "dipole_integrals", _dipole_integrals(self.basis).to(torch.float32)
         )
 
+    @property
+    def latent_irreps(self) -> o3.Irreps:
+        """Return the dynamically packed latent representation.
+
+        :return: e3nn irreps of total component width ``C``. For
+            ``K=sum(l=2..lmax, 2*l+1)`` and ``S=C-3*V-K``, exact layout is
+            ``Sx0e + Vx1o + 1x2e + ... + 1xlmax`` with parity ``(-1)**l``.
+            The planned ``C=48``, ``V=8``, ``lmax=2`` instance is
+            ``19x0e + 8x1o + 1x2e``; every configured higher order is retained.
+        :rtype: e3nn.o3.Irreps
+
+        Immutable metadata has no tensor shape, dtype/device, mask, frame,
+        mutation, deterministic evaluation, or gradient side effect.
+        """
+        return self._latent_irreps
+
     def forward(
         self,
         latent: torch.Tensor,
@@ -121,9 +141,11 @@ class ElectronFieldDecoder(nn.Module):  # type: ignore[misc]
     ) -> ElectronReconstruction:
         """Decode atom tokens at query coordinates and reduce their moments.
 
-        :param latent: Padded tokens ``[B, N, C]`` on the module device in
-            packed ``(C-3V)x0e + Vx1o`` layout. Scalars are unitless learned
-            components and vector triples are expressed in the local frame.
+        :param latent: Padded tokens ``[B, N, C]`` on the module device. With
+            ``K=sum(l=2..lmax, 2*l+1)`` and ``S=C-3*V-K``, layout is
+            ``Sx0e + Vx1o + 1x2e + ... + 1xlmax``. For ``C=48``, ``V=8``,
+            ``lmax=2`` this is ``19x0e + 8x1o + 1x2e``; every configured
+            higher order is retained. Components use the local spatial frame.
         :param centers: Atom centers ``[B, N, 3]`` in angstroms in the same
             centered frame, floating dtype/device as ``query_grid``.
         :param query_grid: Query coordinates ``[B, G, 3]`` in angstroms.
@@ -155,17 +177,25 @@ class ElectronFieldDecoder(nn.Module):  # type: ignore[misc]
         dtype = parameter.dtype
         if dtype in (torch.float16, torch.bfloat16):
             dtype = torch.float32
+        atom_mask = mask[..., None]
+        safe_latent = torch.where(atom_mask, latent, torch.zeros_like(latent))
+        safe_centers = torch.where(atom_mask, centers, torch.zeros_like(centers))
         with torch.autocast(device_type=latent.device.type, enabled=False):
-            work_latent = latent.to(dtype=dtype)
-            work_centers = centers.to(dtype=dtype)
-            physical = mask.unsqueeze(-1).to(dtype=dtype)
-            masked_latent = work_latent * physical
-            packed_coefficients = self.to_coefficients(masked_latent)
+            work_latent = safe_latent.to(dtype=dtype)
+            work_centers = safe_centers.to(dtype=dtype)
+            packed_coefficients = self.to_coefficients(work_latent)
             coefficients = _unpack_coefficients(
                 packed_coefficients, self.n_radial, self.lmax
             )
-            coefficients = coefficients * physical.unsqueeze(-1)
-            round_trip = self.to_round_trip(packed_coefficients) * physical
+            coefficients = torch.where(
+                mask[..., None, None],
+                coefficients,
+                torch.zeros_like(coefficients),
+            )
+            round_trip = self.to_round_trip(packed_coefficients)
+            round_trip = torch.where(
+                atom_mask, round_trip, torch.zeros_like(round_trip)
+            )
             density, gradient = self._density_and_gradient(
                 coefficients, work_centers, query_grid.to(dtype=dtype)
             )
@@ -202,6 +232,8 @@ class ElectronFieldDecoder(nn.Module):  # type: ignore[misc]
         accumulation, chunking, deterministic behavior, mutation guarantees,
         padding semantics, irrep transformation, and gradients are identical
         to :meth:`forward`.
+        For ``C=48``, ``V=8``, and ``lmax=2``, :attr:`latent_irreps` is
+        ``19x0e + 8x1o + 1x2e`` and every configured higher order is retained.
         """
         return self.forward(latent, centers, query_grid, mask)
 
@@ -253,14 +285,12 @@ class ElectronFieldDecoder(nn.Module):  # type: ignore[misc]
                 coefficients[..., self.basis.l_slice(1)],
                 self.dipole_integrals.to(coefficients),
             )
-        physical = mask.to(dtype=coefficients.dtype)
-        count = torch.sum(per_atom_count * physical, dim=1)
-        dipole = torch.sum(
-            (local_dipole + per_atom_count.unsqueeze(-1) * centers)
-            * physical.unsqueeze(-1),
-            dim=1,
+        safe_count = torch.where(mask, per_atom_count, torch.zeros_like(per_atom_count))
+        per_atom_dipole = local_dipole + per_atom_count.unsqueeze(-1) * centers
+        safe_dipole = torch.where(
+            mask[..., None], per_atom_dipole, torch.zeros_like(per_atom_dipole)
         )
-        return count, dipole
+        return torch.sum(safe_count, dim=1), torch.sum(safe_dipole, dim=1)
 
 
 def _dipole_integrals(basis: SphericalFieldBasis) -> torch.Tensor:
@@ -351,20 +381,20 @@ def _validate_decode_inputs(
         raise ValueError("query_grid must contain at least one query point.")
     if mask.shape != latent.shape[:2] or mask.dtype != torch.bool:
         raise ValueError("mask must be a boolean tensor with shape [B, N].")
-    for name, tensor in (
-        ("latent", latent),
-        ("centers", centers),
-        ("query_grid", query_grid),
-    ):
-        if not tensor.is_floating_point():
-            raise ValueError(f"{name} must have a floating dtype.")
-        if not bool(torch.isfinite(tensor).all()):
-            raise ValueError(f"{name} must contain only finite values.")
-    if centers.dtype != query_grid.dtype:
-        raise ValueError("centers and query_grid must have the same dtype.")
     devices = {latent.device, centers.device, query_grid.device, mask.device}
     if len(devices) != 1:
         raise ValueError("latent, centers, query_grid, and mask must share one device.")
+    for name, tensor, physical in (
+        ("latent", latent, latent[mask]),
+        ("centers", centers, centers[mask]),
+        ("query_grid", query_grid, query_grid),
+    ):
+        if not tensor.is_floating_point():
+            raise ValueError(f"{name} must have a floating dtype.")
+        if not bool(torch.isfinite(physical).all()):
+            raise ValueError(f"physical {name} values must contain only finite values.")
+    if centers.dtype != query_grid.dtype:
+        raise ValueError("centers and query_grid must have the same dtype.")
     parameter = next(module.parameters())
     if parameter.device != latent.device:
         raise ValueError("decoder parameters and inputs must use the same device.")
