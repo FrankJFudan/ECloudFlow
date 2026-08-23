@@ -457,7 +457,9 @@ def _distributed_decoder_branch_worker(
             assert norms[0] > 0
             assert torch.equal(norms[0], norms[1])
         else:
-            assert not any(bool(value) for value in gradients)
+            assert all(bool(value) for value in gradients)
+            assert parameter.grad is not None
+            assert torch.count_nonzero(parameter.grad) == 0
     finally:
         dist.destroy_process_group()
 
@@ -499,10 +501,170 @@ def test_gloo_decoder_malformed_active_context_raises_on_every_rank(
 
 
 def test_gloo_decoder_both_inactive_skips_decode_collectively(tmp_path: Path) -> None:
-    """Mutation caught: global-inactive batches unnecessarily touched decoder params."""
+    """Mutation caught: globally inactive first iteration left decoder parameters unused."""
     mp.spawn(
         _distributed_decoder_branch_worker,
         args=(str(tmp_path / "decoder-inactive"), "both_inactive"),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _distributed_decoder_iteration_worker(rank: int, init_file: str) -> None:
+    """Exercise reducer graph stability over consecutive real DDP iterations."""
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=Path(init_file).as_uri(),
+        timeout=timedelta(seconds=10),
+    )
+    try:
+        schedules = {
+            "inactive_then_mixed": (False, rank == 0),
+            "inactive_inactive": (False, False),
+            "active_active": (True, True),
+        }
+        for schedule_name, schedule in schedules.items():
+            decoder = ElectronFieldDecoder(1, 0, 0, 1)
+            module = ECloudFlowTrainingModule(
+                joint_backbone=TinyJointBackbone(),
+                field_tokenizer=nn.Identity(),
+                field_decoder=decoder,
+                loss_config=LossConfig(),
+            )
+            distributed_module = nn.parallel.DistributedDataParallel(
+                module, find_unused_parameters=False
+            )
+            optimizer = torch.optim.SGD(distributed_module.parameters(), lr=0.0)
+            decoder_buffers = {
+                name: value.detach().clone() for name, value in decoder.named_buffers()
+            }
+            ema_state = {
+                name: value.detach().clone()
+                for name, value in module.ema.state_dict().items()
+            }
+            scaler_state = {
+                name: value.detach().clone()
+                for name, value in module.loss_scaler.state_dict().items()
+            }
+            inactive_breakdown = None
+            inactive_prediction = None
+            gradient_presence: list[bool] = []
+            for iteration, active in enumerate(schedule):
+                optimizer.zero_grad(set_to_none=True)
+                batch = _qm_batch() if active else _batch()
+                if not active:
+                    batch = dataclasses.replace(
+                        batch,
+                        decoder_context=ElectronDecoderContext(
+                            query_grid=torch.full((1, 1), float("nan")),
+                            atom_mask=torch.ones(1, 1),
+                            flat_index=torch.tensor([[10**9]]),
+                        ),
+                    )
+                prediction = distributed_module(batch)
+                assert (prediction.electron_reconstruction is not None) is active
+                assert torch.equal(
+                    prediction.position_velocity,
+                    torch.full_like(prediction.position_velocity, 0.5),
+                )
+                if (
+                    schedule_name == "inactive_inactive"
+                    and inactive_prediction is not None
+                ):
+                    for field in dataclasses.fields(ModelPrediction):
+                        before = getattr(inactive_prediction, field.name)
+                        after = getattr(prediction, field.name)
+                        if isinstance(before, torch.Tensor):
+                            assert torch.equal(before, after)
+                        else:
+                            assert before == after
+                if not active:
+                    inactive_prediction = prediction
+                breakdown = compute_ecloudflow_loss(
+                    prediction, batch.targets, module.loss_config
+                )
+                if (
+                    schedule_name == "inactive_inactive"
+                    and inactive_breakdown is not None
+                ):
+                    for stage in ("raw", "normalized", "weighted"):
+                        before = getattr(inactive_breakdown, stage)
+                        after = getattr(breakdown, stage)
+                        assert all(
+                            torch.equal(before[name], after[name]) for name in before
+                        )
+                    assert torch.equal(inactive_breakdown.total, breakdown.total)
+                    before_diagnostics = inactive_breakdown.diagnostics
+                    after_diagnostics = breakdown.diagnostics
+                    for name in (
+                        "flow_fixed",
+                        "score_fixed",
+                        "affinity_log_variance_min",
+                        "affinity_log_variance_max",
+                    ):
+                        assert torch.equal(
+                            getattr(before_diagnostics, name),
+                            getattr(after_diagnostics, name),
+                        )
+                    assert all(
+                        torch.equal(before_diagnostics.subterms[name], value)
+                        for name, value in after_diagnostics.subterms.items()
+                    )
+                    assert all(
+                        torch.equal(before_diagnostics.supervised_counts[name], value)
+                        for name, value in after_diagnostics.supervised_counts.items()
+                    )
+                if not active:
+                    inactive_breakdown = breakdown
+                breakdown.total.backward()
+                flattened_gradients = []
+                for parameter in decoder.parameters():
+                    flattened_gradients.append(
+                        parameter.grad.detach().flatten()
+                        if parameter.grad is not None
+                        else torch.zeros_like(parameter).flatten()
+                    )
+                gradient_presence.append(
+                    all(
+                        parameter.grad is not None for parameter in decoder.parameters()
+                    )
+                )
+                gradient = torch.cat(flattened_gradients)
+                gathered = [torch.zeros_like(gradient) for _ in range(2)]
+                dist.all_gather(gathered, gradient)
+                assert torch.equal(gathered[0], gathered[1])
+                globally_active = schedule_name == "active_active" or (
+                    schedule_name == "inactive_then_mixed" and iteration == 1
+                )
+                if globally_active:
+                    assert torch.count_nonzero(gradient) > 0
+                else:
+                    assert torch.count_nonzero(gradient) == 0
+                optimizer.step()
+            assert all(gradient_presence)
+            for name, value in decoder.named_buffers():
+                assert torch.equal(value, decoder_buffers[name])
+            assert all(
+                torch.equal(value, ema_state[name])
+                for name, value in module.ema.state_dict().items()
+            )
+            assert all(
+                torch.equal(value, scaler_state[name])
+                for name, value in module.loss_scaler.state_dict().items()
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gloo_ddp_decoder_graph_is_stable_across_two_iterations(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: an all-inactive first pass poisons DDP's next reducer pass."""
+    mp.spawn(
+        _distributed_decoder_iteration_worker,
+        args=(str(tmp_path / "decoder-iterations"),),
         nprocs=2,
         join=True,
     )

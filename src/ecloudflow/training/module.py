@@ -117,11 +117,14 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
 
         Model and inputs stay on Lightning-managed dtype/device. Under DDP, every
         rank performs the same requirement and validation-status reductions before
-        decoding or raising. Globally required but locally unobserved work attaches
-        every trainable decoder parameter through exact zero, so the default
-        ``find_unused_parameters=False`` graph is safe; globally inactive batches
-        do not execute the decoder. The gather/decode preserve autograd, fabricate
-        no supervision, mutate no input, and perform no manual rank/device transfer.
+        decoding or raising. Every non-decoding rank, including every rank in a
+        globally inactive batch, attaches each trainable decoder parameter through
+        exact zero, so consecutive passes are safe with the default
+        ``find_unused_parameters=False``. Globally inactive batches still neither
+        validate decoder context nor execute the decoder. The zero dependency
+        changes no prediction value, buffer, diagnostic, or persistent loss state.
+        The gather/decode preserve autograd, fabricate no supervision, mutate no
+        input, and perform no manual rank/device transfer.
         Endpoint geometry retains its documented first-order rather than
         guaranteed-clean meaning.
         """
@@ -182,7 +185,7 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
                 "decoder activity targets are invalid on at least one distributed rank."
             )
         if not global_required:
-            return prediction
+            return self._attach_decoder_zero(prediction)
         execution_error = torch.zeros(
             (), device=prediction.position_velocity.device, dtype=torch.long
         )

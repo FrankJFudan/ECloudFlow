@@ -527,3 +527,90 @@ exit 0 (only Git LF-to-CRLF checkout warnings)
 
 Warnings are the prior third-party pyparsing deprecations and Lightning GPU/
 dataloader-worker hints. The single skip remains the external xTB integration.
+
+## Fix round 3/5 — consecutive globally inactive DDP passes
+
+Review base: `4b247f4`.
+
+### RED evidence
+
+The new worker used the real ``ElectronFieldDecoder`` inside two CPU Gloo ranks,
+wrapped the full training module with
+``DistributedDataParallel(find_unused_parameters=False)``, and performed real
+backward and zero-learning-rate SGD steps. The first globally inactive iteration
+completed without decoder gradients. The second forward then failed in DDP's
+bucket rebuild, exactly reproducing the reducer lifecycle defect under a bounded
+ten-second process-group timeout:
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_gloo_ddp_decoder_graph_is_stable_across_two_iterations -q
+1 failed in 10.18s
+RuntimeError: Expected to have finished reduction in the prior iteration before starting a new one.
+Parameter indices which did not receive grad for rank 0: 0 1 2 3
+```
+
+An independent one-iteration assertion also failed because both globally inactive
+ranks had ``None`` decoder gradients rather than synchronized exact-zero gradients.
+Thus the two-iteration failure was not hidden by context validation or a process
+hang.
+
+### GREEN behavior and invariant boundary
+
+The globally inactive return now reuses the existing decoder-zero attachment.
+Every trainable decoder parameter contributes an exact numerical zero to returned
+``position_velocity`` and therefore to the returned training loss graph. Decoder
+execution remains lazy: globally inactive batches do not validate or use even a
+deliberately malformed decoder context and return no electron reconstruction.
+
+The multi-schedule worker verifies two iterations for inactive-to-mixed,
+inactive-to-inactive, and active-to-active rank schedules. Globally inactive
+steps produce allocated synchronized all-zero gradients for every decoder
+parameter. A later one-rank-active step and both-ranks-active steps produce
+nonzero decoder gradients synchronized by DDP. Two globally inactive passes keep
+all model prediction values, raw/normalized/weighted/total values, every typed
+diagnostic and count, decoder buffers, loss-scaler state, and EMA state exactly
+equal. A zero-learning-rate optimizer isolates graph/reducer behavior from normal
+optimizer mutation while still exercising ``backward`` and ``step``.
+
+This is a verified autograd/DDP reducer invariant, not evidence about empirical
+loss weights, chemical surrogate usefulness, or binding quality.
+
+### Fix-round 3 verification
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_gloo_decoder_both_inactive_skips_decode_collectively \
+  tests/integration/test_training_step.py::test_gloo_ddp_decoder_graph_is_stable_across_two_iterations -q
+2 passed, 14 warnings in 16.44s
+
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training tests/integration/test_training_step.py tests/unit/models/test_ecloudflow.py -q
+108 passed, 20 warnings in 59.28s
+
+conda run -n 3dmolecule python -m pytest -q
+350 passed, 1 skipped, 20 warnings in 70.45s
+
+conda run -n 3dmolecule ruff check \
+  src/ecloudflow/training/module.py tests/integration/test_training_step.py
+All checks passed!
+
+conda run -n 3dmolecule ruff format --check \
+  src/ecloudflow/training/module.py tests/integration/test_training_step.py
+2 files already formatted
+
+conda run -n 3dmolecule python tools/check_python_docs.py src/ecloudflow
+exit 0
+
+conda run -n 3dmolecule python -m mypy --no-site-packages \
+  --ignore-missing-imports --follow-imports=normal \
+  src/ecloudflow/training src/ecloudflow/config/schema.py \
+  src/ecloudflow/models/ecloudflow.py
+Success: no issues found in 7 source files
+
+git diff --check
+exit 0 (only Git LF-to-CRLF checkout warnings)
+```
+
+Warnings remain the existing third-party pyparsing deprecations and Lightning
+GPU/dataloader-worker hints. The one full-suite skip remains external xTB.
