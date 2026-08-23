@@ -171,6 +171,178 @@ git diff --check
 exit 0 (only Git LF-to-CRLF checkout warnings)
 ```
 
+## Fix round 2/5: decoder consensus, lazy rows, and global diagnostics
+
+### Independent RED evidence
+
+The decoder branch first failed independently of the loss collectives. With rank
+0 carrying genuine-QM field observations and rank 1 carrying none, the inactive
+rank had no decoder gradient. When rank 0 instead omitted its required context,
+rank 1 timed out in Gloo after eight seconds. These failures showed both the
+rank-dependent parameter graph and the pre-consensus exception:
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_gloo_decoder_active_and_inactive_ranks_share_parameter_graph \
+  tests/integration/test_training_step.py::test_gloo_decoder_invalid_active_context_raises_on_every_rank -q
+2 failed: inactive rank lacked decoder parameter gradient; peer Gloo recv timed out after 8000 ms
+```
+
+Focused row-selection tests then failed separately: a batch-global field
+observation decoded a second QM row whose field mask was all false, and a masked
+positive ``10**9`` padding index reached advanced indexing despite being
+semantically absent.
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_decoder_compacts_rows_from_actual_enabled_observations \
+  tests/integration/test_training_step.py::test_masked_decoder_padding_indices_accept_arbitrary_signed_sentinels -q
+2 failed: inactive NaN query row decoded; masked 1000000000 index raised IndexError
+```
+
+The first diagnostic-count RED reported one cycle observation for two observed
+tokens, while two Gloo ranks reported different local vectors. Ring RED accepted
+a reversed duplicate triplet; centralized optional-contract RED leaked five
+incidental broadcasting/indexing/finite errors instead of stable named contract
+errors. A component-zero regression also required absent affinity context and
+would have initialized broad-mask counts.
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_default_cycle_mask_counts_observed_tokens_not_qm_rows \
+  tests/unit/training/test_losses.py::test_gloo_diagnostics_counts_are_globally_consistent -q
+2 failed
+
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_ring_triplets_reject_reversed_duplicates_and_missing_bond_arms \
+  tests/unit/training/test_losses.py::test_ring_triplet_rejects_cross_complex_membership -q
+1 failed, 1 passed (reversed duplicate was accepted)
+
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_optional_contracts_raise_named_errors_before_arithmetic_or_indexing -q
+5 failed
+```
+
+Two final activity REDs caught subtler violations. Configured density/gradient
+terms with zero selected field points still demanded reconstruction and labels.
+Disabled ligand-clash/ring terms first range-checked arbitrary sentinel indices,
+then their diagnostic-count branch indexed those sentinels even after validation
+was made activity-aware.
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_enabled_field_terms_with_no_selected_points_require_no_reconstruction -q
+1 failed: enabled QM term requires density target
+
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training/test_losses.py::test_disabled_sparse_subterms_do_not_index_inactive_sentinels -q
+1 failed: inactive sentinel was range-checked, then diagnostic indexing raised IndexError
+```
+
+### GREEN design and verified invariants
+
+The Lightning forward boundary now performs a globally fixed decoder requirement
+reduction and a three-flag validation-status reduction before any decoder executes
+or any rank raises/returns. If global work exists, execution failures use one more
+collective taken by every rank in that branch. Missing/invalid context therefore
+raises the same bounded diagnostic everywhere. A locally inactive rank attaches
+all trainable decoder parameters to its autograd graph through exact zero. The
+successful worker now wraps the real module in
+``DistributedDataParallel(find_unused_parameters=False)``: backward terminates and
+the nonzero decoder gradient is synchronized to both ranks. When every rank is
+inactive the decoder is neither executed nor attached.
+
+Decoder rows are the union of actual effective observations at the explicit
+step: selected density/gradient points, genuine-QM count/dipole rows, and selected
+cycle tokens. Component/subterm zero and warm-up zero suppress requirements.
+Rows with no selected observation are compacted out and may carry non-finite
+query/label placeholders. Padding indices are replaced by a safe in-range index
+*before* gathering, so arbitrary negative or positive masked sentinels are never
+evaluated; their backing values and center gradients remain exact zero.
+
+Optional validation now precedes loss arithmetic/indexing and checks exact shape,
+float/integer/boolean dtype, device, active finiteness/range, positive active
+standard deviations, paired contexts, and required enabled inputs without
+broadcasting. Inactive subterms still enforce structural shape/dtype where the
+shape is defined, but do not range-check/index sentinel topology or inspect
+non-finite values. Enabled field/cycle terms with zero selected entries require no
+decoder or label and create finite differentiable zero.
+
+Sparse ring triplets are canonicalized as
+``(min(left,right), center, max(left,right))``. Reversed duplicates are rejected;
+all nodes must be distinct, in range, and in one complex; both outer-center arms
+must occur in the canonical bonded halfedges. Nonbonded pairs are likewise
+canonical, unique, same-complex, in range, and disjoint from bonds. These checks
+remain linear in sparse inputs and allocate no dense adjacency.
+
+Diagnostic counts use an exact 21-name schema and one unconditional detached
+count-vector all-reduce per loss call. Thus all ranks see the same global counts,
+including field-point, token, node, edge, pair, triplet, and labeled-example
+counts. Default cycle availability counts tokens, not QM rows. Disabled/empty
+subterms report zero and do not create scaler presence; scaler sufficient
+statistics retain their existing fixed collective sequence and absent local ranks
+do not contribute fabricated zero observations.
+
+These are verified mask, sparse-topology, collective-order, autograd-graph,
+diagnostic, finite-zero, and Lightning/DDP invariants. The empirical weights,
+focal gamma, warm-ups, chemical surrogate usefulness, and binding-quality benefit
+remain hypotheses requiring real-data ablations; none is promoted to a scientific
+conclusion by these tests.
+
+### Fix-round 2 verification
+
+```text
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_gloo_decoder_active_and_inactive_ranks_share_parameter_graph \
+  tests/integration/test_training_step.py::test_gloo_decoder_invalid_active_context_raises_on_every_rank \
+  tests/integration/test_training_step.py::test_gloo_decoder_both_inactive_skips_decode_collectively \
+  tests/integration/test_training_step.py::test_decoder_mapping_rejects_duplicates \
+  tests/integration/test_training_step.py::test_masked_decoder_padding_indices_accept_arbitrary_signed_sentinels -q
+5 passed, 14 warnings in 21.75s
+
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_gloo_decoder_active_and_inactive_ranks_share_parameter_graph \
+  tests/integration/test_training_step.py::test_gloo_decoder_invalid_active_context_raises_on_every_rank \
+  tests/integration/test_training_step.py::test_gloo_decoder_malformed_active_context_raises_on_every_rank \
+  tests/integration/test_training_step.py::test_gloo_decoder_both_inactive_skips_decode_collectively -q
+4 passed, 14 warnings in 27.39s
+
+conda run -n 3dmolecule python -m pytest \
+  tests/unit/training tests/integration/test_training_step.py tests/unit/models/test_ecloudflow.py -q
+106 passed, 20 warnings in 46.82s
+
+conda run -n 3dmolecule python -m pytest \
+  tests/integration/test_training_step.py::test_cuda_fp16_gradscaler_skip_does_not_update_ema \
+  tests/integration/test_training_step.py::test_cuda_bf16_lightning_step_smoke -q
+2 passed, 16 warnings in 5.06s (local RTX 4060)
+
+conda run -n 3dmolecule python -m pytest -q
+349 passed, 1 skipped, 20 warnings in 63.89s
+
+conda run -n 3dmolecule ruff check \
+  src/ecloudflow/training/losses.py src/ecloudflow/training/module.py \
+  tests/unit/training/test_losses.py tests/integration/test_training_step.py
+All checks passed!
+
+conda run -n 3dmolecule ruff format --check <same round-2 scope>
+all files formatted
+
+conda run -n 3dmolecule python tools/check_python_docs.py src/ecloudflow
+exit 0
+
+conda run -n 3dmolecule python -m mypy --no-site-packages \
+  --ignore-missing-imports --follow-imports=normal \
+  src/ecloudflow/training src/ecloudflow/config/schema.py \
+  src/ecloudflow/models/ecloudflow.py
+Success: no issues found in 7 source files
+
+git diff --check
+exit 0 (only Git LF-to-CRLF checkout warnings)
+```
+
+Warnings remain the pre-existing third-party pyparsing deprecations and Lightning
+GPU/dataloader-worker hints. The single full-suite skip remains external xTB.
+
 `--no-site-packages --ignore-missing-imports` was necessary because the installed
 third-party `rdkit-stubs` contains a syntax error (`Non-default argument follows
 default argument`). `--follow-imports=normal` still checks all local ECloudFlow

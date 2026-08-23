@@ -15,6 +15,29 @@ from ecloudflow.models import ModelPrediction
 from ecloudflow.training.types import LossBreakdown, LossDiagnostics, TrainingTargets
 
 COMPONENT_NAMES = ("flow", "score", "discrete", "ecloud", "chem", "interaction")
+DIAGNOSTIC_COUNT_NAMES = (
+    "flow_position",
+    "flow_electron",
+    "score_position",
+    "score_electron",
+    "discrete_atom",
+    "discrete_charge",
+    "discrete_bond",
+    "discrete_count",
+    "ecloud_density",
+    "ecloud_gradient",
+    "ecloud_electron_count",
+    "ecloud_dipole",
+    "ecloud_cycle",
+    "chem_valence",
+    "chem_bond_length",
+    "chem_ligand_clash",
+    "chem_protein_clash",
+    "chem_ring_strain",
+    "chem_connectivity",
+    "chem_affinity",
+    "interaction",
+)
 
 
 class RunningLossScaler(nn.Module):  # type: ignore[misc]
@@ -173,12 +196,15 @@ def compute_ecloudflow_loss(
     terms require a differentiable real decoder reconstruction rather than a
     semantically unrelated tensor. Reductions accumulate in float32 for FP16/
     BF16, preserve caller device, and allocate only ``O(N+E+NP)`` tensors—never
-    dense ``[N,N,C]`` bonds. Scaler mutation uses detached DDP-reduced sufficient
-    statistics; input predictions/targets/config are not mutated. Warm-ups and
+    dense ``[N,N,C]`` bonds. Supervised diagnostic counts use one fixed-schema
+    detached all-reduce, so every rank reports identical counts even when local
+    observations differ. Scaler mutation uses detached DDP-reduced sufficient
+    statistics while local presence prevents absent-rank zeros from becoming
+    observations; input predictions/targets/config are not mutated. Warm-ups and
     losses are deterministic for fixed inputs and explicit step. Every tensor
-    shape and dtype is checked in its coordinate frame, unordered halfedge
-    storage stays sparse (no dense ``[N,N,C]``), and scaler checkpoint state
-    resumes independently of the differentiable predictions.
+    shape and dtype is checked in its coordinate frame, unordered halfedge storage
+    stays sparse, and scaler checkpoint state resumes independently of the
+    differentiable predictions.
     """
     if not isinstance(prediction, ModelPrediction):
         raise TypeError("prediction must be a ModelPrediction.")
@@ -189,6 +215,7 @@ def compute_ecloudflow_loss(
     if not isinstance(step, int) or isinstance(step, bool) or step < 0:
         raise ValueError("step must be a non-negative integer.")
     _validate_core_contract(prediction, targets)
+    _validate_optional_contract(prediction, targets, config, step)
     subterms: dict[str, torch.Tensor] = {}
     counts: dict[str, torch.Tensor] = {}
 
@@ -266,12 +293,33 @@ def compute_ecloudflow_loss(
     )
     ecloud = sum(ecloud_terms, _zero_from_prediction(prediction))
 
-    chemistry_terms = _chemistry_terms(prediction, targets, config, subterms, counts)
+    chem_enabled = config.chem.weight > 0.0 and _warmup(config.chem, step) > 0.0
+    chemistry_terms = _chemistry_terms(
+        prediction, targets, config, subterms, counts, enabled=chem_enabled
+    )
     chem = sum(chemistry_terms, _zero_from_prediction(prediction))
 
-    interaction, _ = _interaction_term(prediction, targets, config)
+    interaction_enabled = (
+        config.interaction.weight > 0.0 and _warmup(config.interaction, step) > 0.0
+    )
+    interaction, _ = _interaction_term(
+        prediction, targets, config, enabled=interaction_enabled
+    )
     subterms["interaction_focal"] = interaction
     counts["interaction"] = _mask_count(targets.interaction_mask, prediction.affinity)
+    for component, prefix in (
+        (config.flow, "flow_"),
+        (config.score, "score_"),
+        (config.discrete, "discrete_"),
+        (config.ecloud, "ecloud_"),
+        (config.chem, "chem_"),
+    ):
+        if component.weight == 0.0 or _warmup(component, step) == 0.0:
+            for name in tuple(counts):
+                if name.startswith(prefix):
+                    counts[name] = counts[name] * 0
+    if not interaction_enabled:
+        counts["interaction"] = counts["interaction"] * 0
 
     raw = {
         "flow": flow,
@@ -289,22 +337,28 @@ def compute_ecloudflow_loss(
         "chem": config.chem,
         "interaction": config.interaction,
     }
+    local_counts = dict(counts)
+    counts = _synchronize_diagnostic_counts(counts, prediction.position_velocity)
     observed = {
-        "flow": counts["flow_position"] + counts["flow_electron"],
-        "score": counts["score_position"] + counts["score_electron"],
+        "flow": local_counts["flow_position"] + local_counts["flow_electron"],
+        "score": local_counts["score_position"] + local_counts["score_electron"],
         "discrete": sum(
-            (counts[name] for name in counts if name.startswith("discrete_")),
+            (
+                local_counts[name]
+                for name in local_counts
+                if name.startswith("discrete_")
+            ),
             atom_count * 0,
         ),
         "ecloud": sum(
-            (counts[name] for name in counts if name.startswith("ecloud_")),
+            (local_counts[name] for name in local_counts if name.startswith("ecloud_")),
             atom_count * 0,
         ),
         "chem": sum(
-            (counts[name] for name in counts if name.startswith("chem_")),
+            (local_counts[name] for name in local_counts if name.startswith("chem_")),
             atom_count * 0,
         ),
-        "interaction": counts["interaction"],
+        "interaction": local_counts["interaction"],
     }
     active = {
         name: bool(observed[name] > 0)
@@ -465,6 +519,414 @@ def _validate_core_contract(
             raise ValueError("canonical unordered halfedges must be unique.")
 
 
+def _validate_optional_contract(
+    prediction: ModelPrediction,
+    targets: TrainingTargets,
+    config: LossConfig,
+    step: int,
+) -> None:
+    """Validate optional scientific tensors before any indexing or arithmetic."""
+    reference = prediction.position_velocity
+    device = reference.device
+    node_count = reference.shape[0]
+    edge_count = prediction.bond_logits.shape[0]
+    batch_size = prediction.affinity.shape[0]
+    ecloud_enabled = config.ecloud.weight > 0.0 and _warmup(config.ecloud, step) > 0.0
+    chem_enabled = config.chem.weight > 0.0 and _warmup(config.chem, step) > 0.0
+
+    field_width: int | None = None
+    if prediction.electron_reconstruction is not None:
+        field_width = prediction.electron_reconstruction.density.shape[1]
+    for tensor, rank, name in (
+        (targets.density, 2, "density"),
+        (targets.density_gradient, 3, "density_gradient"),
+        (targets.field_mask, 2, "field_mask"),
+    ):
+        if tensor is not None:
+            if tensor.ndim != rank or tensor.shape[0] != batch_size:
+                raise ValueError(f"{name} must have its exact [B,G,...] shape.")
+            candidate = tensor.shape[1]
+            if field_width is None:
+                field_width = candidate
+            elif field_width != candidate:
+                raise ValueError(f"{name} shape has a field-point dimension unlike G.")
+    if targets.field_mask is not None:
+        _validate_bool_tensor(
+            targets.field_mask,
+            (batch_size, field_width),
+            "field_mask",
+            device,
+        )
+    field_observed = (
+        targets.qm_mask[:, None] & targets.field_mask
+        if targets.field_mask is not None
+        else None
+    )
+    no_field = torch.zeros_like(field_observed) if field_observed is not None else None
+    _validate_optional_float(
+        targets.density,
+        (batch_size, field_width),
+        "density",
+        device,
+        field_observed if ecloud_enabled and config.ecloud.density > 0.0 else no_field,
+    )
+    _validate_optional_float(
+        targets.density_gradient,
+        (batch_size, field_width, 3),
+        "density_gradient",
+        device,
+        field_observed if ecloud_enabled and config.ecloud.gradient > 0.0 else no_field,
+    )
+    _validate_optional_float(
+        targets.electron_count,
+        (batch_size,),
+        "electron_count",
+        device,
+        targets.qm_mask
+        if ecloud_enabled and config.ecloud.electron_count > 0.0
+        else torch.zeros_like(targets.qm_mask),
+    )
+    _validate_optional_float(
+        targets.dipole,
+        (batch_size, 3),
+        "dipole",
+        device,
+        targets.qm_mask
+        if ecloud_enabled and config.ecloud.dipole > 0.0
+        else torch.zeros_like(targets.qm_mask),
+    )
+    cycle_width: int | None = None
+    if prediction.electron_reconstruction is not None:
+        cycle_width = prediction.electron_reconstruction.latent_round_trip.shape[1]
+    elif targets.latent_cycle is not None and targets.latent_cycle.ndim == 3:
+        cycle_width = targets.latent_cycle.shape[1]
+    if targets.latent_cycle_mask is not None:
+        _validate_bool_tensor(
+            targets.latent_cycle_mask,
+            (batch_size, cycle_width),
+            "latent_cycle_mask",
+            device,
+        )
+    cycle_active = (
+        targets.qm_mask[:, None] & targets.latent_cycle_mask
+        if targets.latent_cycle_mask is not None
+        else (
+            targets.qm_mask[:, None].expand(-1, cycle_width)
+            if cycle_width is not None
+            else None
+        )
+    )
+    _validate_optional_float(
+        targets.latent_cycle,
+        (batch_size, cycle_width, prediction.electron_velocity.shape[1]),
+        "latent_cycle",
+        device,
+        cycle_active
+        if ecloud_enabled and config.ecloud.cycle > 0.0
+        else (torch.zeros_like(cycle_active) if cycle_active is not None else None),
+    )
+    if ecloud_enabled and bool(targets.qm_mask.any()):
+        if (
+            config.ecloud.density or config.ecloud.gradient
+        ) and targets.field_mask is None:
+            raise ValueError("enabled density terms require boolean field_mask.")
+        field_present = field_observed is not None and bool(field_observed.any())
+        cycle_present = (
+            bool(cycle_active.any())
+            if targets.latent_cycle_mask is not None and cycle_active is not None
+            else True
+        )
+        required = (
+            (config.ecloud.density > 0.0 and field_present, targets.density, "density"),
+            (
+                config.ecloud.gradient > 0.0 and field_present,
+                targets.density_gradient,
+                "density_gradient",
+            ),
+            (
+                config.ecloud.electron_count > 0.0,
+                targets.electron_count,
+                "electron_count",
+            ),
+            (config.ecloud.dipole > 0.0, targets.dipole, "dipole"),
+            (
+                config.ecloud.cycle > 0.0 and cycle_present,
+                targets.latent_cycle,
+                "latent_cycle",
+            ),
+        )
+        for observed, tensor, name in required:
+            if observed and tensor is None:
+                raise ValueError(f"enabled QM term requires {name} target.")
+
+    editable_observed = bool(targets.editable_atom_mask.any())
+    editable_bond_observed = bool(targets.editable_bond_mask.any())
+    if chem_enabled and editable_observed:
+        if (
+            config.chem.valence > 0.0 or config.chem.connectivity > 0.0
+        ) and targets.bond_order_values is None:
+            raise ValueError("enabled valence/connectivity requires bond_order_values.")
+        if config.chem.valence > 0.0 and targets.valence_limits is None:
+            raise ValueError("enabled valence requires valence_limits.")
+        if config.chem.ligand_clash > 0.0 and targets.nonbonded_halfedge_index is None:
+            raise ValueError("enabled ligand clash requires nonbonded_halfedge_index.")
+        if config.chem.protein_clash > 0.0 and (
+            targets.protein_positions is None or targets.protein_batch is None
+        ):
+            raise ValueError(
+                "enabled protein clash requires protein_positions/protein_batch."
+            )
+        if config.chem.ring_strain > 0.0 and any(
+            value is None
+            for value in (
+                targets.ring_triplets,
+                targets.ring_angle_mean,
+                targets.ring_angle_std,
+            )
+        ):
+            raise ValueError(
+                "enabled ring strain requires complete sparse ring priors."
+            )
+    if (
+        chem_enabled
+        and config.chem.bond_length > 0.0
+        and editable_bond_observed
+        and (targets.bond_length_mean is None or targets.bond_length_std is None)
+    ):
+        raise ValueError(
+            "enabled bond length requires bond_length_mean/bond_length_std."
+        )
+
+    _validate_optional_float(
+        targets.valence_limits,
+        (node_count,),
+        "valence_limits",
+        device,
+        targets.editable_atom_mask
+        if chem_enabled and config.chem.valence > 0.0
+        else torch.zeros_like(targets.editable_atom_mask),
+    )
+    _validate_optional_float(
+        targets.bond_order_values,
+        (prediction.bond_logits.shape[1],),
+        "bond_order_values",
+        device,
+        torch.ones_like(targets.bond_order_values, dtype=torch.bool)
+        if chem_enabled
+        and config.chem.valence > 0.0
+        and targets.bond_order_values is not None
+        else (
+            torch.zeros_like(targets.bond_order_values, dtype=torch.bool)
+            if targets.bond_order_values is not None
+            else None
+        ),
+    )
+    _validate_optional_float(
+        targets.bond_length_mean,
+        (edge_count,),
+        "bond_length_mean",
+        device,
+        targets.editable_bond_mask
+        if chem_enabled and config.chem.bond_length > 0.0
+        else torch.zeros_like(targets.editable_bond_mask),
+    )
+    _validate_optional_float(
+        targets.bond_length_std,
+        (edge_count,),
+        "bond_length_std",
+        device,
+        targets.editable_bond_mask
+        if chem_enabled and config.chem.bond_length > 0.0
+        else torch.zeros_like(targets.editable_bond_mask),
+        positive=True,
+    )
+    if targets.nonbonded_halfedge_index is not None:
+        nonbonded = targets.nonbonded_halfedge_index
+        if (
+            nonbonded.ndim != 2
+            or nonbonded.shape[0] != 2
+            or nonbonded.dtype != torch.long
+            or nonbonded.device != device
+        ):
+            raise ValueError(
+                "nonbonded_halfedge_index must be same-device torch.long [2,P]."
+            )
+        if chem_enabled and config.chem.ligand_clash > 0.0 and editable_observed:
+            _validate_sparse_indices(nonbonded, node_count, "nonbonded_halfedge_index")
+            _validate_sparse_pairs(nonbonded, node_count, "nonbonded_halfedge_index")
+            _validate_nonbonded_topology(nonbonded, targets)
+    if targets.protein_positions is not None or targets.protein_batch is not None:
+        if targets.protein_positions is None or targets.protein_batch is None:
+            raise ValueError(
+                "protein_positions and protein_batch must be supplied together."
+            )
+        if targets.protein_positions.ndim != 2:
+            raise ValueError("protein_positions must have exact shape [P,3].")
+        protein_count = targets.protein_positions.shape[0]
+        if (
+            targets.protein_batch.shape != (protein_count,)
+            or targets.protein_batch.dtype != torch.long
+            or targets.protein_batch.device != device
+        ):
+            raise ValueError("protein_batch must be same-device torch.long [P].")
+        if targets.protein_batch.numel() and (
+            bool((targets.protein_batch < 0).any())
+            or bool((targets.protein_batch >= batch_size).any())
+        ):
+            raise ValueError("protein_batch contains an index outside [0,B).")
+        active_protein = (
+            torch.isin(
+                targets.protein_batch,
+                torch.unique(targets.node_batch[targets.editable_atom_mask]),
+            )
+            if config.chem.protein_clash > 0.0 and chem_enabled
+            else torch.zeros(protein_count, dtype=torch.bool, device=device)
+        )
+        _validate_optional_float(
+            targets.protein_positions,
+            (protein_count, 3),
+            "protein_positions",
+            device,
+            active_protein,
+        )
+    ring_values = (
+        targets.ring_triplets,
+        targets.ring_angle_mean,
+        targets.ring_angle_std,
+    )
+    if any(value is not None for value in ring_values) and any(
+        value is None for value in ring_values
+    ):
+        raise ValueError(
+            "ring_triplets and ring angle priors must be supplied together."
+        )
+    if targets.ring_triplets is not None:
+        triplets = targets.ring_triplets
+        if (
+            triplets.ndim != 2
+            or triplets.shape[0] != 3
+            or triplets.dtype != torch.long
+            or triplets.device != device
+        ):
+            raise ValueError("ring_triplets must be same-device torch.long [3,R].")
+        ring_enabled = (
+            chem_enabled and config.chem.ring_strain > 0.0 and editable_observed
+        )
+        if ring_enabled:
+            _validate_sparse_indices(triplets, node_count, "ring_triplets")
+            _validate_ring_topology(triplets, targets)
+        ring_count = triplets.shape[1]
+        ring_active = (
+            (
+                targets.editable_atom_mask[triplets[0]]
+                | targets.editable_atom_mask[triplets[1]]
+                | targets.editable_atom_mask[triplets[2]]
+            )
+            if ring_enabled
+            else torch.zeros(ring_count, dtype=torch.bool, device=device)
+        )
+        _validate_optional_float(
+            targets.ring_angle_mean,
+            (ring_count,),
+            "ring_angle_mean",
+            device,
+            ring_active,
+        )
+        _validate_optional_float(
+            targets.ring_angle_std,
+            (ring_count,),
+            "ring_angle_std",
+            device,
+            ring_active,
+            positive=True,
+        )
+    interaction_enabled = (
+        config.interaction.weight > 0.0 and _warmup(config.interaction, step) > 0.0
+    )
+    for target, mask, name, probability, enabled in (
+        (
+            targets.affinity,
+            targets.affinity_mask,
+            "affinity",
+            False,
+            chem_enabled and config.chem.affinity > 0.0,
+        ),
+        (
+            targets.interaction,
+            targets.interaction_mask,
+            "interaction",
+            True,
+            interaction_enabled,
+        ),
+    ):
+        active_mask = (
+            mask
+            if enabled
+            else (
+                torch.zeros_like(mask, dtype=torch.bool) if mask is not None else None
+            )
+        )
+        _validate_optional_float(
+            target,
+            (batch_size,),
+            f"{name} target",
+            device,
+            active_mask,
+            probability=probability,
+        )
+        if enabled and mask is not None and bool(mask.any()) and target is None:
+            raise ValueError(f"active {name} mask requires {name} target.")
+
+
+def _validate_bool_tensor(
+    tensor: torch.Tensor,
+    shape: tuple[int | None, ...],
+    name: str,
+    device: torch.device,
+) -> None:
+    """Validate an exact optional boolean tensor contract."""
+    if (
+        tensor.shape != tuple(shape)
+        or tensor.dtype != torch.bool
+        or tensor.device != device
+    ):
+        raise ValueError(f"{name} must be same-device boolean with shape {shape}.")
+
+
+def _validate_optional_float(
+    tensor: torch.Tensor | None,
+    shape: tuple[int | None, ...],
+    name: str,
+    device: torch.device,
+    active: torch.Tensor | None,
+    *,
+    positive: bool = False,
+    probability: bool = False,
+) -> None:
+    """Validate shape/placement and only selected numerical values."""
+    if tensor is None:
+        return
+    if (
+        tensor.shape != tuple(shape)
+        or not tensor.is_floating_point()
+        or tensor.device != device
+    ):
+        raise ValueError(f"{name} must be floating on model device with shape {shape}.")
+    selected = (
+        tensor.reshape(-1) if active is None else tensor[_expanded_mask(active, tensor)]
+    )
+    if selected.numel() and not bool(torch.isfinite(selected).all()):
+        raise ValueError(f"active {name} values must be finite.")
+    if positive and selected.numel() and bool((selected <= 0).any()):
+        raise ValueError(f"active {name} values must be positive.")
+    if (
+        probability
+        and selected.numel()
+        and bool(((selected < 0.0) | (selected > 1.0)).any())
+    ):
+        raise ValueError(f"active {name} values must lie in [0,1].")
+
+
 def _ecloud_terms(
     prediction: ModelPrediction,
     targets: TrainingTargets,
@@ -483,7 +945,35 @@ def _ecloud_terms(
         "dipole": config.ecloud.dipole,
         "cycle": config.ecloud.cycle,
     }
-    if not enabled or not bool(targets.qm_mask.any()) or not any(weights.values()):
+    field_observed = (
+        targets.qm_mask[:, None] & targets.field_mask
+        if targets.field_mask is not None
+        else None
+    )
+    observed = {
+        "density": field_observed.sum()
+        if field_observed is not None
+        else targets.qm_mask.sum() * 0,
+        "gradient": field_observed.sum()
+        if field_observed is not None
+        else targets.qm_mask.sum() * 0,
+        "electron_count": targets.qm_mask.sum(),
+        "dipole": targets.qm_mask.sum(),
+        "cycle": (
+            (targets.qm_mask[:, None] & targets.latent_cycle_mask).sum()
+            if targets.latent_cycle_mask is not None
+            else (
+                targets.qm_mask[:, None].expand(-1, targets.latent_cycle.shape[1]).sum()
+                if targets.latent_cycle is not None
+                else targets.qm_mask.sum()
+            )
+        ),
+    }
+    effective = {
+        name: enabled and weight > 0.0 and bool(observed[name] > 0)
+        for name, weight in weights.items()
+    }
+    if not any(effective.values()):
         for name in ("density", "gradient", "electron_count", "dipole", "cycle"):
             diagnostics[f"ecloud_{name}"] = zero
             counts[f"ecloud_{name}"] = targets.qm_mask.sum() * 0
@@ -495,7 +985,7 @@ def _ecloud_terms(
         )
     values: dict[str, torch.Tensor] = {}
     field_mask = targets.field_mask
-    if weights["density"]:
+    if effective["density"]:
         if targets.density is None or field_mask is None:
             raise ValueError(
                 "enabled QM density requires density and field_mask targets."
@@ -505,7 +995,7 @@ def _ecloud_terms(
             targets.density,
             targets.qm_mask[:, None] & field_mask,
         )
-    if weights["gradient"]:
+    if effective["gradient"]:
         if targets.density_gradient is None or field_mask is None:
             raise ValueError(
                 "enabled QM density gradient requires gradient and field_mask targets."
@@ -515,19 +1005,19 @@ def _ecloud_terms(
             targets.density_gradient,
             targets.qm_mask[:, None] & field_mask,
         )
-    if weights["electron_count"]:
+    if effective["electron_count"]:
         if targets.electron_count is None:
             raise ValueError("enabled QM electron count requires count targets.")
         values["electron_count"] = _masked_mse(
             reconstruction.electron_count, targets.electron_count, targets.qm_mask
         )
-    if weights["dipole"]:
+    if effective["dipole"]:
         if targets.dipole is None:
             raise ValueError("enabled QM dipole requires dipole targets.")
         values["dipole"] = _masked_mse(
             reconstruction.dipole, targets.dipole, targets.qm_mask
         )
-    if weights["cycle"]:
+    if effective["cycle"]:
         if targets.latent_cycle is None:
             raise ValueError("enabled electron cycle requires latent cycle targets.")
         cycle_mask = (
@@ -548,13 +1038,9 @@ def _ecloud_terms(
         values[name] = zero
     for name, value in values.items():
         diagnostics[f"ecloud_{name}"] = value
-        if name in {"density", "gradient"} and field_mask is not None:
-            observed = (targets.qm_mask[:, None] & field_mask).sum()
-        elif name == "cycle" and targets.latent_cycle_mask is not None:
-            observed = (targets.qm_mask[:, None] & targets.latent_cycle_mask).sum()
-        else:
-            observed = targets.qm_mask.sum()
-        counts[f"ecloud_{name}"] = observed if weights[name] else observed * 0
+        counts[f"ecloud_{name}"] = (
+            observed[name] if effective[name] else observed[name] * 0
+        )
     return [weights[name] * value for name, value in values.items()]
 
 
@@ -564,6 +1050,8 @@ def _chemistry_terms(
     config: LossConfig,
     diagnostics: dict[str, torch.Tensor],
     counts: dict[str, torch.Tensor],
+    *,
+    enabled: bool,
 ) -> list[torch.Tensor]:
     """Compute endpoint geometry, sparse graph, clash, and affinity surrogates."""
     editable = targets.editable_atom_mask
@@ -588,6 +1076,11 @@ def _chemistry_terms(
         "connectivity": config.chem.connectivity,
         "affinity": config.chem.affinity,
     }
+    if not enabled:
+        for name in weights:
+            diagnostics[f"chem_{name}"] = zero
+            counts[f"chem_{name}"] = targets.editable_atom_mask.sum() * 0
+        return [zero]
     if bool(editable.any()):
         source, target = targets.halfedge_index
         active_edges = targets.editable_bond_mask
@@ -758,7 +1251,9 @@ def _chemistry_terms(
         values["affinity"] = zero
     for name, value in values.items():
         diagnostics[f"chem_{name}"] = value
-        if name in {"valence", "connectivity"}:
+        if weights[name] == 0.0:
+            observed = editable.sum() * 0
+        elif name in {"valence", "connectivity"}:
             observed = editable.sum()
         elif name == "bond_length":
             observed = targets.editable_bond_mask.sum()
@@ -781,7 +1276,7 @@ def _chemistry_terms(
             observed = affinity_mask.sum()
         else:
             observed = editable.sum() * 0
-        counts[f"chem_{name}"] = observed if weights[name] else observed * 0
+        counts[f"chem_{name}"] = observed
     return [weights[name] * value for name, value in values.items()]
 
 
@@ -846,14 +1341,8 @@ def _ring_strain(
     _validate_sparse_indices(
         triplets, prediction.position_velocity.shape[0], "ring_triplets"
     )
+    _validate_ring_topology(triplets, targets)
     left, center, right = triplets
-    if bool(((left == center) | (left == right) | (center == right)).any()):
-        raise ValueError("ring triplets must contain three distinct nodes.")
-    if not (
-        torch.equal(targets.node_batch[left], targets.node_batch[center])
-        and torch.equal(targets.node_batch[left], targets.node_batch[right])
-    ):
-        raise ValueError("ring triplets must stay within one complex.")
     ring_editable = (
         targets.editable_atom_mask[left]
         | targets.editable_atom_mask[center]
@@ -901,11 +1390,43 @@ def _ring_strain(
     )
 
 
+def _validate_ring_topology(triplets: torch.Tensor, targets: TrainingTargets) -> None:
+    """Validate canonical sparse ring membership and bonded arms in linear memory."""
+    left, center, right = triplets
+    if bool(((left == center) | (left == right) | (center == right)).any()):
+        raise ValueError("ring triplets must contain three distinct nodes.")
+    if not (
+        torch.equal(targets.node_batch[left], targets.node_batch[center])
+        and torch.equal(targets.node_batch[left], targets.node_batch[right])
+    ):
+        raise ValueError("ring triplets must stay within one complex.")
+    node_count = targets.node_batch.shape[0]
+    outer_low = torch.minimum(left, right)
+    outer_high = torch.maximum(left, right)
+    triplet_codes = (outer_low * node_count + center) * node_count + outer_high
+    if triplet_codes.unique().numel() != triplet_codes.numel():
+        raise ValueError("canonical ring triplets must be unique.")
+    first_codes = torch.minimum(left, center) * node_count + torch.maximum(left, center)
+    second_codes = torch.minimum(right, center) * node_count + torch.maximum(
+        right, center
+    )
+    bond_codes = targets.halfedge_index[0] * node_count + targets.halfedge_index[1]
+    if not bool(
+        torch.isin(first_codes, bond_codes).all()
+        and torch.isin(second_codes, bond_codes).all()
+    ):
+        raise ValueError("ring triplets require both canonical bonded arms.")
+
+
 def _interaction_term(
-    prediction: ModelPrediction, targets: TrainingTargets, config: LossConfig
+    prediction: ModelPrediction,
+    targets: TrainingTargets,
+    config: LossConfig,
+    *,
+    enabled: bool,
 ) -> tuple[torch.Tensor, bool]:
     """Compute masked binary focal loss for per-complex interaction labels."""
-    if not _optional_mask_any(targets.interaction_mask):
+    if not enabled or not _optional_mask_any(targets.interaction_mask):
         return _zero_from_prediction(prediction), False
     if targets.interaction is None or targets.interaction_mask is None:
         raise ValueError("interaction availability requires labels and mask.")
@@ -1010,6 +1531,23 @@ def _mask_count(mask: torch.Tensor | None, reference: torch.Tensor) -> torch.Ten
         if mask is not None
         else torch.zeros((), dtype=torch.long, device=reference.device)
     )
+
+
+def _synchronize_diagnostic_counts(
+    counts: Mapping[str, torch.Tensor], reference: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """All-reduce the fixed diagnostic count schema in one detached collective."""
+    if set(counts) != set(DIAGNOSTIC_COUNT_NAMES):
+        raise ValueError("diagnostics require the complete stable count schema.")
+    vector = torch.stack(
+        [
+            counts[name].detach().to(device=reference.device, dtype=torch.long)
+            for name in DIAGNOSTIC_COUNT_NAMES
+        ]
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(vector, op=dist.ReduceOp.SUM)
+    return {name: vector[index] for index, name in enumerate(DIAGNOSTIC_COUNT_NAMES)}
 
 
 def _optional_mask_any(mask: torch.Tensor | None) -> bool:

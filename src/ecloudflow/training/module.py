@@ -10,6 +10,7 @@ from typing import Any
 
 import lightning as L
 import torch
+from torch import distributed as dist
 from torch import nn
 
 from ecloudflow.config import LossConfig
@@ -114,26 +115,102 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         :raises TypeError: If the batch/model return or decoder API is incompatible.
         :raises ValueError: If decoder mapping shape, dtype, device, or range fails.
 
-        Model and inputs stay on Lightning-managed dtype/device. The gather and
-        decode are deterministic, preserve autograd, fabricate no supervision,
-        mutate no input, and perform no rank/device transfer. Endpoint geometry
-        retains its documented first-order rather than guaranteed-clean meaning.
+        Model and inputs stay on Lightning-managed dtype/device. Under DDP, every
+        rank performs the same requirement and validation-status reductions before
+        decoding or raising. Globally required but locally unobserved work attaches
+        every trainable decoder parameter through exact zero, so the default
+        ``find_unused_parameters=False`` graph is safe; globally inactive batches
+        do not execute the decoder. The gather/decode preserve autograd, fabricate
+        no supervision, mutate no input, and perform no manual rank/device transfer.
+        Endpoint geometry retains its documented first-order rather than
+        guaranteed-clean meaning.
         """
         if not isinstance(batch, TrainingBatch):
             raise TypeError("batch must be TrainingBatch.")
         prediction = self.joint_backbone(batch.state, batch.time, batch.condition)
         if not isinstance(prediction, ModelPrediction):
             raise TypeError("joint_backbone must return ModelPrediction.")
-        if not self._decoder_is_observed(batch.targets):
-            return prediction
-        if batch.decoder_context is None:
-            raise ValueError(
-                "enabled observed QM reconstruction terms require decoder_context."
-            )
-        reconstruction = self._decode_electrons(
-            prediction, batch.decoder_context, batch.targets
+        activity_error = False
+        try:
+            active_rows = self._decoder_active_rows(batch.targets)
+        except (TypeError, ValueError, RuntimeError, IndexError):
+            active_rows = torch.zeros_like(prediction.affinity, dtype=torch.bool)
+            activity_error = True
+        local_required = bool(active_rows.any())
+        requirement = torch.tensor(
+            int(local_required), device=prediction.position_velocity.device
         )
-        return replace(prediction, electron_reconstruction=reconstruction)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(requirement, op=dist.ReduceOp.SUM)
+        global_required = bool(requirement > 0)
+        validation_error = torch.zeros(
+            3, device=prediction.position_velocity.device, dtype=torch.long
+        )
+        validation_error[2] = int(activity_error)
+        local_validation_error: Exception | None = None
+        prepared: tuple[torch.Tensor, ...] | None = None
+        if global_required and local_required and batch.decoder_context is None:
+            validation_error[0] = 1
+        elif global_required and local_required:
+            assert batch.decoder_context is not None
+            try:
+                prepared = self._prepare_electron_decoder_inputs(
+                    prediction,
+                    batch.decoder_context,
+                    batch.targets,
+                    active_rows,
+                )
+            except (TypeError, ValueError, RuntimeError, IndexError) as error:
+                validation_error[1] = 1
+                local_validation_error = error
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(validation_error, op=dist.ReduceOp.SUM)
+        if validation_error[0] > 0:
+            raise ValueError(
+                "decoder_context is missing on at least one active distributed rank."
+            )
+        if validation_error[1] > 0:
+            if local_validation_error is not None and not (
+                dist.is_available() and dist.is_initialized()
+            ):
+                raise local_validation_error
+            raise ValueError(
+                "decoder context is invalid on at least one active distributed rank."
+            )
+        if validation_error[2] > 0:
+            raise ValueError(
+                "decoder activity targets are invalid on at least one distributed rank."
+            )
+        if not global_required:
+            return prediction
+        execution_error = torch.zeros(
+            (), device=prediction.position_velocity.device, dtype=torch.long
+        )
+        local_execution_error: Exception | None = None
+        decoded_prediction = prediction
+        if local_required:
+            assert prepared is not None
+            try:
+                reconstruction = self._decode_electrons(prepared)
+                decoded_prediction = replace(
+                    prediction, electron_reconstruction=reconstruction
+                )
+            except (TypeError, ValueError, RuntimeError, IndexError) as error:
+                execution_error.fill_(1)
+                local_execution_error = error
+        else:
+            decoded_prediction = self._attach_decoder_zero(prediction)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(execution_error, op=dist.ReduceOp.SUM)
+        if execution_error > 0:
+            if local_execution_error is not None and not (
+                dist.is_available() and dist.is_initialized()
+            ):
+                raise local_execution_error
+            raise ValueError(
+                "decoder execution is invalid on at least one active distributed rank."
+            )
+        return decoded_prediction
 
     def training_step(self, batch: TrainingBatch, batch_idx: int) -> torch.Tensor:
         """Compute, validate, and synchronously log one training objective.
@@ -271,8 +348,8 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         )
         self.ema.update_after_step(self, step_succeeded=succeeded)
 
-    def _decoder_is_observed(self, targets: TrainingTargets) -> bool:
-        """Return whether an enabled decoder subterm has genuine-QM observations."""
+    def _decoder_active_rows(self, targets: TrainingTargets) -> torch.Tensor:
+        """Return genuine-QM rows selected by at least one effective subterm."""
         loss = self.loss_config.ecloud
         step = int(self.global_step)
         if loss.warmup_end == loss.warmup_start:
@@ -284,27 +361,43 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         else:
             warmup = (step - loss.warmup_start) / (loss.warmup_end - loss.warmup_start)
         if not bool(targets.qm_mask.any()) or loss.weight == 0.0 or warmup == 0.0:
-            return False
-        field_observed = targets.field_mask is None or bool(
-            (targets.qm_mask[:, None] & targets.field_mask).any()
-        )
-        return any(
-            (
-                self.loss_config.ecloud.density and field_observed,
-                self.loss_config.ecloud.gradient and field_observed,
-                self.loss_config.ecloud.electron_count,
-                self.loss_config.ecloud.dipole,
-                self.loss_config.ecloud.cycle,
+            return torch.zeros_like(targets.qm_mask)
+        active = torch.zeros_like(targets.qm_mask)
+        if loss.density or loss.gradient:
+            active |= (
+                targets.field_mask.any(dim=-1)
+                if targets.field_mask is not None
+                else targets.qm_mask
             )
+        if loss.electron_count or loss.dipole:
+            active |= targets.qm_mask
+        if loss.cycle:
+            active |= (
+                targets.latent_cycle_mask.any(dim=-1)
+                if targets.latent_cycle_mask is not None
+                else targets.qm_mask
+            )
+        return active & targets.qm_mask
+
+    def _attach_decoder_zero(self, prediction: ModelPrediction) -> ModelPrediction:
+        """Attach every decoder parameter to the local graph with exact zero value."""
+        zero = prediction.position_velocity.new_zeros(())
+        for parameter in self.field_decoder.parameters():
+            if parameter.requires_grad and parameter.numel():
+                zero = zero + parameter.reshape(-1)[0] * 0.0
+        return replace(
+            prediction,
+            position_velocity=prediction.position_velocity + zero,
         )
 
-    def _decode_electrons(
+    def _prepare_electron_decoder_inputs(
         self,
         prediction: ModelPrediction,
         context: ElectronDecoderContext,
         targets: TrainingTargets,
-    ) -> ElectronReconstruction:
-        """Gather mapped predicted tokens/centers into active QM decoder rows."""
+        active_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Validate and gather active decoder tensors without executing the decoder."""
         flat_latent = prediction.endpoint_electron_latent
         flat_centers = prediction.endpoint_positions
         index = context.flat_index
@@ -342,6 +435,18 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
             raise ValueError(
                 "decoder mapping batch dimension must equal prediction batch size."
             )
+        if (
+            active_rows.shape != (index.shape[0],)
+            or active_rows.dtype != torch.bool
+            or active_rows.device != index.device
+        ):
+            raise ValueError("active decoder rows must be same-device boolean [B].")
+        if (
+            targets.node_batch.shape != (flat_latent.shape[0],)
+            or targets.node_batch.dtype != torch.long
+            or targets.node_batch.device != index.device
+        ):
+            raise ValueError("decoder node_batch must be same-device torch.long [N].")
         selected_index = index[mask]
         if selected_index.unique().numel() != selected_index.numel():
             raise ValueError("decoder mapping contains duplicate flattened nodes.")
@@ -357,16 +462,36 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         )
         if not torch.equal(targets.node_batch[selected_index], rows[mask]):
             raise ValueError("decoder mapping crosses declared complex membership.")
-        safe_index = index.clamp_min(0)
+        safe_index = torch.where(mask, index, torch.zeros_like(index))
         padded = flat_latent[safe_index]
         centers = flat_centers[safe_index]
         padded = torch.where(mask[..., None], padded, torch.zeros_like(padded))
         centers = torch.where(mask[..., None], centers, torch.zeros_like(centers))
-        active_rows = targets.qm_mask
         active_padded = padded[active_rows]
         active_centers = centers[active_rows]
         active_query = context.query_grid[active_rows]
         active_mask = mask[active_rows]
+        if active_query.numel() and not bool(torch.isfinite(active_query).all()):
+            raise ValueError("active decoder query_grid values must be finite.")
+        decode = getattr(self.field_decoder, "decode", None)
+        if not callable(decode):
+            raise TypeError("field_decoder must expose a compatible decode method.")
+        return (
+            active_padded,
+            active_centers,
+            active_query,
+            active_mask,
+            active_rows.nonzero(as_tuple=False).flatten(),
+            torch.tensor(index.shape[0], device=index.device),
+        )
+
+    def _decode_electrons(
+        self, prepared: tuple[torch.Tensor, ...]
+    ) -> ElectronReconstruction:
+        """Execute and scatter decoder output after distributed validation consensus."""
+        active_padded, active_centers, active_query, active_mask, active_index, size = (
+            prepared
+        )
         decode = getattr(self.field_decoder, "decode", None)
         if not callable(decode):
             raise TypeError("field_decoder must expose a compatible decode method.")
@@ -375,8 +500,7 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         )
         if not isinstance(reconstruction, ElectronReconstruction):
             raise TypeError("field_decoder.decode must return ElectronReconstruction.")
-        batch_size = index.shape[0]
-        active_index = active_rows.nonzero(as_tuple=False).flatten()
+        batch_size = int(size.item())
 
         def scatter(value: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
             base = value.new_zeros(shape)

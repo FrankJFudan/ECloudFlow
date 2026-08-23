@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from datetime import timedelta
+from pathlib import Path
 
 import lightning as L
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import nn
 from torch.utils.data import DataLoader
 
@@ -324,6 +328,184 @@ def test_real_decoder_compacts_mixed_qm_rows_before_evaluation() -> None:
     assert backbone.center_x.grad is not None
     assert backbone.center_x.grad[0] != 0
     assert backbone.center_x.grad[1] == 0
+
+
+def test_decoder_compacts_rows_from_actual_enabled_observations() -> None:
+    """Mutation caught: one observed field row caused every QM row to decode."""
+    base = LossConfig()
+    ecloud = base.ecloud.model_copy(
+        update={"electron_count": 0.0, "dipole": 0.0, "cycle": 0.0}
+    )
+    backbone = MixedQMBackbone()
+    module = ECloudFlowTrainingModule(
+        joint_backbone=backbone,
+        field_tokenizer=nn.Identity(),
+        field_decoder=ElectronFieldDecoder(1, 0, 0, 1),
+        loss_config=base.model_copy(update={"ecloud": ecloud}),
+    )
+    batch = _mixed_qm_batch()
+    targets = dataclasses.replace(
+        batch.targets,
+        qm_mask=torch.ones(2, dtype=torch.bool),
+        field_mask=torch.tensor([[True, True], [False, False]]),
+    )
+    batch = dataclasses.replace(batch, targets=targets)
+
+    prediction = module(batch)
+    assert prediction.electron_reconstruction is not None
+    breakdown = compute_ecloudflow_loss(prediction, targets, module.loss_config)
+    breakdown.raw["ecloud"].backward()
+
+    assert backbone.center_x.grad is not None
+    assert backbone.center_x.grad[0] != 0
+    assert backbone.center_x.grad[1] == 0
+
+
+def test_masked_decoder_padding_indices_accept_arbitrary_signed_sentinels() -> None:
+    """Mutation caught: clamp-min still indexed huge positive padding sentinels."""
+    backbone = MixedQMBackbone()
+    module = ECloudFlowTrainingModule(
+        joint_backbone=backbone,
+        field_tokenizer=nn.Identity(),
+        field_decoder=ElectronFieldDecoder(1, 0, 0, 1),
+        loss_config=LossConfig(),
+    )
+    batch = _mixed_qm_batch()
+    assert batch.decoder_context is not None
+    context = dataclasses.replace(
+        batch.decoder_context,
+        atom_mask=torch.tensor([[True, False], [True, False]]),
+        flat_index=torch.tensor([[0, 10**9], [1, -(10**9)]]),
+    )
+    targets = dataclasses.replace(
+        batch.targets,
+        latent_cycle=torch.tensor(
+            [[[0.0], [float("nan")]], [[float("nan")], [float("inf")]]]
+        ),
+        latent_cycle_mask=torch.tensor([[True, False], [True, False]]),
+    )
+    prediction = module(
+        dataclasses.replace(batch, targets=targets, decoder_context=context)
+    )
+    assert prediction.electron_reconstruction is not None
+
+    loss = compute_ecloudflow_loss(prediction, targets, LossConfig()).raw["ecloud"]
+    loss.backward()
+
+    assert backbone.center_x.grad is not None
+    assert backbone.center_x.grad[1] == 0
+
+
+def _distributed_decoder_branch_worker(
+    rank: int, init_file: str, scenario: str
+) -> None:
+    """Exercise decoder branch consensus and parameter graph participation."""
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=Path(init_file).as_uri(),
+        timeout=timedelta(seconds=8),
+    )
+    try:
+        decoder = ElectronFieldDecoder(1, 0, 0, 1)
+        module = ECloudFlowTrainingModule(
+            joint_backbone=TinyJointBackbone(),
+            field_tokenizer=nn.Identity(),
+            field_decoder=decoder,
+            loss_config=LossConfig(),
+        )
+        distributed_module = nn.parallel.DistributedDataParallel(module)
+        active = scenario != "both_inactive" and rank == 0
+        batch = _qm_batch() if active else _batch()
+        if scenario == "invalid_active" and active:
+            batch = dataclasses.replace(batch, decoder_context=None)
+        elif scenario == "malformed_active" and active:
+            assert batch.decoder_context is not None
+            batch = dataclasses.replace(
+                batch,
+                decoder_context=dataclasses.replace(
+                    batch.decoder_context, flat_index=torch.tensor([[0, 0]])
+                ),
+            )
+        message = "ok"
+        try:
+            prediction = distributed_module(batch)
+            loss = compute_ecloudflow_loss(
+                prediction, batch.targets, module.loss_config
+            ).total
+            loss.backward()
+        except (ValueError, RuntimeError) as error:
+            message = f"{type(error).__name__}: {error}"
+        gathered_messages: list[str | None] = [None, None]
+        dist.all_gather_object(gathered_messages, message)
+        if scenario in {"invalid_active", "malformed_active"}:
+            assert gathered_messages[0] == gathered_messages[1]
+            assert "decoder context" in gathered_messages[0].replace("_", " ")
+            return
+        assert gathered_messages == ["ok", "ok"]
+        parameter = next(decoder.parameters())
+        has_gradient = torch.tensor(parameter.grad is not None, dtype=torch.long)
+        gradients = [torch.zeros_like(has_gradient) for _ in range(2)]
+        dist.all_gather(gradients, has_gradient)
+        if scenario == "active_inactive":
+            assert all(bool(value) for value in gradients)
+            assert parameter.grad is not None
+            local_norm = parameter.grad.detach().abs().sum()
+            norms = [torch.zeros_like(local_norm) for _ in range(2)]
+            dist.all_gather(norms, local_norm)
+            assert norms[0] > 0
+            assert torch.equal(norms[0], norms[1])
+        else:
+            assert not any(bool(value) for value in gradients)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gloo_decoder_active_and_inactive_ranks_share_parameter_graph(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: rank-local decode made decoder parameters unused on one rank."""
+    mp.spawn(
+        _distributed_decoder_branch_worker,
+        args=(str(tmp_path / "decoder-active-inactive"), "active_inactive"),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_gloo_decoder_invalid_active_context_raises_on_every_rank(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: active-rank context raise stranded an inactive peer."""
+    mp.spawn(
+        _distributed_decoder_branch_worker,
+        args=(str(tmp_path / "decoder-invalid"), "invalid_active"),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_gloo_decoder_malformed_active_context_raises_on_every_rank(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: active mapping validation must precede rank-local decode."""
+    mp.spawn(
+        _distributed_decoder_branch_worker,
+        args=(str(tmp_path / "decoder-malformed"), "malformed_active"),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_gloo_decoder_both_inactive_skips_decode_collectively(tmp_path: Path) -> None:
+    """Mutation caught: global-inactive batches unnecessarily touched decoder params."""
+    mp.spawn(
+        _distributed_decoder_branch_worker,
+        args=(str(tmp_path / "decoder-inactive"), "both_inactive"),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_decoder_mapping_rejects_duplicates() -> None:

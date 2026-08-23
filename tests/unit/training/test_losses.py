@@ -356,6 +356,31 @@ def test_enabled_qm_term_requires_real_reconstruction() -> None:
         compute_ecloudflow_loss(prediction, _targets(), LossConfig())
 
 
+def test_enabled_field_terms_with_no_selected_points_require_no_reconstruction() -> (
+    None
+):
+    """Mutation caught: a configured but unobserved field term forced decoding."""
+    base = LossConfig()
+    ecloud = base.ecloud.model_copy(
+        update={"electron_count": 0.0, "dipole": 0.0, "cycle": 0.0}
+    )
+    targets = replace(
+        _targets(),
+        field_mask=torch.zeros(2, 2, dtype=torch.bool),
+        density=None,
+        density_gradient=None,
+    )
+
+    result = compute_ecloudflow_loss(
+        replace(_prediction(), electron_reconstruction=None),
+        targets,
+        base.model_copy(update={"ecloud": ecloud}),
+    )
+
+    assert result.raw["ecloud"].item() == 0.0
+    assert result.diagnostics.supervised_counts["ecloud_density"].item() == 0
+
+
 def test_zero_weight_scientific_subterms_do_not_require_unused_context() -> None:
     """Mutation caught: disabled terms still demand labels or prediction auxiliaries."""
     base = LossConfig()
@@ -428,6 +453,26 @@ def test_qm_target_shape_cannot_broadcast_across_field_points() -> None:
 
 
 @pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"field_mask": torch.ones(2, 2)}, "field_mask"),
+        ({"latent_cycle_mask": torch.ones(2, 2)}, "latent_cycle_mask"),
+        ({"bond_length_mean": torch.tensor([1.4])}, "bond_length_mean"),
+        ({"affinity": torch.ones(2, 1)}, "affinity target"),
+        ({"affinity": torch.tensor([float("nan"), 0.0])}, "active affinity"),
+    ],
+)
+def test_optional_contracts_raise_named_errors_before_arithmetic_or_indexing(
+    change: dict[str, torch.Tensor], message: str
+) -> None:
+    """Mutation caught: optional tensor errors leaked from broadcasting/index kernels."""
+    with pytest.raises(ValueError, match=message):
+        compute_ecloudflow_loss(
+            _prediction(), replace(_targets(), **change), LossConfig()
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "bad"),
     [
         ("atom_classes", torch.tensor([2, 1, 0])),
@@ -467,7 +512,7 @@ def test_sparse_halfedges_must_be_canonical_and_same_complex() -> None:
         ),
         (
             {
-                "ring_triplets": torch.tensor([[0], [1], [2]]),
+                "ring_triplets": torch.tensor([[1], [0], [2]]),
                 "ring_angle_mean": torch.tensor([1.0]),
                 "ring_angle_std": torch.tensor([-0.1]),
             },
@@ -483,6 +528,85 @@ def test_sparse_scientific_topology_is_validated_without_dense_allocation(
         compute_ecloudflow_loss(
             _prediction(), replace(_targets(), **change), LossConfig()
         )
+
+
+def test_ring_triplets_reject_reversed_duplicates_and_missing_bond_arms() -> None:
+    """Mutation caught: ring angles were accepted without canonical bonded support."""
+    valid = replace(
+        _targets(),
+        ring_triplets=torch.tensor([[1], [0], [2]]),
+        ring_angle_mean=torch.tensor([1.0]),
+        ring_angle_std=torch.tensor([0.1]),
+    )
+    result = compute_ecloudflow_loss(_prediction(), valid, LossConfig())
+    assert torch.isfinite(result.raw["chem"])
+
+    duplicate = replace(
+        valid,
+        ring_triplets=torch.tensor([[1, 2], [0, 0], [2, 1]]),
+        ring_angle_mean=torch.tensor([1.0, 1.0]),
+        ring_angle_std=torch.tensor([0.1, 0.1]),
+    )
+    with pytest.raises(ValueError, match="unique"):
+        compute_ecloudflow_loss(_prediction(), duplicate, LossConfig())
+
+    missing_arm = replace(valid, ring_triplets=torch.tensor([[0], [1], [2]]))
+    with pytest.raises(ValueError, match="bonded arms"):
+        compute_ecloudflow_loss(_prediction(), missing_arm, LossConfig())
+
+
+def test_ring_triplet_rejects_cross_complex_membership() -> None:
+    """Mutation caught: ring topology could span complexes despite valid bond rows."""
+    prediction = _prediction()
+
+    def append_node(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.cat((tensor.detach(), tensor.detach()[:1]), dim=0).requires_grad_(
+            tensor.requires_grad
+        )
+
+    prediction = replace(
+        prediction,
+        position_velocity=append_node(prediction.position_velocity),
+        position_score=append_node(prediction.position_score),
+        electron_velocity=append_node(prediction.electron_velocity),
+        electron_score=append_node(prediction.electron_score),
+        atom_logits=append_node(prediction.atom_logits),
+        charge_logits=append_node(prediction.charge_logits),
+        endpoint_positions=append_node(prediction.endpoint_positions),
+        endpoint_electron_latent=append_node(prediction.endpoint_electron_latent),
+    )
+    targets = _targets()
+    chem = LossConfig().chem.model_copy(
+        update={
+            "valence": 0.0,
+            "bond_length": 0.0,
+            "ligand_clash": 0.0,
+            "protein_clash": 0.0,
+            "connectivity": 0.0,
+            "affinity": 0.0,
+        }
+    )
+    config = LossConfig().model_copy(update={"chem": chem})
+    targets = replace(
+        targets,
+        position_velocity=torch.cat((targets.position_velocity, torch.zeros(1, 3))),
+        position_score=torch.cat((targets.position_score, torch.zeros(1, 3))),
+        electron_velocity=torch.cat((targets.electron_velocity, torch.zeros(1, 2))),
+        electron_score=torch.cat((targets.electron_score, torch.zeros(1, 2))),
+        atom_classes=torch.tensor([0, 1, 0, 0]),
+        charge_classes=torch.tensor([0, 1, 0, 0]),
+        editable_atom_mask=torch.tensor([True, False, True, True]),
+        node_batch=torch.tensor([0, 0, 1, 1]),
+        halfedge_index=torch.tensor([[0, 2], [1, 3]]),
+        halfedge_batch=torch.tensor([0, 1]),
+        valence_limits=torch.full((4,), 4.0),
+        ring_triplets=torch.tensor([[0], [1], [2]]),
+        ring_angle_mean=torch.tensor([1.0]),
+        ring_angle_std=torch.tensor([0.1]),
+    )
+
+    with pytest.raises(ValueError, match="one complex"):
+        compute_ecloudflow_loss(prediction, targets, config)
 
 
 def test_active_bond_prior_requires_positive_finite_stddev() -> None:
@@ -511,6 +635,13 @@ def test_diagnostics_count_actual_enabled_observations_per_subterm() -> None:
     assert counts["interaction"] == 2
 
 
+def test_default_cycle_mask_counts_observed_tokens_not_qm_rows() -> None:
+    """Mutation caught: default cycle diagnostics counted complexes instead of tokens."""
+    result = compute_ecloudflow_loss(_prediction(), _targets(), LossConfig())
+
+    assert result.diagnostics.supervised_counts["ecloud_cycle"].item() == 2
+
+
 def test_disabled_component_does_not_initialize_or_decay_running_scale() -> None:
     """Mutation caught: broad masks update a scale for a zero-weight component."""
     base = LossConfig()
@@ -521,6 +652,66 @@ def test_disabled_component_does_not_initialize_or_decay_running_scale() -> None
     compute_ecloudflow_loss(_prediction(), _targets(), config, scaler=scaler)
 
     assert not scaler.initialized[scaler.component_names.index("ecloud")]
+
+
+def test_disabled_optional_components_require_no_context_and_report_zero_counts() -> (
+    None
+):
+    """Mutation caught: component-zero chemistry/interaction still required labels."""
+    base = LossConfig()
+    config = base.model_copy(
+        update={
+            "flow": base.flow.model_copy(update={"weight": 0.0}),
+            "chem": base.chem.model_copy(update={"weight": 0.0}),
+            "interaction": base.interaction.model_copy(update={"weight": 0.0}),
+        }
+    )
+    targets = replace(
+        _targets(),
+        valence_limits=None,
+        bond_order_values=None,
+        bond_length_mean=None,
+        bond_length_std=None,
+        nonbonded_halfedge_index=None,
+        protein_positions=None,
+        protein_batch=None,
+        ring_triplets=None,
+        ring_angle_mean=None,
+        ring_angle_std=None,
+        affinity=None,
+        interaction=None,
+    )
+
+    result = compute_ecloudflow_loss(_prediction(), targets, config)
+
+    assert result.raw["chem"].item() == 0.0
+    assert result.raw["interaction"].item() == 0.0
+    assert result.diagnostics.supervised_counts["flow_position"].item() == 0
+    assert all(
+        value.item() == 0
+        for name, value in result.diagnostics.supervised_counts.items()
+        if name.startswith("chem_") or name == "interaction"
+    )
+
+
+def test_disabled_sparse_subterms_do_not_index_inactive_sentinels() -> None:
+    """Mutation caught: diagnostics indexed disabled pair/triplet sentinel values."""
+    base = LossConfig()
+    chem = base.chem.model_copy(update={"ligand_clash": 0.0, "ring_strain": 0.0})
+    targets = replace(
+        _targets(),
+        nonbonded_halfedge_index=torch.tensor([[-(10**9)], [10**9]]),
+        ring_triplets=torch.tensor([[-(10**9)], [10**9], [10**9 + 1]]),
+        ring_angle_mean=torch.tensor([float("nan")]),
+        ring_angle_std=torch.tensor([float("inf")]),
+    )
+
+    result = compute_ecloudflow_loss(
+        _prediction(), targets, base.model_copy(update={"chem": chem})
+    )
+
+    assert result.diagnostics.supervised_counts["chem_ligand_clash"].item() == 0
+    assert result.diagnostics.supervised_counts["chem_ring_strain"].item() == 0
 
 
 def test_zero_weight_ecloud_component_requires_no_decoder_prediction() -> None:
@@ -739,6 +930,48 @@ def test_gloo_scaler_handles_asymmetric_finite_and_missing_supervision(
     mp.spawn(
         _distributed_asymmetric_presence_worker,
         args=(str(tmp_path / "gloo-asymmetric"),),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _distributed_diagnostic_counts_worker(rank: int, init_file: str) -> None:
+    """Require globally identical detached counts with asymmetric local masks."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=Path(init_file).as_uri()
+    )
+    try:
+        targets = _targets()
+        if rank == 1:
+            targets = replace(
+                targets,
+                editable_atom_mask=torch.zeros(3, dtype=torch.bool),
+                editable_bond_mask=torch.zeros(2, dtype=torch.bool),
+                count_mask=torch.zeros(2, dtype=torch.bool),
+                qm_mask=torch.zeros(2, dtype=torch.bool),
+                interaction_mask=torch.zeros(2, dtype=torch.bool),
+                affinity_mask=torch.zeros(2, dtype=torch.bool),
+            )
+        result = compute_ecloudflow_loss(_prediction(), targets, LossConfig())
+        names = sorted(result.diagnostics.supervised_counts)
+        vector = torch.stack(
+            [result.diagnostics.supervised_counts[name].long() for name in names]
+        )
+        gathered = [torch.zeros_like(vector) for _ in range(2)]
+        dist.all_gather(gathered, vector)
+        assert torch.equal(gathered[0], gathered[1])
+        assert vector[names.index("flow_position")].item() == 2
+        assert vector[names.index("ecloud_density")].item() == 2
+        assert vector[names.index("interaction")].item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gloo_diagnostics_counts_are_globally_consistent(tmp_path: Path) -> None:
+    """Mutation caught: rank-local diagnostic counts disagreed on uneven batches."""
+    mp.spawn(
+        _distributed_diagnostic_counts_worker,
+        args=(str(tmp_path / "gloo-counts"),),
         nprocs=2,
         join=True,
     )
