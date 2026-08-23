@@ -54,6 +54,68 @@ def test_categorical_probability_endpoints_are_exact_canonical_values() -> None:
     assert torch.equal(finish, torch.nn.functional.one_hot(target, 3).float())
 
 
+@pytest.mark.parametrize(
+    ("dtype", "values"),
+    [
+        (
+            torch.float32,
+            [0.15578578412532806, 0.49655890464782715, 0.34765538573265076],
+        ),
+        (
+            torch.float64,
+            [
+                0.08925704295312828,
+                0.22671240210546825,
+                0.2331887041102485,
+                0.24161213145514088,
+                0.20922971937601423,
+            ],
+        ),
+    ],
+)
+def test_adversarial_categorical_priors_are_continuous_at_exact_endpoints(
+    dtype: torch.dtype,
+    values: list[float],
+) -> None:
+    """Rounded priors have no normalization jump beside either endpoint."""
+    path = CategoricalPath(len(values), torch.tensor(values, dtype=dtype))
+    target = torch.tensor([len(values) - 1])
+    zero = torch.tensor(0.0, dtype=dtype)
+    one = torch.tensor(1.0, dtype=dtype)
+    near_zero = torch.nextafter(zero, one)
+    near_one = torch.nextafter(one, zero)
+
+    start = path.probabilities(target, zero)
+    just_after_start = path.probabilities(target, near_zero)
+    finish = path.probabilities(target, one)
+    just_before_finish = path.probabilities(target, near_one)
+    expected_finish = torch.nn.functional.one_hot(target, len(values)).to(dtype)
+    epsilon = torch.finfo(dtype).eps
+
+    assert abs(path.prior.sum().item() - 1.0) <= epsilon
+    assert torch.equal(start, path.prior.unsqueeze(0))
+    assert torch.equal(just_after_start, start)
+    assert torch.equal(finish, expected_finish)
+    assert (just_before_finish - finish).abs().max().item() <= epsilon
+
+    interior = path.probabilities(target, torch.tensor(0.37, dtype=dtype))
+    assert bool((interior >= 0.0).all())
+    assert abs(interior.sum().item() - 1.0) <= epsilon
+
+    coefficients = torch.linspace(-0.75, 1.25, len(values), dtype=dtype)
+    expected_gradient = ((expected_finish - path.prior) * coefficients).sum()
+    for endpoint in (0.0, 1.0):
+        time = torch.tensor(endpoint, dtype=dtype, requires_grad=True)
+        probabilities = path.probabilities(target, time)
+        gradient = torch.autograd.grad((probabilities * coefficients).sum(), time)[0]
+        torch.testing.assert_close(
+            gradient,
+            expected_gradient,
+            atol=4 * epsilon,
+            rtol=4 * epsilon,
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_categorical_endpoint_values_keep_one_sided_time_gradients(
     dtype: torch.dtype,

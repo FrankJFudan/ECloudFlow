@@ -191,3 +191,75 @@ endpoint correction; it neither mutates inputs nor changes fixed-mask handling,
 prior validation, retained float64 behavior, or interior simplex values. The
 endpoint-gradient tests use a non-constant class weighting so the analytically
 nonzero derivative cannot be hidden by simplex-sum cancellation.
+
+## Fix Round 4
+
+### RED evidence
+
+At reviewed head `93e397f`, adversarial priors were added for the two retained
+probability dtypes. The float32 construction produced a canonical prior sum of
+`0.9999999403953552`; the float64 construction produced
+`0.9999999999999999`. Normalizing the closest representable interior value
+again changed a component by `2.9802322387695312e-08` and
+`2.7755575615628914e-17`, respectively, even though the exact `t=0` branch
+returned the stored prior.
+
+Command:
+
+`conda run -n 3dmolecule python -m pytest tests/unit/process/test_categorical.py -k adversarial -vv`
+
+Output: `2 failed, 9 deselected`; both failures reported the non-unit stored
+sums above before reaching the closest-interior equality assertion.
+
+### Changes and numerical contract
+
+- `CategoricalPath.probabilities` now uses the construction-time canonical prior
+  directly in the affine expression at every time. It no longer applies a
+  distinct interior division followed by endpoint-only straight-through value
+  correction.
+- Exact `t=0` and `t=1` values now arise from the same affine expression as the
+  interior. Its autograd derivative is therefore exactly the documented
+  `one_hot(target) - prior` affine derivative at both endpoints.
+- The accepted prior is still validated with the existing strict, dtype-specific
+  absolute tolerances and normalized exactly once into the retained float32 or
+  float64 probability dtype. No acceptance tolerance was widened.
+- New adversarial float32 and float64 tests use `nextafter(0, 1)` and
+  `nextafter(1, 0)`. They require bitwise equality at `t=0`, `t=1`, and the
+  closest value after zero where affine rounding cannot yet change a component;
+  the near-one and simplex checks are bounded by machine epsilon. The same
+  priors also exercise both endpoint gradients. Existing BF16, strict rejection,
+  multinomial dtype, and exact fixed-mask regressions remain active.
+
+### GREEN evidence
+
+- `conda run -n 3dmolecule python -m pytest tests/unit/process
+  tests/unit/test_source_docs.py -v`: `44 passed in 1.84s`.
+- `conda run -n 3dmolecule python -m ruff check src/ecloudflow/process
+  tests/unit/process tests/unit/test_source_docs.py tools/check_python_docs.py`:
+  `All checks passed!`
+- `conda run -n 3dmolecule python -m ruff format --check
+  src/ecloudflow/process tests/unit/process tests/unit/test_source_docs.py
+  tools/check_python_docs.py`: `9 files already formatted`.
+- `conda run -n 3dmolecule python -m mypy src/ecloudflow/process`:
+  `Success: no issues found in 4 source files`.
+- `conda run -n 3dmolecule python tools/check_python_docs.py
+  src/ecloudflow/process`: exit code 0 with no output.
+- `conda run -n 3dmolecule python -m pytest -v`: `225 passed, 1 skipped,
+  14 warnings in 15.15s`; the skip is the external xTB smoke test and all
+  warnings are the existing third-party Matplotlib/PyParsing deprecations.
+
+A preliminary attempt to launch multiple `conda run` gates concurrently hit a
+Windows temporary-file collision (`__conda_tmp_14799.txt`) in four launchers;
+all required gates were then rerun serially with the successful outputs above.
+
+### Changed files and self-review
+
+Changed `src/ecloudflow/process/categorical.py`,
+`tests/unit/process/test_categorical.py`, and this report. The final formulation
+is smaller than the round-3 endpoint correction and has no endpoint-specific
+forward representation. Convex interpolation preserves non-negativity, and its
+sum differs from mathematical one only by retained-dtype reduction rounding,
+which the regressions bound at machine-epsilon scale for the adversarial probes.
+Exact fixed rows remain supplied by the unchanged functional mask replacement.
+No mutation, device, target-shape, validation, sampling, loss, or low-precision
+code path changed. No known concern remains within the Task 9 contract.

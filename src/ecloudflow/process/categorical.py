@@ -34,7 +34,8 @@ class CategoricalPath:
             vocabulary, at least two.
         :param prior: Finite floating normalized simplex of shape ``[C]`` on
             the device that target class tensors will use. Reduced-precision
-            priors are checked in float32 and normalized there for stable rows.
+            priors are checked in float32 and normalized once in the retained
+            probability dtype.
         :raises ValueError: If class count, prior shape/dtype/finiteness/device,
             non-negativity, or normalization is invalid.
         """
@@ -66,11 +67,14 @@ class CategoricalPath:
             contracts are invalid.
 
         ``t=0`` is exactly the configured prior and ``t=1`` is exactly the data
-        one-hot distribution. A straight-through value correction retains those
-        exact forward values while its time gradient is the intended affine
-        one-sided derivative ``one_hot(target)-prior`` at both endpoints.
-        Interior rows use stable normalization. The calculation does not mutate
-        either input and preserves autograd through a floating time tensor.
+        one-hot distribution. One canonical prior representation is used at
+        endpoints and in the interior, avoiding a normalization discontinuity.
+        The affine interpolation uses this retained representation directly;
+        consequently its simplex sum is accurate to the retained dtype without
+        an endpoint-specific renormalization step. Its time derivative is
+        ``one_hot(target)-prior``, including at both endpoints. The calculation
+        does not mutate either input and preserves autograd through a floating
+        time tensor.
         """
         _validate_target(target, self.num_classes, self._prior.device)
         expanded_time = _expand_time(time, target)
@@ -79,16 +83,7 @@ class CategoricalPath:
         )
         prior = self._prior.reshape(*([1] * target.ndim), self.num_classes)
         weights = expanded_time.to(dtype=self._prior.dtype).unsqueeze(-1)
-        interpolated = (1.0 - weights) * prior + weights * one_hot
-        normalized = interpolated / interpolated.sum(dim=-1, keepdim=True)
-        start = expanded_time.eq(0.0).unsqueeze(-1)
-        end = expanded_time.eq(1.0).unsqueeze(-1)
-        forward_values = torch.where(
-            start,
-            prior.expand(*target.shape, self.num_classes),
-            torch.where(end, one_hot, normalized),
-        )
-        probabilities = interpolated + (forward_values - interpolated).detach()
+        probabilities = (1.0 - weights) * prior + weights * one_hot
         if not bool(torch.isfinite(probabilities).all()):
             raise ValueError("categorical probabilities must remain finite.")
         return probabilities
