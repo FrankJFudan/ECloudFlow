@@ -53,7 +53,11 @@ class _ShardBatchDataset(IterableDataset[list[ComplexSample]]):
         is read when iteration begins, so persistent worker processes observe a
         later :meth:`ECloudDataModule.set_epoch` call without loader recreation.
         Whole-shard ownership is preferred; sparse shards use indexed members
-        and never deserialize samples owned by another rank or worker.
+        and never deserialize samples owned by another rank or worker. Returned
+        complexes preserve ``[N, 3]`` local binding-frame coordinates in
+        angstroms, floating dtype/device, graph features, chemical/field masks,
+        and provenance. The worker mutates only its iterator/bucket state and an
+        optional verified cache; manifest mappings and samples remain immutable.
         """
         worker = get_worker_info()
         worker_id, worker_count = (worker.id, worker.num_workers) if worker else (0, 1)
@@ -115,14 +119,26 @@ class ECloudDataModule(LightningDataModule):
         self.paths: tuple[Path, ...] = ()
 
     def setup(self, stage: str | None = None) -> None:
-        """Read the immutable manifest and resolve its shard paths.
+        """Validate and transactionally publish immutable dataset state.
 
-        :param stage: Optional Lightning stage; shard discovery is stage agnostic.
+        :param stage: Optional Lightning lifecycle stage. Discovery is identical
+            for ``fit``, ``validate``, ``test``, ``predict``, and ``None``.
         :return: None.
         :rtype: None
-        :raises DataValidationError: If the manifest or recorded shards are absent.
+        :raises DataValidationError: If the manifest/shards are absent or
+            invalid, or if a restore-before-setup checkpoint hash disagrees.
+
+        The manifest and resolved generation paths are held in local variables
+        until every existence, schema, exact-partition, and pending-checkpoint
+        validation succeeds. Entry clears previously published module state;
+        therefore any caught failure leaves loaders unusable until a later valid
+        setup. This CPU-only operation reads metadata/path existence but never
+        opens shard tensors, changes dtype/device/frame/angstrom coordinates or
+        masks, writes files, or mutates the frozen manifest.
         """
         del stage
+        self.manifest = None
+        self.paths = ()
         shard_root = Path(self.config.shard_dir)
         manifest_path = (
             Path(self.config.manifest)
@@ -141,13 +157,13 @@ class ECloudDataModule(LightningDataModule):
         missing = [str(path) for path in paths if not path.is_file()]
         if missing:
             raise DataValidationError(f"dataset shards do not exist: {missing}")
-        self.manifest = manifest
-        self.paths = paths
         if (
             self._pending_manifest_hash is not None
             and self._pending_manifest_hash != manifest.hash
         ):
             raise DataValidationError("checkpoint dataset manifest hash mismatch")
+        self.manifest = manifest
+        self.paths = paths
 
     def train_dataloader(self) -> DataLoader[list[ComplexSample]]:
         """Create the configured training-partition loader.
@@ -214,6 +230,8 @@ class ECloudDataModule(LightningDataModule):
         The synchronized CPU scalar is worker-visible and contains no device
         tensors. Equal seed/epoch pairs reproduce order; a changed epoch changes
         bounded-shuffle order without recreating persistent workers.
+        Updating the scalar does not mutate samples, manifests, shard files,
+        coordinate frames, tensor dtype/device, graph features, or masks.
         """
         if epoch < 0:
             raise ValueError("epoch must be nonnegative")
@@ -229,6 +247,8 @@ class ECloudDataModule(LightningDataModule):
 
         The method performs no filesystem mutation. A manifest hash is absent
         only when Lightning requests state before :meth:`setup`.
+        Returned values contain no tensors/devices and are stable across ranks
+        for equal epoch and manifest; callers receive a new mutable dictionary.
         """
         return {
             "epoch": self.epoch,
@@ -246,6 +266,10 @@ class ECloudDataModule(LightningDataModule):
 
         Lightning may restore state before calling ``setup``. The expected hash
         is retained and checked as soon as the immutable manifest is loaded.
+        If state arrives after setup, a mismatch fails before the epoch changes.
+        Otherwise the synchronized CPU epoch scalar is updated deterministically
+        for persistent workers. No shard/sample tensor, dtype, device, binding
+        frame, angstrom coordinate, feature, or mask is mutated.
         """
         expected = state_dict.get("manifest_hash")
         if expected is not None and not isinstance(expected, str):

@@ -256,11 +256,20 @@ def build_grouped_split(
     :return: Sample partitions plus entity/group audit lookups and a hash.
     :rtype: GroupedSplit
     :raises ValueError: If thresholds, fractions, identifiers, SMILES, or
-        duplicate sample records are invalid.
+        duplicate sample records are invalid, or if explicit protein/ligand
+        grouping evidence is missing.
 
     Protein and ligand relationships are joined in one disjoint-set graph.
     Consequently, transitive leakage chains are kept together even when one
     pair shares a protein cluster and another pair shares a ligand scaffold.
+    Raw protein fallback edges use deterministic affine-gap global alignment;
+    raw ligand edges use CPU Morgan fingerprints over Murcko scaffolds. The
+    resulting connected components, not individual samples, are assigned by a
+    seeded stable ordering. Inputs are read but never mutated, and all audit
+    thresholds, source identifiers, normalized-input hashes, groups, and
+    qualified entity namespaces are preserved in the returned frozen record.
+    Pairwise fallbacks are quadratic and intended for audit-sized datasets;
+    production preprocessing should provide explicit clusters.
     """
     _validate_split_parameters(sequence_identity, ligand_tanimoto, fractions)
     rows = sorted((dict(record) for record in records), key=_sample_identifier)
@@ -443,10 +452,19 @@ def _union_similar_sequences(
 def _global_alignment_identity(left: str, right: str) -> float:
     """Return deterministic global-alignment identity including gap columns.
 
+    :param left: Non-empty protein sequence using residue character codes.
+    :param right: Non-empty protein sequence in the same residue alphabet.
+    :return: Exact-match count divided by alignment columns, in ``[0, 1]``.
+    :rtype: float
+    :raises ValueError: If Biopython cannot align an empty/invalid sequence.
+
     A global affine-gap alignment is selected with fixed scores. Identity is
     exact character matches divided by the full alignment length, including
     insertions/deletions. This prevents a single indel from shifting every
-    downstream comparison as an ungapped ``zip`` calculation would.
+    downstream comparison as an ungapped ``zip`` calculation would. Scores are
+    dimensionless (match ``2``, mismatch ``-1``, gap open ``-2``, extension
+    ``-0.5``); execution is deterministic on CPU and does not mutate either
+    sequence. Complexity is quadratic in sequence length for this audit fallback.
     """
     aligner = PairwiseAligner(mode="global")
     aligner.match_score = 2.0

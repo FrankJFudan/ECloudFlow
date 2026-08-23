@@ -239,12 +239,21 @@ class DatasetManifest:
         return data
 
     def write(self, path: str | Path) -> None:
-        """Atomically write and fsync this manifest as stable JSON.
+        """Publish this immutable dataset descriptor as stable fsynced JSON.
 
-        :param path: Final manifest path in an existing or new directory.
+        :param path: Final manifest path; missing parent directories are created.
         :return: None.
         :rtype: None
         :raises OSError: If bytes cannot be written, synchronized, or renamed.
+
+        Canonical JSON includes the derived content hash, ordered sample/shard
+        membership, byte sizes, SHA-256 values, split audit metadata, skips, and
+        immutable generation paths. Bytes are written to a sibling ``.partial``
+        file, flushed and ``fsync``-ed, then atomically replaced. Readers see
+        either the previous complete manifest or this complete manifest, never
+        a mixed generation. The method mutates only the destination filesystem;
+        it does not alter this frozen record, shard tensors, coordinate frames,
+        devices, dtypes, masks, or source data.
         """
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -258,12 +267,22 @@ class DatasetManifest:
 
     @classmethod
     def read(cls, path: str | Path) -> DatasetManifest:
-        """Read and verify a manifest emitted by :meth:`write`.
+        """Load and fully validate a published immutable dataset descriptor.
 
-        :param path: Existing JSON manifest path.
-        :return: Reconstructed typed manifest.
+        :param path: Existing UTF-8 JSON manifest emitted by :meth:`write`.
+        :return: Frozen typed manifest with ordered shards and mapping proxies.
         :rtype: DatasetManifest
-        :raises ValueError: If the stored manifest fingerprint is inconsistent.
+        :raises OSError: If the manifest cannot be read from the filesystem.
+        :raises json.JSONDecodeError: If the file is not valid JSON.
+        :raises KeyError: If a required shard, skip, or audit field is absent.
+        :raises TypeError: If stored values cannot reconstruct typed records.
+        :raises ValueError: If hashes, paths, partition coverage, generation
+            identity, or the stored manifest fingerprint are inconsistent.
+
+        Loading performs no shard decoding, tensor/device transfer, or file
+        mutation. Constructor validation requires grouped assignments and audit
+        inputs to cover exactly the serialized sample IDs and rejects unsafe
+        shard paths before callers resolve them.
         """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         expected_hash = data.pop("hash", None)

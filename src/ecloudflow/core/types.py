@@ -79,7 +79,21 @@ class QMProvenance:
         )
 
     def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
-        """Serialize immutable mappings for multiprocessing worker transport."""
+        """Describe lossless CPU-process transport for QM provenance.
+
+        :return: The validated record type and its complete constructor argument
+            tuple, with the read-only source-hash view copied to a plain mapping.
+        :rtype: tuple[Any, tuple[Any, ...]]
+        :raises ContractValidationError: During receiver reconstruction if
+            transported QM metadata violates the canonical provenance contract.
+
+        Pickle invokes this hook only for process/checkpoint transport. It does
+        not run xTB, alter ``qm_mask``, move tensors between devices, or mutate
+        this frozen record. Reconstruction calls :class:`QMProvenance`, which
+        revalidates command, charge, multiplicity, status, and source hashes and
+        restores an immutable mapping. Malformed transported values therefore
+        fail through the normal provenance contract rather than bypassing it.
+        """
         return (
             type(self),
             (
@@ -656,7 +670,21 @@ class SampleProvenance:
             )
 
     def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
-        """Serialize read-only provenance mappings across DataLoader processes."""
+        """Describe lossless DataLoader transport for sample provenance.
+
+        :return: The validated provenance type and complete constructor values;
+            immutable metadata views are represented as ordinary dictionaries.
+        :rtype: tuple[Any, tuple[Any, ...]]
+        :raises ContractValidationError: During receiver reconstruction if a
+            mapping or ligand-coordinate tensor violates provenance invariants.
+
+        The optional ``original_ligand_positions`` tensor keeps its ``[N, 3]``
+        shape, Cartesian angstrom frame, floating dtype, device, and values.
+        This hook performs no device transfer, source-file access, hash update,
+        or in-place mutation. The receiving constructor rechecks finite
+        coordinates and freezes every metadata mapping, so persistent worker
+        transport preserves the canonical provenance invariants.
+        """
         return (
             type(self),
             (
@@ -781,11 +809,19 @@ class ComplexSample:
 
         :return: Constructor and primitive argument tuple understood by pickle.
         :rtype: tuple[Any, tuple[Any, ...]]
+        :raises ContractValidationError: During receiver reconstruction if any
+            transported graph, frame, field, provenance, or fragment is invalid.
 
         PyTorch DataLoader uses multiprocessing pickle between persistent CPU
         workers and the training process. ``MappingProxyType`` is intentionally
         not picklable, so mappings are copied to ordinary dictionaries only for
         transport; the receiving constructor revalidates and freezes them.
+        Pocket/ligand/field coordinates retain ``[N, 3]`` shapes, local binding
+        frame, angstrom units, floating dtype and device; graph features, masks,
+        batch indices, formal charges, bond orders, and optional fragment fixed
+        masks are unchanged. The method performs no sampling, tensor transfer,
+        filesystem access, or mutation. Any incompatible reconstructed tensor
+        fails the ordinary :class:`ComplexSample` contract.
         """
         return (
             type(self),

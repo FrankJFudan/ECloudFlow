@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from ecloudflow.config.schema import DataConfig
 from ecloudflow.data.datamodule import ECloudDataModule
 from ecloudflow.data.diffgui_lmdb import DiffGuiLMDBImporter
+from ecloudflow.data.manifest import DatasetManifest
 from ecloudflow.data.parsers import build_complex_sample
 from ecloudflow.data.shards import ShardWriter
 from ecloudflow.data.splits import GroupedSplit, SplitAudit
@@ -179,3 +180,16 @@ def test_checkpoint_hash_loaded_before_setup_is_validated_later(
     second.load_state_dict(state)
     with pytest.raises(DataValidationError, match="manifest hash mismatch"):
         second.setup()
+    assert second.manifest is None
+    assert second.paths == ()
+    with pytest.raises(DataValidationError, match="manifest hash mismatch"):
+        second.train_dataloader()
+
+    second.load_state_dict(
+        {
+            "epoch": 0,
+            "manifest_hash": DatasetManifest.read(second_root / "manifest.json").hash,
+        }
+    )
+    second.setup()
+    assert second.manifest is not None

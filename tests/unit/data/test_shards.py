@@ -112,7 +112,7 @@ def test_skips_are_stable_and_shuffle_and_buckets_are_deterministic(
         tmp_path,
     )
     assert len(manifest.skips) == 1
-    assert manifest.skips[0].sample_id == "unknown"
+    assert manifest.skips[0].sample_id == "anonymous"
     paths = manifest.shard_paths(tmp_path)
     first = [s.source_id for s in stream_samples(paths, seed=4, shuffle_buffer=3)]
     second = [s.source_id for s in stream_samples(paths, seed=4, shuffle_buffer=3)]
@@ -156,6 +156,61 @@ def test_interrupted_generation_resumes_and_old_manifest_stays_valid(
     for path, digest in old_shards.items():
         assert path.is_file()
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("before_promotion", "after_promotion", "after_manifest"),
+)
+def test_publication_state_machine_recovers_every_crash_boundary_without_replay(
+    fixture_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """Ready generations publish idempotently without consuming samples twice."""
+    samples = _samples(fixture_dir, 3)
+    writer = ShardWriter(max_samples_per_shard=2)
+    import ecloudflow.data.shards as shard_module
+
+    original_promote = shard_module._promote_generation
+    original_publish = shard_module._publish_dataset_manifest
+    interrupted = False
+
+    def promote(stage_dir: Path, generation_dir: Path) -> None:
+        nonlocal interrupted
+        if boundary == "before_promotion" and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated crash before promotion")
+        original_promote(stage_dir, generation_dir)
+        if boundary == "after_promotion" and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated crash after promotion")
+
+    def publish(manifest: DatasetManifest, output_dir: Path) -> None:
+        nonlocal interrupted
+        if boundary == "after_promotion" and not interrupted:
+            raise AssertionError("promotion interruption did not execute")
+        original_publish(manifest, output_dir)
+        if boundary == "after_manifest" and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated crash after manifest")
+
+    monkeypatch.setattr(shard_module, "_promote_generation", promote)
+    monkeypatch.setattr(shard_module, "_publish_dataset_manifest", publish)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        writer.write(samples, tmp_path)
+    assert interrupted
+
+    class MustNotIterate:
+        def __iter__(self):
+            raise AssertionError("completed serialization was restarted")
+
+    recovered = writer.write(MustNotIterate(), tmp_path)  # type: ignore[arg-type]
+    assert DatasetManifest.read(tmp_path / "manifest.json").hash == recovered.hash
+    assert recovered.sample_ids == tuple(sample.source_id for sample in samples)
+    assert not (tmp_path / ".staging/active.json").exists()
+    assert len(tuple((tmp_path / "generations").iterdir())) == 1
 
 
 def test_size_boundary_checkpoint_never_claims_an_unwritten_candidate(
@@ -216,6 +271,30 @@ def test_failed_identifier_is_reserved_before_duplicate_serialization(
         "DuplicateSampleError",
     ]
     assert calls == 1
+
+
+def test_invalid_candidate_reserves_its_trustworthy_source_id(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """An invalid object cannot let a later valid sample replace its source ID."""
+    sample = _samples(fixture_dir, 1)[0]
+
+    class InvalidCandidate:
+        source_id = sample.source_id
+
+    manifest = ShardWriter().write(
+        [InvalidCandidate(), sample],  # type: ignore[list-item]
+        tmp_path,
+    )
+    assert manifest.sample_ids == ()
+    assert [skip.sample_id for skip in manifest.skips] == [
+        sample.source_id,
+        sample.source_id,
+    ]
+    assert [skip.category for skip in manifest.skips] == [
+        "TypeError",
+        "DuplicateSampleError",
+    ]
 
 
 def test_verified_local_cache_hit_refill_and_corruption_failure(

@@ -72,6 +72,8 @@ class DiffGuiLMDBImporter:
 
         This constructor performs no filesystem access or mutation. Path
         existence and source requirements are checked lazily during iteration.
+        It does not decode tensors, choose devices/dtypes, or alter coordinate
+        frames, angstrom units, chemical masks, the LMDB, or source repository.
         """
         if config.diffgui_lmdb is None:
             raise DataValidationError("data.diffgui_lmdb must be configured")
@@ -94,7 +96,10 @@ class DiffGuiLMDBImporter:
 
         A fresh read-only LMDB environment is opened for each iteration. No
         lock, migration flag, source tensor, or external repository file is
-        modified. Records are revalidated during canonical construction.
+        modified. Byte-sorted keys deterministically define order. Records are
+        revalidated during canonical construction, preserving ``[N, 3]`` local
+        binding-frame angstrom coordinates, floating dtype/device, graph/field
+        tensors, chemical masks, formal charges, stereochemistry, and provenance.
         """
         yield from self.iter_samples()
 
@@ -103,7 +108,17 @@ class DiffGuiLMDBImporter:
 
         :return: Iterator of revalidated canonical samples.
         :rtype: Iterator[ComplexSample]
-        :raises DataValidationError: If opening, decoding, or conversion fails.
+        :raises DataValidationError: If the path/open, byte decoder, official
+            source resolution, custom converter, or canonical validation fails.
+
+        Each invocation owns and closes a fresh ``readonly=True``,
+        ``create=False``, ``lock=False`` LMDB environment, including on failure.
+        Byte-sorted cursor order is deterministic. Official records are reparsed
+        from read-only protein/ligand sources to recover stereochemistry, formal
+        charge, and pose; custom converters must return ``ComplexSample``.
+        Conversion preserves local ``[N, 3]`` angstrom frames, tensor
+        dtype/device, graph/field masks, and provenance and never updates LMDB
+        bytes, lock files, source files, or caller-owned decoded mappings.
         """
         if not self.path.exists():
             raise DataValidationError(f"DiffGui LMDB does not exist: {self.path}")

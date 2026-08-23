@@ -90,20 +90,43 @@ class ShardWriter:
         *,
         split: GroupedSplit | None = None,
     ) -> DatasetManifest:
-        """Serialize validated samples into atomic WebDataset tar shards.
+        """Build or resume one content-verified immutable dataset generation.
 
-        :param samples: Stream of canonical complex samples.
-        :param output_dir: Destination containing shards and ``manifest.json``.
-        :param split: Optional leakage-controlled sample/entity split metadata.
-        :return: Manifest with sample IDs, source hashes, shard hashes, skips,
-            preprocessing version, and split metadata.
+        :param samples: Deterministic stream of canonical complexes. Pocket,
+            ligand, and optional field coordinates use ``[N, 3]`` local-frame
+            angstrom tensors; graph tensors, dtypes, devices, batch indices,
+            chemical masks, and fragment fixed masks are preserved exactly.
+        :param output_dir: Dataset root containing ``.staging``, immutable
+            ``generations/<id>`` directories, and the current ``manifest.json``.
+        :param split: Optional frozen leakage-controlled sample/entity split.
+            Grouped assignments must cover exactly every successfully serialized
+            sample; ``None`` publishes explicit unpartitioned mode.
+        :return: Fully validated manifest for the newly published or recovered
+            generation, including hashes, skips, provenance, and split audit.
         :rtype: DatasetManifest
-        :raises ShardWriteError: If tar creation, synchronization, hashing, or
-            atomic finalization fails.
+        :raises ShardWriteError: If resume input changes, grouped coverage is
+            incomplete, a staged/promoted shard fails size/hash validation, or
+            tar, checkpoint, promotion, synchronization, or publication fails.
+        :raises RuntimeError: If the input iterable itself aborts preprocessing.
 
-        Shards are first written with a ``.partial`` suffix, hashed, fsynced,
-        and renamed. Failed samples are recorded and never replaced by another
-        sample. Distributed rank/worker partitioning is a read-time operation.
+        Publication is a recoverable state machine: ``STAGING`` journals only
+        durable candidate/shard prefixes; ``READY`` adds a self-contained
+        publication descriptor; ``PROMOTED`` atomically renames that directory
+        to its immutable generation path; ``PUBLISHED`` atomically replaces the
+        top-level manifest before clearing the active marker. Recovery validates
+        the descriptor and all shard sizes/hashes in either READY or PROMOTED
+        location and finishes publication before touching ``samples``. Thus a
+        crash immediately before promotion, in the rename-to-manifest window,
+        or after manifest replacement is idempotent and never reserializes a
+        completed generation; the previous manifest always references unchanged
+        shards until the replacement is durable.
+
+        Candidate IDs are reserved before type validation/serialization. Failed
+        candidates become bounded typed skips, and a duplicate can never replace
+        the first occurrence. Anonymous invalid objects are recorded but do not
+        create a reusable synthetic ID. Serialization performs filesystem I/O
+        only, does not mutate input samples, move tensors between CPU/GPU, change
+        coordinate frames/units, or apply distributed partitioning.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +136,9 @@ class ShardWriter:
             self.preprocessing_version,
             split,
         )
+        recovered = _recover_ready_generation(output_dir)
+        if recovered is not None:
+            return recovered
         generation_id, stage_dir, journal = _open_generation(
             output_dir, config_fingerprint
         )
@@ -197,14 +223,6 @@ class ShardWriter:
                 "grouped split assignments must exactly match serialized sample IDs"
             )
         metadata = split.to_metadata() if split is not None else {}
-        generation_dir = output_dir / "generations" / generation_id
-        generation_dir.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.replace(stage_dir, generation_dir)
-        except OSError as error:
-            raise ShardWriteError(
-                f"failed to publish dataset generation: {error}"
-            ) from error
         published_shards = tuple(
             ShardRecord(
                 path=(Path("generations") / generation_id / record.path).as_posix(),
@@ -229,17 +247,20 @@ class ShardWriter:
             entity_groups=metadata.get("entity_groups", {}),
             split_audit=split.audit if split is not None else None,
         )
-        try:
-            manifest.write(output_dir / "manifest.json")
-        except OSError as error:
-            raise ShardWriteError(
-                f"failed to finalize dataset manifest: {error}"
-            ) from error
-        active = output_dir / ".staging" / "active.json"
-        try:
-            active.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _write_publication_descriptor(manifest, stage_dir)
+        _set_active_generation(
+            output_dir, generation_id, config_fingerprint, state="ready"
+        )
+        generation_dir = output_dir / "generations" / generation_id
+        _promote_generation(stage_dir, generation_dir)
+        _set_active_generation(
+            output_dir, generation_id, config_fingerprint, state="promoted"
+        )
+        _publish_dataset_manifest(manifest, output_dir)
+        _set_active_generation(
+            output_dir, generation_id, config_fingerprint, state="published"
+        )
+        _clear_active_generation(output_dir, generation_id)
         return manifest
 
     def _write_shard(
@@ -280,6 +301,179 @@ class ShardWriter:
             size_bytes=size_bytes,
             sample_ids=tuple(sample.source_id for sample, _ in samples),
         )
+
+
+def _recover_ready_generation(output_dir: Path) -> DatasetManifest | None:
+    """Finish a durable READY/PROMOTED/PUBLISHED generation without replay.
+
+    :param output_dir: Dataset root containing the active marker and generation.
+    :return: Recovered published manifest, or ``None`` when no complete
+        publication descriptor exists and ordinary STAGING must continue.
+    :rtype: DatasetManifest | None
+    :raises ShardWriteError: If a descriptor, generation identity, shard path,
+        byte size, digest, promotion, or final manifest publication is invalid.
+
+    The active marker is a CPU/filesystem control record only. A descriptor in
+    ``.staging/<id>`` denotes READY; the same descriptor in
+    ``generations/<id>`` denotes PROMOTED. Every shard is re-hashed before any
+    top-level manifest replacement. An already matching manifest denotes
+    PUBLISHED and only marker cleanup remains. The function never opens the
+    caller's sample iterable, deserializes tensors, changes device/dtype/frame,
+    or mutates an older immutable generation.
+    """
+    active_path = output_dir / ".staging" / "active.json"
+    if not active_path.is_file():
+        return None
+    try:
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+        generation_id = str(active["generation_id"])
+        config_fingerprint = str(active["config_fingerprint"])
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return None
+    if not _portable_generation_id(generation_id) or not _valid_sha256(
+        config_fingerprint
+    ):
+        return None
+
+    stage_dir = output_dir / ".staging" / generation_id
+    generation_dir = output_dir / "generations" / generation_id
+    staged_descriptor = stage_dir / "publication.json"
+    promoted_descriptor = generation_dir / "publication.json"
+    if promoted_descriptor.is_file():
+        descriptor = promoted_descriptor
+        shard_root = generation_dir
+        promoted = True
+    elif staged_descriptor.is_file():
+        descriptor = staged_descriptor
+        shard_root = stage_dir
+        promoted = False
+    else:
+        return None
+
+    try:
+        manifest = DatasetManifest.read(descriptor)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise ShardWriteError(
+            f"invalid generation publication descriptor: {error}"
+        ) from error
+    if manifest.generation_id != generation_id:
+        raise ShardWriteError("publication descriptor generation ID mismatch")
+    _validate_publication_shards(manifest, shard_root, generation_id)
+
+    if not promoted:
+        _set_active_generation(
+            output_dir, generation_id, config_fingerprint, state="ready"
+        )
+        _promote_generation(stage_dir, generation_dir)
+    _set_active_generation(
+        output_dir, generation_id, config_fingerprint, state="promoted"
+    )
+
+    published_path = output_dir / "manifest.json"
+    already_published = False
+    if published_path.is_file():
+        try:
+            already_published = (
+                DatasetManifest.read(published_path).hash == manifest.hash
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            already_published = False
+    if not already_published:
+        _publish_dataset_manifest(manifest, output_dir)
+    _set_active_generation(
+        output_dir, generation_id, config_fingerprint, state="published"
+    )
+    _clear_active_generation(output_dir, generation_id)
+    return manifest
+
+
+def _write_publication_descriptor(manifest: DatasetManifest, stage_dir: Path) -> None:
+    """Persist a self-contained recovery descriptor before directory promotion."""
+    try:
+        manifest.write(stage_dir / "publication.json")
+    except OSError as error:
+        raise ShardWriteError(
+            f"failed to checkpoint generation publication: {error}"
+        ) from error
+
+
+def _promote_generation(stage_dir: Path, generation_dir: Path) -> None:
+    """Atomically rename a READY stage into its immutable generation path."""
+    generation_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(stage_dir, generation_dir)
+    except OSError as error:
+        raise ShardWriteError(
+            f"failed to promote dataset generation: {error}"
+        ) from error
+
+
+def _publish_dataset_manifest(manifest: DatasetManifest, output_dir: Path) -> None:
+    """Atomically make one promoted generation the current dataset."""
+    try:
+        manifest.write(output_dir / "manifest.json")
+    except OSError as error:
+        raise ShardWriteError(
+            f"failed to finalize dataset manifest: {error}"
+        ) from error
+
+
+def _set_active_generation(
+    output_dir: Path,
+    generation_id: str,
+    config_fingerprint: str,
+    *,
+    state: str,
+) -> None:
+    """Atomically checkpoint one publication state-machine transition."""
+    if state not in {"staging", "ready", "promoted", "published"}:
+        raise ValueError("unknown generation publication state")
+    _write_json_atomic(
+        output_dir / ".staging" / "active.json",
+        {
+            "generation_id": generation_id,
+            "config_fingerprint": config_fingerprint,
+            "state": state,
+        },
+    )
+
+
+def _clear_active_generation(output_dir: Path, generation_id: str) -> None:
+    """Remove the matching active marker after manifest publication."""
+    active_path = output_dir / ".staging" / "active.json"
+    try:
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+        if active.get("generation_id") == generation_id:
+            active_path.unlink(missing_ok=True)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return
+
+
+def _validate_publication_shards(
+    manifest: DatasetManifest, shard_root: Path, generation_id: str
+) -> None:
+    """Verify descriptor paths, byte sizes, and hashes before publication."""
+    expected_parent = Path("generations") / generation_id
+    for record in manifest.shards:
+        relative = Path(record.path)
+        if relative.parent != expected_parent:
+            raise ShardWriteError(
+                f"publication shard path escaped its generation: {record.path}"
+            )
+        path = shard_root / relative.name
+        if (
+            not path.is_file()
+            or path.stat().st_size != record.size_bytes
+            or "sha256:" + _sha256_file(path) != record.sha256
+        ):
+            raise ShardWriteError(f"publication shard validation failed: {record.path}")
+
+
+def _portable_generation_id(value: str) -> bool:
+    """Return whether an active generation ID is one safe path component."""
+    return bool(value) and all(
+        character.isalnum() or character in "-_" for character in value
+    )
 
 
 def _generation_config_fingerprint(
@@ -338,12 +532,11 @@ def _open_generation(
     generation_id = uuid.uuid4().hex
     stage_dir = staging_root / generation_id
     stage_dir.mkdir(parents=False, exist_ok=False)
-    _write_json_atomic(
-        active_path,
-        {
-            "generation_id": generation_id,
-            "config_fingerprint": config_fingerprint,
-        },
+    _set_active_generation(
+        output_dir,
+        generation_id,
+        config_fingerprint,
+        state="staging",
     )
     journal = {
         "config_fingerprint": config_fingerprint,
@@ -425,18 +618,42 @@ def _process_candidate(
     dict[str, str],
 ]:
     """Reserve an ID before serialization and return a journalable outcome."""
-    sample_id = str(getattr(candidate, "source_id", "unknown")) or "unknown"
     try:
+        raw_sample_id = getattr(candidate, "source_id", None)
+    # Candidate-supplied descriptors may raise arbitrary exceptions; isolation
+    # converts them into an anonymous skip without aborting the dataset build.
+    except Exception as error:  # noqa: BLE001
+        skip = _skip_record("anonymous", error)
+        return (
+            None,
+            None,
+            skip,
+            {
+                "sample_id": skip.sample_id,
+                "status": "skip",
+                "category": skip.category,
+                "message": skip.message,
+            },
+        )
+    sample_id = (
+        raw_sample_id
+        if isinstance(raw_sample_id, str) and raw_sample_id.strip()
+        else None
+    )
+    try:
+        if sample_id is not None:
+            if sample_id in seen_ids:
+                raise DuplicateSampleError(
+                    "duplicate sample identifier was already reserved"
+                )
+            seen_ids.add(sample_id)
         if not isinstance(candidate, ComplexSample):
             raise TypeError("record is not a ComplexSample")
-        if candidate.source_id in seen_ids:
-            raise DuplicateSampleError(
-                "duplicate sample identifier was already reserved"
-            )
-        seen_ids.add(candidate.source_id)
+        if sample_id is None:
+            raise ValueError("ComplexSample source_id is not a usable identifier")
         encoded = _serialize_sample(candidate)
     except (TypeError, ValueError, RuntimeError, OSError) as error:
-        skip = _skip_record(sample_id, error)
+        skip = _skip_record(sample_id or "anonymous", error)
         return (
             None,
             None,
@@ -502,7 +719,9 @@ def stream_samples(
         required for split filtering without decoding non-owned members.
     :param cache_dir: Optional portable local read-through cache directory. Cache
         use requires expected hashes and verifies every hit and fill.
-    :return: Lazy iterator of validated canonical samples.
+    :return: Lazy iterator of validated canonical samples whose coordinate
+        tensors retain ``[N, 3]`` local binding-frame angstrom values, dtype,
+        device, graph/field masks, chemical attributes, and provenance.
     :rtype: Iterator[ComplexSample]
     :raises ValueError: If rank/worker arguments or the shuffle size are invalid.
     :raises ShardReadError: If a shard hash, tar member, or sample payload fails.
@@ -511,7 +730,10 @@ def stream_samples(
     first and worker second so non-owners never open the tar. Sparse shard sets
     use manifest/member indices to choose ownership before extraction and
     deserialization. Filtering occurs before within-shard ordinals, preserving
-    exact once-only coverage without N-times sample decoding.
+    exact once-only coverage without N-times sample decoding. Path order and
+    the seed/rank/worker tuple completely determine output order. Hash-verified
+    cache fills mutate only ``cache_dir`` through fsynced atomic replacement;
+    shards and reconstructed samples are never modified or moved across devices.
     """
     _validate_partition(rank, world_size, worker_id, num_workers, shuffle_buffer)
     ordered_paths = sorted((Path(path) for path in paths), key=lambda path: path.name)
@@ -609,7 +831,24 @@ def _resolve_cached_shard(
     cache_dir: str | Path | None,
     expected_hash: str | None,
 ) -> Path:
-    """Return a verified cache hit or atomically fill it from the source shard."""
+    """Resolve one shard through a content-addressed verified read-through cache.
+
+    :param source_path: Immutable source tar path used on a cache miss/corruption.
+    :param cache_dir: Optional caller-chosen local cache root; ``None`` disables
+        all cache filesystem mutation and returns ``source_path`` directly.
+    :param expected_hash: Canonical ``sha256:<hex>`` content identity. It is
+        mandatory when caching so untrusted names never become cache paths.
+    :return: Source path when caching is disabled, otherwise a verified cached tar.
+    :rtype: pathlib.Path
+    :raises ShardReadError: If the hash is absent/malformed, source/cache I/O
+        fails, or copied bytes do not match the expected digest.
+
+    A valid cache hit never opens the source. Corrupt hits are replaced from a
+    uniquely named partial file after copy, ``fsync``, and SHA-256 verification.
+    Concurrent workers may race safely because every successful replacement has
+    identical content. No tar member is decoded and no tensor dtype, device,
+    coordinate frame, units, or mask is changed here.
+    """
     if cache_dir is None:
         return source_path
     if expected_hash is None or not _valid_sha256(expected_hash):
@@ -660,13 +899,20 @@ def sample_ids_for_partition(
 ) -> list[str]:
     """Return IDs selected by the canonical rank/worker partition.
 
-    :param paths: Tar shard paths.
-    :param rank: Distributed rank.
-    :param world_size: Distributed rank count.
-    :param worker_id: Rank-local worker index.
-    :param num_workers: Rank-local worker count.
+    :param paths: Immutable tar shard paths in arbitrary input order.
+    :param rank: Distributed rank in ``[0, world_size)``.
+    :param world_size: Positive distributed rank count.
+    :param worker_id: Rank-local worker index in ``[0, num_workers)``.
+    :param num_workers: Positive rank-local worker count.
     :return: Storage-ordered selected sample IDs.
     :rtype: list[str]
+    :raises ValueError: If rank/world-size or worker/count bounds are invalid.
+    :raises ShardReadError: If any owned shard or canonical payload is invalid.
+
+    This audit helper applies the same rank-first, worker-second ownership as
+    :func:`stream_samples` with shuffling disabled. Across all valid consumers,
+    each sample ID appears exactly once. It performs CPU shard decoding but does
+    not mutate files/samples or change tensor dtype, device, frame, units, or masks.
     """
     return [
         sample.source_id
@@ -698,7 +944,9 @@ def bucketed_batches(
     The two-dimensional bucket key limits padding variance on large pockets
     while keeping all pending storage bounded by one partial batch per observed
     bucket. Full buckets are emitted immediately; partial buckets are drained
-    in sorted key order at end of epoch.
+    in sorted key order at end of epoch. No Cartesian coordinates, features,
+    bond/fragment masks, dtype, device, local binding frame, or angstrom units
+    are inspected or changed; only bounded lists of sample references mutate.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
