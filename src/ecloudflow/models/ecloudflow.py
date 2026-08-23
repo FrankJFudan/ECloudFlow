@@ -10,6 +10,7 @@ from torch import nn
 
 from ecloudflow.config import ModelConfig
 from ecloudflow.core.types import GenerationCondition, MolecularState, PocketGraph
+from ecloudflow.ecloud.decoder import ElectronReconstruction
 from ecloudflow.models.backbone import JointLigandBackbone
 from ecloudflow.models.count_predictor import AtomCountPredictor
 from ecloudflow.models.heads import ScalarHead, SymmetricPairHead
@@ -32,8 +33,18 @@ class ModelPrediction:
         halfedge per row; no dense pair tensor is materialized.
     :param count_logits: Normalized invariant log probabilities ``[B,M+1]``.
     :param affinity: Invariant scalar affinity auxiliary ``[B]``.
+    :param affinity_log_variance: Per-complex heteroscedastic affinity
+        log-variance ``[B]`` before the loss-side numerical clamp.
     :param interaction_logits: Invariant interaction auxiliary ``[B]``.
+    :param endpoint_positions: Differentiable first-order endpoint estimate
+        ``x_t + (1-t)v_t`` with shape ``[N,3]`` in angstroms. It is exact for
+        a straight deterministic path and only an empirical auxiliary estimator
+        for a curved or stochastic path; it is never claimed as the clean endpoint.
+    :param endpoint_electron_latent: Analogous first-order packed electron
+        endpoint estimate ``[N,C]`` in the configured irrep representation.
     :param pocket_cache_key: Validated stable key of the reused pocket encoding.
+    :param electron_reconstruction: Optional differentiable output from the
+        real Task 8 field decoder; ``None`` means it was not evaluated.
     :return: Immutable prediction container retaining all autograd edges.
     :rtype: ModelPrediction
     :raises ValueError: During model construction if any output contract fails.
@@ -55,8 +66,12 @@ class ModelPrediction:
     bond_logits: torch.Tensor
     count_logits: torch.Tensor
     affinity: torch.Tensor
+    affinity_log_variance: torch.Tensor
     interaction_logits: torch.Tensor
+    endpoint_positions: torch.Tensor
+    endpoint_electron_latent: torch.Tensor
     pocket_cache_key: str
+    electron_reconstruction: ElectronReconstruction | None = None
 
     def __post_init__(self) -> None:
         """Validate joint output shape, placement, and sparse graph semantics.
@@ -93,10 +108,21 @@ class ModelPrediction:
         if self.bond_logits.ndim != 2 or self.count_logits.ndim != 2:
             raise ValueError("bond and count logits must be rank-two tensors.")
         batch_size = self.count_logits.shape[0]
-        if self.affinity.shape != (batch_size,) or self.interaction_logits.shape != (
-            batch_size,
+        if any(
+            value.shape != (batch_size,)
+            for value in (
+                self.affinity,
+                self.affinity_log_variance,
+                self.interaction_logits,
+            )
         ):
             raise ValueError("auxiliary predictions must have shape [B].")
+        if self.endpoint_positions.shape != (node_count, 3):
+            raise ValueError("endpoint_positions must have shape [N, 3].")
+        if self.endpoint_electron_latent.shape != self.electron_velocity.shape:
+            raise ValueError(
+                "endpoint_electron_latent must match electron prediction shape."
+            )
         reference = self.position_velocity
         for value in (
             self.position_score,
@@ -107,12 +133,44 @@ class ModelPrediction:
             self.bond_logits,
             self.count_logits,
             self.affinity,
+            self.affinity_log_variance,
             self.interaction_logits,
+            self.endpoint_positions,
+            self.endpoint_electron_latent,
         ):
             if value.device != reference.device or value.dtype != reference.dtype:
                 raise ValueError(
                     "all prediction tensors must share floating dtype and device."
                 )
+        if self.electron_reconstruction is not None:
+            reconstruction = self.electron_reconstruction
+            if (
+                reconstruction.density.ndim != 2
+                or reconstruction.density.shape[0] != batch_size
+                or reconstruction.gradient.shape != (*reconstruction.density.shape, 3)
+                or reconstruction.electron_count.shape != (batch_size,)
+                or reconstruction.dipole.shape != (batch_size, 3)
+                or reconstruction.latent_round_trip.ndim != 3
+                or reconstruction.latent_round_trip.shape[0] != batch_size
+                or reconstruction.latent_round_trip.shape[2]
+                != self.electron_velocity.shape[1]
+            ):
+                raise ValueError(
+                    "electron reconstruction has invalid density, gradient, moment, or cycle shape."
+                )
+            reconstruction_dtype = (
+                torch.float32
+                if reference.dtype in (torch.float16, torch.bfloat16)
+                else reference.dtype
+            )
+            for value in reconstruction:
+                if (
+                    value.device != reference.device
+                    or value.dtype != reconstruction_dtype
+                ):
+                    raise ValueError(
+                        "electron reconstruction tensors must use the stable prediction dtype and device."
+                    )
         if not self.pocket_cache_key:
             raise ValueError("pocket cache key must be non-empty.")
 
@@ -255,6 +313,7 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         self.bond_head = SymmetricPairHead(scalar_dim, bond_classes)
         self.count_predictor = AtomCountPredictor(scalar_dim, max_atoms=max_atoms)
         self.affinity_head = ScalarHead(scalar_dim)
+        self.affinity_log_variance_head = ScalarHead(scalar_dim)
         self.interaction_head = ScalarHead(scalar_dim)
 
     @classmethod
@@ -479,6 +538,8 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
             fixed_bonds = condition.fragment.fixed_bond_mask
             position_velocity = position_velocity.masked_fill(fixed[:, None], 0.0)
             position_score = position_score.masked_fill(fixed[:, None], 0.0)
+            electron_velocity = electron_velocity.masked_fill(fixed[:, None], 0.0)
+            electron_score = electron_score.masked_fill(fixed[:, None], 0.0)
             atom_logits = torch.where(fixed[:, None], state.atom_logits, atom_logits)
             charge_logits = torch.where(
                 fixed[:, None], state.charge_logits, charge_logits
@@ -487,6 +548,11 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
                 fixed_bonds[:, None], state.bond_logits, bond_logits
             )
         count_logits = self.count_predictor(hidden.pooled, fixed_counts).logits
+        node_time = time[state.node_batch, None]
+        endpoint_positions = state.positions + (1.0 - node_time) * position_velocity
+        endpoint_electron_latent = (
+            state.electron_latent + (1.0 - node_time) * electron_velocity
+        )
         return ModelPrediction(
             position_velocity=position_velocity,
             position_score=position_score,
@@ -497,7 +563,10 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
             bond_logits=bond_logits,
             count_logits=count_logits,
             affinity=self.affinity_head(hidden.pooled),
+            affinity_log_variance=self.affinity_log_variance_head(hidden.pooled),
             interaction_logits=self.interaction_head(hidden.pooled),
+            endpoint_positions=endpoint_positions,
+            endpoint_electron_latent=endpoint_electron_latent,
             pocket_cache_key=encoding.cache_key,
         )
 

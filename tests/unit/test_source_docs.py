@@ -133,6 +133,25 @@ def test_task10_designated_apis_keep_equivariance_and_cache_contracts() -> None:
     assert check_paths(paths, designated=required) == []
 
 
+def test_task11_designated_apis_keep_loss_ddp_precision_and_ema_contracts() -> None:
+    """Task 11 training APIs retain scientific and distributed semantics."""
+    required = {
+        "losses.RunningLossScaler.update",
+        "losses.compute_ecloudflow_loss",
+        "ema.ExponentialMovingAverage.update",
+        "module.ECloudFlowTrainingModule.training_step",
+        "module.ECloudFlowTrainingModule.optimizer_step",
+    }
+    assert required <= DESIGNATED_APIS
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        root / "src/ecloudflow/training/losses.py",
+        root / "src/ecloudflow/training/ema.py",
+        root / "src/ecloudflow/training/module.py",
+    ]
+    assert check_paths(paths, designated=required) == []
+
+
 def test_checker_rejects_missing_designated_api(tmp_path: Path) -> None:
     """A registry entry must resolve to a real module-qualified callable."""
     source = tmp_path / "missing.py"

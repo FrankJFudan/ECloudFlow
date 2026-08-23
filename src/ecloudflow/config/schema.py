@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -88,6 +88,107 @@ class DataConfig(StrictModel):
     diffgui_build_fields: bool = False
 
 
+class WeightedLossConfig(StrictModel):
+    """Common component weight and deterministic linear warm-up bounds."""
+
+    weight: float = Field(default=1.0, ge=0.0, le=1.0e6)
+    warmup_start: int = Field(default=0, ge=0)
+    warmup_end: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_warmup(self) -> "WeightedLossConfig":
+        """Require a nondecreasing inclusive warm-up interval."""
+        if self.warmup_end < self.warmup_start:
+            raise ValueError(
+                "warmup_end must be greater than or equal to warmup_start."
+            )
+        return self
+
+
+class FlowLossConfig(WeightedLossConfig):
+    """Weights for exact Cartesian and packed-electron velocity targets."""
+
+    position: float = Field(default=1.0, ge=0.0, le=1.0e6)
+    electron: float = Field(default=1.0, ge=0.0, le=1.0e6)
+
+
+class ScoreLossConfig(WeightedLossConfig):
+    """Weights for exact Cartesian and packed-electron score targets."""
+
+    position: float = Field(default=1.0, ge=0.0, le=1.0e6)
+    electron: float = Field(default=1.0, ge=0.0, le=1.0e6)
+
+
+class DiscreteLossConfig(WeightedLossConfig):
+    """Weights for node, sparse-halfedge, and per-complex endpoint classes."""
+
+    atom: float = Field(default=1.0, ge=0.0, le=1.0e6)
+    charge: float = Field(default=1.0, ge=0.0, le=1.0e6)
+    bond: float = Field(default=1.0, ge=0.0, le=1.0e6)
+    count: float = Field(default=1.0, ge=0.0, le=1.0e6)
+
+
+class ECloudLossConfig(WeightedLossConfig):
+    """Weights for genuine-QM field reconstruction and latent cycle terms."""
+
+    density: float = Field(default=1.0, ge=0.0, le=1.0e6)
+    gradient: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    electron_count: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    dipole: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    cycle: float = Field(default=0.1, ge=0.0, le=1.0e6)
+
+
+class ChemistryLossConfig(WeightedLossConfig):
+    """Weights and stable constants for differentiable chemistry surrogates."""
+
+    valence: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    bond_length: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    ligand_clash: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    protein_clash: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    ring_strain: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    connectivity: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    affinity: float = Field(default=0.1, ge=0.0, le=1.0e6)
+    ligand_clash_distance: float = Field(default=1.2, gt=0.0, le=10.0)
+    protein_clash_distance: float = Field(default=1.5, gt=0.0, le=10.0)
+    minimum_degree: float = Field(default=1.0, ge=0.0, le=16.0)
+    affinity_log_variance_min: float = Field(default=-10.0, ge=-30.0, le=30.0)
+    affinity_log_variance_max: float = Field(default=10.0, ge=-30.0, le=30.0)
+    epsilon: float = Field(default=1.0e-8, gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_variance_bounds(self) -> "ChemistryLossConfig":
+        """Require ordered finite heteroscedastic log-variance bounds."""
+        if self.affinity_log_variance_max < self.affinity_log_variance_min:
+            raise ValueError("affinity log-variance bounds must be ordered.")
+        return self
+
+
+class InteractionLossConfig(WeightedLossConfig):
+    """Weight and focusing exponent for per-complex interaction supervision."""
+
+    focal_gamma: float = Field(default=2.0, ge=0.0, le=10.0)
+
+
+class LossNormalizationConfig(StrictModel):
+    """Detached distributed running-RMS normalization controls."""
+
+    enabled: bool = True
+    decay: float = Field(default=0.99, ge=0.0, lt=1.0)
+    epsilon: float = Field(default=1.0e-8, gt=0.0, le=1.0)
+
+
+class LossConfig(StrictModel):
+    """Frozen, serializable configuration for all six scientific components."""
+
+    flow: FlowLossConfig = FlowLossConfig()
+    score: ScoreLossConfig = ScoreLossConfig()
+    discrete: DiscreteLossConfig = DiscreteLossConfig()
+    ecloud: ECloudLossConfig = ECloudLossConfig()
+    chem: ChemistryLossConfig = ChemistryLossConfig()
+    interaction: InteractionLossConfig = InteractionLossConfig()
+    normalization: LossNormalizationConfig = LossNormalizationConfig()
+
+
 class AppConfig(StrictModel):
     """Top-level configuration composed from model and sampling groups."""
 
@@ -95,3 +196,4 @@ class AppConfig(StrictModel):
     model: ModelConfig = ModelConfig()
     sample: SampleConfig = SampleConfig()
     data: DataConfig = DataConfig()
+    loss: LossConfig = LossConfig()

@@ -628,6 +628,7 @@ def test_forward_has_finite_gradients_through_all_joint_inputs() -> None:
         + prediction.bond_logits.square().sum()
         + prediction.count_logits.square().sum()
         + prediction.affinity.square().sum()
+        + prediction.affinity_log_variance.square().sum()
         + prediction.interaction_logits.square().sum()
     )
     loss.backward()
@@ -648,6 +649,36 @@ def test_forward_has_finite_gradients_through_all_joint_inputs() -> None:
     assert all(
         gradient is not None and torch.isfinite(gradient).all()
         for gradient in parameter_gradients
+    )
+
+
+def test_forward_exposes_first_order_endpoint_and_affinity_uncertainty() -> None:
+    """Mutation caught: chemistry reuses current coordinates or omits uncertainty."""
+    model = _model()
+    state = _state()
+    time = torch.tensor([0.25, 0.75])
+
+    prediction = model(state, time, _condition(state))
+
+    node_time = time[state.node_batch, None]
+    assert torch.allclose(
+        prediction.endpoint_positions,
+        state.positions + (1.0 - node_time) * prediction.position_velocity,
+    )
+    assert torch.allclose(
+        prediction.endpoint_electron_latent,
+        state.electron_latent + (1.0 - node_time) * prediction.electron_velocity,
+    )
+    assert prediction.affinity_log_variance.shape == (2,)
+    loss = (
+        prediction.endpoint_positions.square().sum()
+        + prediction.endpoint_electron_latent.square().sum()
+        + prediction.affinity_log_variance.square().sum()
+    )
+    loss.backward()
+    assert all(
+        parameter.grad is not None
+        for parameter in model.affinity_log_variance_head.parameters()
     )
 
 

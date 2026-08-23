@@ -2,6 +2,7 @@ defaults:
   - model: tiny
   - sample: balanced
   - data: pdbbind
+  - loss: default
   - _self_
 
 seed: 2026

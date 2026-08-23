@@ -1,0 +1,55 @@
+flow:
+  weight: 1.0
+  warmup_start: 0
+  warmup_end: 0
+  position: 1.0
+  electron: 1.0
+score:
+  weight: 1.0
+  warmup_start: 0
+  warmup_end: 0
+  position: 1.0
+  electron: 1.0
+discrete:
+  weight: 1.0
+  warmup_start: 0
+  warmup_end: 0
+  atom: 1.0
+  charge: 1.0
+  bond: 1.0
+  count: 1.0
+ecloud:
+  weight: 1.0
+  warmup_start: 0
+  warmup_end: 0
+  density: 1.0
+  gradient: 0.1
+  electron_count: 0.1
+  dipole: 0.1
+  cycle: 0.1
+chem:
+  weight: 1.0
+  warmup_start: 0
+  warmup_end: 0
+  valence: 0.1
+  bond_length: 0.1
+  ligand_clash: 0.1
+  protein_clash: 0.1
+  ring_strain: 0.1
+  connectivity: 0.1
+  affinity: 0.1
+  ligand_clash_distance: 1.2
+  protein_clash_distance: 1.5
+  minimum_degree: 1.0
+  affinity_log_variance_min: -10.0
+  affinity_log_variance_max: 10.0
+  epsilon: 1.0e-8
+interaction:
+  weight: 1.0
+  warmup_start: 0
+  warmup_end: 0
+  focal_gamma: 2.0
+normalization:
+  enabled: true
+  decay: 0.99
+  epsilon: 1.0e-8
