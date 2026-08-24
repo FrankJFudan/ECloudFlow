@@ -436,6 +436,15 @@ class GreedyBondDecoder:
             if left != right:
                 parent[right] = left
 
+        # Fixed fragment bonds already connect their endpoint components.  If
+        # they are omitted here, the fallback may spend mutable valence on an
+        # unnecessary internal edge and report a feasible fixed scaffold as
+        # disconnected.
+        for edge, klass in enumerate(prepared.fixed_classes.tolist()):
+            if klass >= 0 and problem.vocabulary.bond_orders[klass] > 0:
+                source, target = prepared.edges[edge]
+                union(source, target)
+
         # First connect components, then greedily add any remaining high-score edges.
         for (_, klass), edge, source, target in candidates:
             if prepared.node_count > 1 and find(source) == find(target):
