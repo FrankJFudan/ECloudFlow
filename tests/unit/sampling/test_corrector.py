@@ -1,5 +1,6 @@
 import torch
 
+from ecloudflow.core import FragmentCondition, clamp_fragment
 from ecloudflow.core.types import MolecularState
 from ecloudflow.sampling.corrector import ScoreCorrector
 
@@ -55,7 +56,7 @@ def test_score_corrector_dispatches_three_two_and_one_argument_hooks():
         (hook_three, hook_two, hook_one),
         torch.Generator().manual_seed(2),
     )
-    assert seen == ["three", "two", "one"]
+    assert seen == ["three", "two", "one", "three", "two", "one"]
 
 
 def test_score_corrector_rejects_invalid_step_overrides():
@@ -69,3 +70,25 @@ def test_score_corrector_rejects_invalid_step_overrides():
             pass
         else:
             raise AssertionError("invalid correction step override was accepted")
+
+
+def test_score_corrector_clamps_initial_frame_before_recording():
+    reference = _state()
+    condition = FragmentCondition.from_atom_mask(torch.tensor([True]), reference)
+    noisy = reference.replace(positions=torch.tensor([[9.0, 0.0, 0.0]]))
+    trajectory = ScoreCorrector(steps=0).correct(
+        noisy,
+        lambda state, time: {"positions": torch.zeros_like(state.positions)},
+        hooks=(lambda state: clamp_fragment(state, condition),),
+        generator=torch.Generator().manual_seed(1),
+    )
+    assert torch.equal(trajectory.frames[0].positions, reference.positions)
+
+
+def test_score_corrector_zero_score_stays_finite():
+    zero = lambda state, time: {"positions": torch.zeros_like(state.positions)}
+    trajectory = ScoreCorrector(snr=1.0e6, steps=2).correct(
+        _state(), zero, generator=torch.Generator().manual_seed(4)
+    )
+    assert torch.isfinite(trajectory.final.positions).all()
+    assert torch.equal(trajectory.final.positions, _state().positions)

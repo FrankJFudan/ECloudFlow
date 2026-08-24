@@ -12,6 +12,7 @@ from ecloudflow.sampling.solver import (
     SamplingTrajectory,
     StateHook,
     VectorFieldCallable,
+    apply_state_hooks,
     _call_field,
     _derivative_state,
     _validate_finite,
@@ -68,7 +69,10 @@ class ScoreCorrector:
             if steps is None
             else self._validate_steps(steps, "steps override")
         )
-        current = state
+        initial_time = torch.tensor(
+            1.0, dtype=state.positions.dtype, device=state.positions.device
+        )
+        current = apply_state_hooks(state, hooks, initial_time, rng)
         frames: list[MolecularState] = [current]
         started, nfe = time.perf_counter(), 0
         mask = self.edit_mask
@@ -84,19 +88,25 @@ class ScoreCorrector:
                 1.0, dtype=state.positions.dtype, device=state.positions.device
             )
             derivative = _derivative_state(_call_field(score, current, t), current)
+            _validate_finite(derivative)
             nfe += 1
-            # Adaptive Langevin step from the median score/noise ratio.
-            grad_norm = (
-                derivative.positions.norm(dim=-1)
-                .mean()
-                .clamp_min(torch.finfo(state.positions.dtype).tiny)
+            # Adaptive Langevin step from the score/noise ratio. A zero score
+            # has no deterministic direction, so it receives no random kick;
+            # near-zero fields are capped to keep the update finite.
+            grad_norm = derivative.positions.norm(dim=-1).mean()
+            norm_floor = torch.tensor(
+                torch.finfo(state.positions.dtype).eps,
+                dtype=state.positions.dtype,
+                device=state.positions.device,
             )
             noise_norm = torch.sqrt(
                 torch.tensor(
                     3.0, dtype=state.positions.dtype, device=state.positions.device
                 )
             )
-            step = (self.snr * noise_norm / grad_norm).square() * 2.0
+            ratio = self.snr * noise_norm / grad_norm.clamp_min(norm_floor)
+            step = (ratio.square() * 2.0).clamp(max=1.0)
+            step = torch.where(grad_norm <= norm_floor, torch.zeros_like(step), step)
             noise = torch.randn(
                 current.positions.shape,
                 generator=rng,
@@ -110,18 +120,7 @@ class ScoreCorrector:
                 position_delta = position_delta * mask
             current = current.replace(positions=current.positions + position_delta)
             current = self._apply_other_channels(current, derivative, step, mask, rng)
-            for hook in hooks:
-                try:
-                    current = hook(current, t, rng)
-                except TypeError as first:
-                    try:
-                        current = hook(current, t)
-                    except TypeError:
-                        try:
-                            current = hook(current)
-                        except TypeError:
-                            raise first
-            _validate_finite(current)
+            current = apply_state_hooks(current, hooks, t, rng)
             frames.append(current)
         return SamplingTrajectory(
             current,

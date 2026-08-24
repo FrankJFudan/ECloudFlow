@@ -16,6 +16,30 @@ VectorFieldCallable = Callable[..., Any]
 StateHook = Callable[..., MolecularState]
 
 
+def apply_state_hooks(
+    state: MolecularState,
+    hooks: Sequence[StateHook],
+    time_value: torch.Tensor,
+    generator: torch.Generator,
+) -> MolecularState:
+    """Apply the canonical 3/2/1-argument hook chain and finite check."""
+    for hook in hooks:
+        try:
+            state = hook(state, time_value, generator)
+        except TypeError as first:
+            try:
+                state = hook(state, time_value)
+            except TypeError:
+                try:
+                    state = hook(state)
+                except TypeError:
+                    raise first
+        if not isinstance(state, MolecularState):
+            raise TypeError("state hooks must return MolecularState.")
+    _validate_finite(state)
+    return state
+
+
 @dataclass(frozen=True)
 class SamplingTrajectory:
     """Retain final state, optional frames, and numerical diagnostics."""
@@ -149,21 +173,7 @@ class _BaseSolver:
         t: torch.Tensor,
         generator: torch.Generator,
     ) -> MolecularState:
-        for hook in hooks:
-            try:
-                state = hook(state, t, generator)
-            except TypeError as first:
-                try:
-                    state = hook(state, t)
-                except TypeError:
-                    try:
-                        state = hook(state)
-                    except TypeError:
-                        raise first
-            if not isinstance(state, MolecularState):
-                raise TypeError("state hooks must return MolecularState.")
-        _validate_finite(state)
-        return state
+        return apply_state_hooks(state, hooks, t, generator)
 
     def integrate(
         self,

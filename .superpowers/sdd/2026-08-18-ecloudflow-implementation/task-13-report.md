@@ -36,3 +36,17 @@ non-integer values.
 
 The focused suite now reports `7 passed`, including explicit bounded-rejection
 failure, 3/2/1-argument hook dispatch, and strict step-override validation.
+
+## Round 2 Review Fixes
+
+### RED
+
+Re-review found that the corrector recorded an unconstrained input state as
+``frames[0]`` and that a zero score caused an unbounded inverse-norm Langevin
+step, risking non-finite coordinates.
+
+### GREEN
+
+The focused suite now reports `9 passed`. Initial corrector states pass through
+the canonical hook chain before recording, zero/near-zero score updates remain
+finite, and all prior hook/step regressions remain covered.
