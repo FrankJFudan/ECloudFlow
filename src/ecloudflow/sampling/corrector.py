@@ -12,10 +12,10 @@ from ecloudflow.sampling.solver import (
     SamplingTrajectory,
     StateHook,
     VectorFieldCallable,
-    apply_state_hooks,
     _call_field,
     _derivative_state,
     _validate_finite,
+    apply_state_hooks,
 )
 
 
