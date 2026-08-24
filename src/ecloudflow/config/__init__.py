@@ -14,6 +14,7 @@ from ecloudflow.config.schema import (
     ModelConfig,
     SampleConfig,
     ScoreLossConfig,
+    TrainerConfig,
     WeightedLossConfig,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "ModelConfig",
     "SampleConfig",
     "ScoreLossConfig",
+    "TrainerConfig",
     "WeightedLossConfig",
     "load_config",
 ]

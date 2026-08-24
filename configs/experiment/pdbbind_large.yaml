@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+  - _self_
+  - /train: stage3
+  - override /model: large
+  - override /data: pdbbind
+
+data:
+  batch_size: 8
+  num_workers: 16
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true
+  shuffle_buffer: 4096
+  verify_shard_hashes: true
+trainer:
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16-mixed
+  devices: 4
+  accumulate_grad_batches: 8
+  gradient_clip_val: 1.0
+  max_steps: 500000
+  max_epochs: 1000
+  checkpoint_dir: outputs/pdbbind_large/checkpoints
+  every_n_train_steps: 1000
+  save_last: true
+  resume_from: null
+  reproducible_resume: true
+  deterministic: true
+  benchmark: false
+  num_sanity_val_steps: 0
+  log_every_n_steps: 10
+  nan_failure_threshold: 1
+  max_nan_artifacts: 3

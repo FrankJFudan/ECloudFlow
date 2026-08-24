@@ -189,6 +189,67 @@ class LossConfig(StrictModel):
     normalization: LossNormalizationConfig = LossNormalizationConfig()
 
 
+class TrainerConfig(StrictModel):
+    """Configure deterministic local or distributed Lightning execution.
+
+    :param accelerator: Lightning accelerator selector; production uses ``gpu``.
+    :param strategy: Lightning strategy name; production uses ``ddp``.
+    :param precision: Explicit true or mixed arithmetic precision.
+    :param devices: Positive number of devices participating on this node.
+    :param accumulate_grad_batches: Positive optimizer accumulation interval.
+    :param gradient_clip_val: Non-negative gradient norm clipping threshold.
+    :param max_steps: Positive optimizer-step termination bound.
+    :param max_epochs: Positive epoch termination bound.
+    :param checkpoint_dir: Artifact directory for atomic rank-zero checkpoints.
+    :param every_n_train_steps: Positive periodic checkpoint interval.
+    :param save_last: Whether the latest complete checkpoint is retained.
+    :param resume_from: Optional Lightning checkpoint used for strict resume.
+    :param reproducible_resume: Require complete identity and rank-local state.
+    :param deterministic: Request deterministic Lightning/PyTorch algorithms.
+    :param benchmark: Enable backend autotuning; incompatible with determinism.
+    :param num_sanity_val_steps: Bounded validation checks before fitting.
+    :param log_every_n_steps: Positive logger interval.
+    :param nan_failure_threshold: Nonfinite batches allowed before termination.
+    :param max_nan_artifacts: Maximum diagnostic files published by rank zero.
+    :return: Frozen validated runtime configuration with no device side effects.
+    :rtype: TrainerConfig
+    :raises ValueError: If deterministic and benchmark modes are both enabled.
+
+    Values are declarative and contain no tensors, dtype conversions, process
+    groups, filesystem mutation, or implicit rank behavior. A resolved instance
+    serializes deterministically into checkpoint provenance. Changing termination
+    bounds or paths is resume-compatible; accelerator, precision, accumulation,
+    clipping, and checkpoint cadence remain training-semantic configuration.
+    """
+
+    accelerator: Literal["auto", "cpu", "gpu"] = "auto"
+    strategy: str = "auto"
+    precision: Literal["32-true", "16-mixed", "bf16-mixed"] = "32-true"
+    devices: int = Field(default=1, ge=1)
+    accumulate_grad_batches: int = Field(default=1, ge=1)
+    gradient_clip_val: float = Field(default=1.0, ge=0.0)
+    max_steps: int = Field(default=1000, ge=1)
+    max_epochs: int = Field(default=100, ge=1)
+    checkpoint_dir: str = "outputs/checkpoints"
+    every_n_train_steps: int = Field(default=1000, ge=1)
+    save_last: bool = True
+    resume_from: str | None = None
+    reproducible_resume: bool = True
+    deterministic: bool = True
+    benchmark: bool = False
+    num_sanity_val_steps: int = Field(default=0, ge=0)
+    log_every_n_steps: int = Field(default=50, ge=1)
+    nan_failure_threshold: int = Field(default=1, ge=1)
+    max_nan_artifacts: int = Field(default=3, ge=0)
+
+    @model_validator(mode="after")
+    def validate_backend_modes(self) -> "TrainerConfig":
+        """Reject backend autotuning when exact deterministic replay is requested."""
+        if self.deterministic and self.benchmark:
+            raise ValueError("benchmark must be false when deterministic is true.")
+        return self
+
+
 class AppConfig(StrictModel):
     """Top-level configuration composed from model and sampling groups."""
 
@@ -197,3 +258,10 @@ class AppConfig(StrictModel):
     sample: SampleConfig = SampleConfig()
     data: DataConfig = DataConfig()
     loss: LossConfig = LossConfig()
+    trainer: TrainerConfig = TrainerConfig()
+    stage: Literal[
+        "electron_tokenizer",
+        "ligand_pretrain",
+        "pocket_multitask",
+        "high_quality_finetune",
+    ] = "pocket_multitask"

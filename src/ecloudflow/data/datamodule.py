@@ -101,6 +101,26 @@ class _ShardBatchDataset(IterableDataset[list[ComplexSample]]):
         )
 
 
+class _ResumableDataLoader(DataLoader[list[ComplexSample]]):
+    """Replay a deterministic loader prefix before exposing resumed batches."""
+
+    def __init__(self, *args: Any, consumed_batches: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._resume_consumed_batches = consumed_batches
+
+    def __iter__(self) -> Iterator[list[ComplexSample]]:
+        """Yield only batches after the checkpointed trainer-consumed prefix."""
+        iterator = super().__iter__()
+        for _ in range(self._resume_consumed_batches):
+            try:
+                next(iterator)
+            except StopIteration as error:
+                raise DataValidationError(
+                    "checkpoint consumed-batch position exceeds deterministic epoch"
+                ) from error
+        yield from iterator
+
+
 class ECloudDataModule(LightningDataModule):
     """Expose leakage-safe shards through reproducible Lightning loaders.
 
@@ -120,8 +140,10 @@ class ECloudDataModule(LightningDataModule):
         self.epoch = 0
         self._epoch_state = Value("q", 0, lock=True)
         self._pending_manifest_hash: str | None = None
+        self._pending_preprocessing_version: str | None = None
         self.manifest: DatasetManifest | None = None
         self.paths: tuple[Path, ...] = ()
+        self.consumed_batches = 0
 
     def setup(self, stage: str | None = None) -> None:
         """Validate and transactionally publish immutable dataset state.
@@ -167,6 +189,11 @@ class ECloudDataModule(LightningDataModule):
             and self._pending_manifest_hash != manifest.hash
         ):
             raise DataValidationError("checkpoint dataset manifest hash mismatch")
+        if (
+            self._pending_preprocessing_version is not None
+            and self._pending_preprocessing_version != manifest.preprocessing_version
+        ):
+            raise DataValidationError("checkpoint preprocessing version mismatch")
         self.manifest = manifest
         self.paths = paths
 
@@ -222,7 +249,9 @@ class ECloudDataModule(LightningDataModule):
         }
         if self.config.num_workers:
             options["prefetch_factor"] = self.config.prefetch_factor
-        return DataLoader(dataset, **options)
+        return _ResumableDataLoader(
+            dataset, consumed_batches=self.consumed_batches, **options
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Publish a deterministic epoch to current persistent workers.
@@ -240,14 +269,37 @@ class ECloudDataModule(LightningDataModule):
         """
         if epoch < 0:
             raise ValueError("epoch must be nonnegative")
+        if int(epoch) != self.epoch:
+            self.consumed_batches = 0
         self.epoch = int(epoch)
         with self._epoch_state.get_lock():
             self._epoch_state.value = self.epoch
 
-    def state_dict(self) -> dict[str, Any]:
-        """Return checkpoint-safe epoch and dataset identity metadata.
+    def mark_batch_consumed(self, count: int = 1) -> None:
+        """Advance rank-local progress after trainer-confirmed batch completion.
 
-        :return: Plain mapping containing epoch and the loaded manifest hash.
+        :param count: Positive number of successfully consumed batches.
+        :return: None after advancing the in-memory rank-local cursor.
+        :rtype: None
+        :raises ValueError: If ``count`` is not a positive integer.
+
+        Callers invoke this only from a successful train-batch-end hook. Worker
+        production and DataLoader prefetch never call it, so prefetched but
+        unconsumed batches are replayed after resume. The cursor is a CPU integer
+        with no tensor dtype/device, sample, mask, shard, or filesystem mutation.
+        Every rank advances its own cursor deterministically; no collective is
+        performed here. A genuine epoch change through :meth:`set_epoch` resets
+        the cursor, while :meth:`load_state_dict` restores it exactly.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("consumed batch count must be a positive integer")
+        self.consumed_batches += count
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return checkpoint-safe stream position and dataset identity metadata.
+
+        :return: Plain mapping containing epoch, trainer-consumed batch position,
+            manifest hash, and preprocessing version.
         :rtype: dict[str, Any]
 
         The method performs no filesystem mutation. A manifest hash is absent
@@ -258,7 +310,13 @@ class ECloudDataModule(LightningDataModule):
         """
         return {
             "epoch": self.epoch,
+            "consumed_batches": self.consumed_batches,
             "manifest_hash": self.manifest.hash if self.manifest is not None else None,
+            "preprocessing_version": (
+                self.manifest.preprocessing_version
+                if self.manifest is not None
+                else None
+            ),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -283,8 +341,42 @@ class ECloudDataModule(LightningDataModule):
             self.paths = ()
             raise DataValidationError("checkpoint manifest hash must be textual")
         self._pending_manifest_hash = expected
+        preprocessing_version = state_dict.get("preprocessing_version")
+        if preprocessing_version is not None and not isinstance(
+            preprocessing_version, str
+        ):
+            self.manifest = None
+            self.paths = ()
+            raise DataValidationError(
+                "checkpoint preprocessing version must be textual"
+            )
+        self._pending_preprocessing_version = preprocessing_version
         if self.manifest is not None and expected not in (None, self.manifest.hash):
             self.manifest = None
             self.paths = ()
             raise DataValidationError("checkpoint dataset manifest hash mismatch")
-        self.set_epoch(int(state_dict.get("epoch", 0)))
+        if (
+            self.manifest is not None
+            and preprocessing_version
+            not in (None, self.manifest.preprocessing_version)
+        ):
+            self.manifest = None
+            self.paths = ()
+            raise DataValidationError("checkpoint preprocessing version mismatch")
+        epoch = state_dict.get("epoch", 0)
+        consumed = state_dict.get("consumed_batches", 0)
+        if (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch < 0
+            or isinstance(consumed, bool)
+            or not isinstance(consumed, int)
+            or consumed < 0
+        ):
+            raise DataValidationError(
+                "checkpoint epoch and consumed_batches must be nonnegative integers"
+            )
+        self.epoch = epoch
+        self.consumed_batches = consumed
+        with self._epoch_state.get_lock():
+            self._epoch_state.value = self.epoch

@@ -1,0 +1,9 @@
+# @package _global_
+stage: high_quality_finetune
+loss:
+  ecloud:
+    weight: 2.0
+  chem:
+    weight: 1.5
+  interaction:
+    weight: 1.5

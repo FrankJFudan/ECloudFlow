@@ -1,0 +1,33 @@
+# @package _global_
+defaults:
+  - _self_
+  - /train: stage3
+  - override /model: tiny
+  - override /data: pdbbind
+
+data:
+  batch_size: 1
+  num_workers: 0
+  persistent_workers: false
+  pin_memory: false
+  shuffle_buffer: 0
+trainer:
+  accelerator: cpu
+  strategy: auto
+  precision: 32-true
+  devices: 1
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  max_steps: 2
+  max_epochs: 1
+  checkpoint_dir: outputs/smoke/checkpoints
+  every_n_train_steps: 1
+  save_last: true
+  resume_from: null
+  reproducible_resume: true
+  deterministic: true
+  benchmark: false
+  num_sanity_val_steps: 0
+  log_every_n_steps: 1
+  nan_failure_threshold: 1
+  max_nan_artifacts: 1

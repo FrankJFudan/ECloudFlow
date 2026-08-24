@@ -1,0 +1,13 @@
+# @package _global_
+stage: electron_tokenizer
+loss:
+  flow:
+    weight: 0.0
+  score:
+    weight: 0.0
+  discrete:
+    weight: 0.0
+  chem:
+    weight: 0.0
+  interaction:
+    weight: 0.0
