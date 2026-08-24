@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import subprocess
 import tempfile
 from collections.abc import Mapping
@@ -131,10 +132,14 @@ def capture_rng_state() -> dict[str, Any]:
     object gather; it performs no collective, filesystem mutation, or seeding.
     Determinism requires the same rank/world/device topology at restore.
     """
-    try:
-        cuda = [state.cpu() for state in torch.cuda.get_rng_state_all()]
-    except RuntimeError as error:
-        raise CheckpointStateError(f"CUDA RNG state is unavailable: {error}") from error
+    cuda: list[torch.Tensor] = []
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        try:
+            cuda = [state.cpu() for state in torch.cuda.get_rng_state_all()]
+        except RuntimeError as error:
+            raise CheckpointStateError(
+                f"CUDA RNG state is unavailable: {error}"
+            ) from error
     return {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
@@ -281,6 +286,17 @@ def _broadcast_object(value: Any, *, source: int) -> Any:
     return values[0]
 
 
+def _has_nonfinite_tensor(value: Any) -> bool:
+    """Return whether a callback output tree contains a non-finite tensor."""
+    if isinstance(value, torch.Tensor):
+        return value.is_floating_point() and not bool(torch.isfinite(value).all())
+    if isinstance(value, Mapping):
+        return any(_has_nonfinite_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nonfinite_tensor(item) for item in value)
+    return False
+
+
 def _git_revision() -> str:
     """Return the exact current Git revision or fail closed."""
     try:
@@ -330,9 +346,12 @@ class ReproducibleCheckpoint(Callback):
         self.resolved_config = _plain_config(resolved_config)
         self.reproducible_resume = reproducible_resume
         self.git_revision = git_revision
-        if git_revision is not None and len(git_revision) != 40:
+        if (
+            git_revision is not None
+            and re.fullmatch(r"[0-9a-fA-F]{40}", git_revision) is None
+        ):
             raise CheckpointStateError(
-                "git_revision must contain exactly 40 characters"
+                "git_revision must contain exactly 40 hexadecimal characters"
             )
         self._pending_rng_state: object | None = None
         self._pending_data_state: object | None = None
@@ -346,7 +365,11 @@ class ReproducibleCheckpoint(Callback):
         batch_idx: int,
     ) -> None:
         """Record one batch only after Lightning confirms successful consumption."""
-        del pl_module, outputs, batch, batch_idx
+        del pl_module, batch, batch_idx
+        # A later diagnostic callback may abort this same hook for a NaN/Inf
+        # output.  Do not advance the cursor for that unsuccessful batch.
+        if _has_nonfinite_tensor(outputs):
+            return
         data = getattr(trainer, "datamodule", None)
         mark = getattr(data, "mark_batch_consumed", None)
         if callable(mark):

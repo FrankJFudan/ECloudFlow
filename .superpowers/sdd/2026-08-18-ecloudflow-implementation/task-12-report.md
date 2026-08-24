@@ -65,3 +65,32 @@ without libuv support`). The implementation itself retains Gloo-safe fixed
 collective ordering and the distributed smoke test remains available for a
 libuv-capable/Linux or server environment. The NCCL/H100 test is intentionally
 marked server-only.
+
+## Independent review and fix round 1
+
+The first independent review identified three important correctness gaps:
+
+1. CPU-only checkpoint capture could call CUDA RNG APIs unconditionally.
+2. A non-finite diagnostic raised after the checkpoint callback could leave the
+   consumed-batch cursor advanced.
+3. Injected Git revisions were checked only by length, not hexadecimal syntax.
+
+Fix round 1 adds an explicit CUDA availability guard, skips cursor advancement
+for non-finite callback outputs, validates `[0-9a-fA-F]{40}` revisions, and adds
+regressions for all three cases. Focused verification after the fixes:
+
+```text
+python -m pytest tests/integration/test_checkpoint_resume.py \
+  tests/unit/training/test_stages.py -q
+14 passed, 19 warnings
+ruff check src/ecloudflow/training/checkpoint.py \
+  tests/integration/test_checkpoint_resume.py
+All checks passed!
+ruff format --check src/ecloudflow/training/checkpoint.py \
+  tests/integration/test_checkpoint_resume.py
+All files formatted
+```
+
+The review itself could not execute tests in its isolated environment because
+PyTorch was unavailable; controller verification above is the authoritative
+GREEN evidence for this fix round.

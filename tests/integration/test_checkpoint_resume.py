@@ -207,6 +207,21 @@ def test_rng_round_trip_restores_cpu_sequence() -> None:
     torch.testing.assert_close(torch.rand(4), expected, rtol=0, atol=0)
 
 
+def test_cpu_rng_capture_does_not_require_cuda() -> None:
+    """CPU/Gloo checkpoint metadata remains usable when CUDA is unavailable."""
+    state = capture_rng_state()
+    assert (
+        state["torch_cuda"] == []
+        or len(state["torch_cuda"]) == torch.cuda.device_count()
+    )
+
+
+def test_checkpoint_rejects_non_hex_git_revision() -> None:
+    """Checkpoint provenance must contain a real forty-character hex revision."""
+    with pytest.raises(CheckpointStateError, match="hexadecimal"):
+        ReproducibleCheckpoint({"trainer": {}}, git_revision="z" * 40)
+
+
 def test_atomic_json_failure_preserves_published_artifact(tmp_path: Path) -> None:
     """Mutation caught: a failed artifact serialization truncates the prior file."""
     path = tmp_path / "diagnostic.json"
@@ -230,6 +245,26 @@ def test_nan_diagnostics_are_bounded_and_stop_at_threshold(tmp_path: Path) -> No
             trainer, module, torch.tensor(float("inf")), None, 1
         )
     assert len(list(tmp_path.glob("nonfinite-*.json"))) == 1
+
+
+def test_nonfinite_batch_does_not_advance_resume_cursor() -> None:
+    """A failed nonfinite callback must replay the offending batch on resume."""
+    callback = ReproducibleCheckpoint({"trainer": {}})
+    data = type(
+        "Data",
+        (),
+        {
+            "consumed_batches": 0,
+            "mark_batch_consumed": lambda self: setattr(
+                self, "consumed_batches", self.consumed_batches + 1
+            ),
+        },
+    )()
+    trainer = type("Trainer", (), {"datamodule": data})()
+    callback.on_train_batch_end(trainer, None, torch.tensor(float("nan")), None, 0)
+    assert data.consumed_batches == 0
+    callback.on_train_batch_end(trainer, None, torch.tensor(1.0), None, 0)
+    assert data.consumed_batches == 1
 
 
 def test_multiworker_resume_replays_only_unconsumed_batches(tmp_path: Path) -> None:
