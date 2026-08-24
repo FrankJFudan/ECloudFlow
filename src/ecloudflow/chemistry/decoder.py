@@ -75,6 +75,8 @@ class BondDecodeProblem:
         """Validate the problem boundary without changing model tensors."""
         if self.vocabulary.domain != "ligand":
             raise ValueError("bond decoding requires a ligand vocabulary.")
+        if not isinstance(self.require_connected, bool):
+            raise TypeError("require_connected must be boolean.")
         if (
             isinstance(self.timeout_seconds, bool)
             or not math.isfinite(float(self.timeout_seconds))
@@ -111,6 +113,13 @@ class BondDecodeProblem:
                 raise ValueError(f"{name} must be on the state device.")
             if bool((value < 0).any()):
                 raise ValueError(f"{name} must not contain negative indices.")
+            upper_bound = (
+                len(self.vocabulary.atom_symbols)
+                if name == "atom_indices"
+                else len(self.vocabulary.formal_charges)
+            )
+            if bool((value >= upper_bound).any()):
+                raise ValueError(f"{name} contains an out-of-vocabulary index.")
         if torch.unique(self.state.node_batch).numel() > 1:
             raise ValueError("bond decoding expects one molecular graph per problem.")
 
@@ -185,12 +194,22 @@ class ExactBondDecoder:
         objective_scale: int = 100_000,
     ) -> None:
         if timeout_seconds is not None and (
-            not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0
+            isinstance(timeout_seconds, bool)
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
         ):
             raise ValueError("timeout_seconds must be finite and positive.")
-        if isinstance(num_search_workers, bool) or num_search_workers < 1:
-            raise ValueError("num_search_workers must be positive.")
-        if isinstance(objective_scale, bool) or objective_scale < 1:
+        if (
+            isinstance(num_search_workers, bool)
+            or not isinstance(num_search_workers, int)
+            or num_search_workers < 1
+        ):
+            raise ValueError("num_search_workers must be a positive integer.")
+        if (
+            isinstance(objective_scale, bool)
+            or not isinstance(objective_scale, int)
+            or objective_scale < 1
+        ):
             raise ValueError("objective_scale must be positive.")
         self.timeout_seconds = timeout_seconds
         self.num_search_workers = int(num_search_workers)
