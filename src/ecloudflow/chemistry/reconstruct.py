@@ -67,6 +67,9 @@ def reconstruct_rdkit_molecule(
         raise ValueError("decoded bond_orders must have shape [E].")
     if not bool(torch.isfinite(decoded.bond_orders).all()):
         raise ValueError("decoded bond_orders must contain finite values.")
+    rounded_orders = decoded.bond_orders.round()
+    if not bool(torch.isclose(decoded.bond_orders, rounded_orders, atol=1.0e-5).all()):
+        raise ValueError("decoded bond orders must be integer-valued.")
     if not decoded.connected or not decoded.valence_valid:
         raise ValueError("decoded graph is not connected and valence-valid.")
     vocab = vocabulary or ChemicalVocabulary.default_ligand()
