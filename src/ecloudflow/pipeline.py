@@ -661,7 +661,9 @@ def _prepare_output_dir(value: str | Path | None) -> Path | None:
     """Create and validate a run directory without touching absent output."""
     if value is None:
         return None
-    destination = Path(value)
+    # Resolve once at the public boundary so serialized pose paths remain
+    # usable even when the caller supplied a relative run directory.
+    destination = Path(value).expanduser().resolve()
     if destination.exists() and not destination.is_dir():
         raise ValueError(f"output_dir is not a directory: {destination}")
     destination.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,5 @@
+from rdkit import Chem
+
 from ecloudflow.evaluation.ranking import rank_molecules
 from ecloudflow.sampling.results import GenerationRecord
 
@@ -31,3 +33,20 @@ def test_ranking_uses_vina_qed_sa_smiles_and_no_eclf():
     ]
     assert all("ECLF" not in item.molecule_id for item in ranked)
     assert unranked[0].temporary_id == records[-1].temporary_id
+
+
+def test_ranking_derives_qed_and_standard_sa_when_properties_are_missing():
+    record = GenerationRecord(
+        canonical_smiles="CCO",
+        attempt_id="attempt-ethanol",
+        molecule=Chem.MolFromSmiles("CCO"),
+        properties={"docking_score": -5.0},
+    )
+
+    ranked, unranked = rank_molecules("POCKET", [record])
+
+    assert not unranked
+    assert ranked[0].qed is not None
+    assert 0.0 < ranked[0].qed < 1.0
+    assert ranked[0].sa_score is not None
+    assert 1.0 <= ranked[0].sa_score <= 10.0

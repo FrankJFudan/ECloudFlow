@@ -19,4 +19,3 @@ def test_sample_help_exposes_simple_count_and_fragment_options():
     assert "--num-molecules" in result.stdout
     assert "--fragment" in result.stdout
     assert "--profile" in result.stdout
-

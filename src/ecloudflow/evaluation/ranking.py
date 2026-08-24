@@ -8,6 +8,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from rdkit import Chem
+from rdkit.Chem import QED
+
 from ecloudflow.sampling.results import GenerationRecord
 
 _POCKET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -106,7 +109,11 @@ def rank_molecules(
             unranked.append(record)
             continue
         qed = _metric(record, "qed", "QED")
+        if qed is None:
+            qed = _derived_qed(record.molecule)
         sa = _metric(record, "sa", "sa_score", "synthetic_accessibility", "SA")
+        if sa is None:
+            sa = _derived_sa(record.molecule)
         prepared.append((record, score, qed, sa))
     prepared.sort(
         key=lambda item: (
@@ -160,6 +167,45 @@ def _metric(record: GenerationRecord, *names: str) -> float | None:
             raise ValueError(f"metric {name!r} must be finite")
         return value
     return None
+
+
+def _derived_qed(molecule: Any) -> float | None:
+    """Compute QED from a retained RDKit molecule when metadata is absent.
+
+    :param molecule: Candidate molecule retained by a generation record.
+    :return: Finite QED value, or ``None`` when no usable molecule exists.
+    :rtype: float | None
+    """
+    if not isinstance(molecule, Chem.Mol):
+        return None
+    try:
+        value = float(QED.qed(molecule))
+    except (RuntimeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _derived_sa(molecule: Any) -> float | None:
+    """Compute the conventional RDKit Ertl SA score when available.
+
+    :param molecule: Candidate molecule retained by a generation record.
+    :return: Conventional 1--10 synthetic-accessibility score, or ``None`` if
+        the optional RDKit contribution is unavailable or cannot score it.
+    :rtype: float | None
+
+    The contribution is imported lazily because RDKit distributions may omit
+    ``Contrib/SA_Score``. Missing optional code remains an explicit missing
+    metric rather than a fabricated numeric value.
+    """
+    if not isinstance(molecule, Chem.Mol):
+        return None
+    try:
+        from rdkit.Contrib.SA_Score import sascorer
+
+        value = float(sascorer.calculateScore(molecule))
+    except (ImportError, RuntimeError, ValueError, AttributeError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 __all__ = ["RankedMolecule", "assign_rank_ids", "rank_molecules"]

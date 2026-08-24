@@ -110,6 +110,47 @@ class VisualizationConfig(StrictModel):
     seed: int = 2026
 
 
+class BenchmarkConfig(StrictModel):
+    """Reproducible strong-scaling and sampling-efficiency controls.
+
+    :param warmup_steps: Unreported warm-up optimizer iterations.
+    :param measurement_steps: Timed iterations used for throughput estimates.
+    :param global_batch_size: Fixed global work size for every device count.
+    :param devices: Requested device counts, normally ``(1, 2, 4)`` on H100.
+    :param profile: Sampling profile used for NFE accounting.
+    :param output_dir: Default benchmark artifact destination.
+    :param seed: Local deterministic workload seed.
+    :param speedup_tolerance: Permitted relative scaling regression.
+    :param memory_tolerance: Permitted relative memory regression.
+    :param valid_yield_tolerance: Permitted relative yield regression.
+    :return: Frozen benchmark configuration without device side effects.
+    :rtype: BenchmarkConfig
+    """
+
+    warmup_steps: int = Field(default=2, ge=0)
+    measurement_steps: int = Field(default=10, ge=1)
+    global_batch_size: int = Field(default=8, ge=1)
+    devices: tuple[int, ...] = (1, 2, 4)
+    profile: Literal["fast", "balanced", "quality"] = "balanced"
+    output_dir: str = "runs/benchmark"
+    seed: int = 2026
+    speedup_tolerance: float = Field(default=0.1, ge=0.0, le=1.0)
+    memory_tolerance: float = Field(default=0.1, ge=0.0, le=1.0)
+    valid_yield_tolerance: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_devices(self) -> "BenchmarkConfig":
+        """Require a non-empty unique positive device-count sequence."""
+        if not self.devices or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in self.devices
+        ):
+            raise ValueError("benchmark devices must be positive integers")
+        if len(set(self.devices)) != len(self.devices):
+            raise ValueError("benchmark devices must be unique")
+        return self
+
+
 class DataConfig(StrictModel):
     """Dataset and distributed streaming settings.
 
@@ -326,6 +367,7 @@ class AppConfig(StrictModel):
     sample: SampleConfig = SampleConfig()
     evaluation: EvaluationConfig = EvaluationConfig()
     visualization: VisualizationConfig = VisualizationConfig()
+    benchmark: BenchmarkConfig = BenchmarkConfig()
     data: DataConfig = DataConfig()
     loss: LossConfig = LossConfig()
     trainer: TrainerConfig = TrainerConfig()

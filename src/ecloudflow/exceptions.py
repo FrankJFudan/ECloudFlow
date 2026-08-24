@@ -23,3 +23,7 @@ class DataValidationError(ECloudFlowError, ValueError):
 
 class SamplingNumericsError(ECloudFlowError, ValueError):
     """Raise when a sampling trajectory produces NaN or infinite values."""
+
+
+class BenchmarkError(ECloudFlowError, ValueError):
+    """Raise when a benchmark run cannot complete or validate its contract."""

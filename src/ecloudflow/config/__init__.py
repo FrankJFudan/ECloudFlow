@@ -3,6 +3,7 @@
 from ecloudflow.config.loader import load_config
 from ecloudflow.config.schema import (
     AppConfig,
+    BenchmarkConfig,
     ChemistryLossConfig,
     DataConfig,
     DiscreteLossConfig,
@@ -16,12 +17,13 @@ from ecloudflow.config.schema import (
     SampleConfig,
     ScoreLossConfig,
     TrainerConfig,
-    WeightedLossConfig,
     VisualizationConfig,
+    WeightedLossConfig,
 )
 
 __all__ = [
     "AppConfig",
+    "BenchmarkConfig",
     "ChemistryLossConfig",
     "DataConfig",
     "DiscreteLossConfig",
@@ -35,7 +37,7 @@ __all__ = [
     "SampleConfig",
     "ScoreLossConfig",
     "TrainerConfig",
-    "WeightedLossConfig",
     "VisualizationConfig",
+    "WeightedLossConfig",
     "load_config",
 ]

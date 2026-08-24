@@ -107,7 +107,14 @@ class SamplingPipeline:
         if isinstance(output, dict):
             for key in ("molecule", "mol", "smiles", "state", "trajectory"):
                 if key in output:
-                    return self._normalize_state_output(output[key], fixed=fixed)
+                    normalized = self._normalize_state_output(output[key], fixed=fixed)
+                    # Keep scalar metrics and provenance attached to a candidate;
+                    # the public pipeline serializes these values into ranking
+                    # tables instead of silently dropping them at this boundary.
+                    return {
+                        **output,
+                        key: normalized,
+                    }
         if isinstance(output, SamplingTrajectory):
             output = output.final
         if isinstance(output, MolecularState):

@@ -17,18 +17,46 @@ from ecloudflow.training.types import (
 )
 
 __all__ = [
-    "ECloudFlowTrainingModule",
     "AtomicArtifactWriter",
+    "BenchmarkConfig",
+    "BenchmarkError",
     "CheckpointStateError",
+    "ECloudFlowTrainingModule",
     "ElectronDecoderContext",
     "ExponentialMovingAverage",
     "LossBreakdown",
     "NonFiniteDiagnostics",
     "ReproducibleCheckpoint",
     "RunningLossScaler",
+    "ScalingReport",
+    "ScalingRow",
     "TrainingBatch",
-    "TrainingTargets",
     "TrainingStage",
-    "configure_stage",
+    "TrainingTargets",
+    "benchmark_scaling",
     "compute_ecloudflow_loss",
+    "configure_stage",
+    "measured_stub_nfe",
+    "merge_scaling_reports",
 ]
+
+_BENCHMARK_EXPORTS = {
+    "BenchmarkConfig",
+    "BenchmarkError",
+    "ScalingReport",
+    "ScalingRow",
+    "benchmark_scaling",
+    "merge_scaling_reports",
+    "measured_stub_nfe",
+}
+
+
+def __getattr__(name: str):
+    """Resolve benchmark helpers lazily to keep ``python -m`` warning-free."""
+    if name in _BENCHMARK_EXPORTS:
+        from ecloudflow.training import benchmark
+
+        value = getattr(benchmark, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(name)
