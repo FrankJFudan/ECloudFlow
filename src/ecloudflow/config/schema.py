@@ -42,6 +42,74 @@ class SampleConfig(StrictModel):
         return self.max_attempts or 5 * self.num_molecules
 
 
+class EvaluationConfig(StrictModel):
+    """Select metric domains and deterministic evaluation aggregation policy.
+
+    :param groups: Enabled metric domains.  The default covers chemistry,
+        distribution, geometry, binding, electron-cloud, conditional, and
+        efficiency quality.
+    :param bootstrap_seed: Seed for reproducible confidence intervals.
+    :param bootstrap_resamples: Number of pocket-level bootstrap resamples.
+    :param raw_relaxed_policy: Pose source used by geometry metrics.
+    :param reference_path: Optional reference index for novelty/distribution.
+    :param optional_backends: Explicit optional-tool names and settings.
+    :return: Frozen evaluation configuration with no tool or filesystem side
+        effects.
+    :rtype: EvaluationConfig
+    """
+
+    groups: tuple[
+        Literal[
+            "chemistry",
+            "distribution",
+            "geometry",
+            "binding",
+            "ecloud",
+            "conditional",
+            "efficiency",
+        ],
+        ...,
+    ] = (
+        "chemistry",
+        "distribution",
+        "geometry",
+        "binding",
+        "ecloud",
+        "conditional",
+        "efficiency",
+    )
+    bootstrap_seed: int = 2026
+    bootstrap_resamples: int = Field(default=1000, ge=1)
+    raw_relaxed_policy: Literal["raw", "relaxed", "both"] = "raw"
+    reference_path: str | None = None
+    optional_backends: dict[str, str] = Field(default_factory=dict)
+
+
+class VisualizationConfig(StrictModel):
+    """Publication viewer and figure settings with deterministic defaults.
+
+    :param theme: Matplotlib/HTML visual theme.
+    :param field_isovalue: Electron-density isosurface threshold.
+    :param top_n: Number of top molecules shown in reports.
+    :param width: Figure/viewer width in pixels.
+    :param height: Figure/viewer height in pixels.
+    :param formats: Static formats to export.
+    :param dpi: Raster export resolution.
+    :param seed: Deterministic plotting seed.
+    :return: Frozen visualization configuration.
+    :rtype: VisualizationConfig
+    """
+
+    theme: Literal["light", "dark", "paper"] = "paper"
+    field_isovalue: float = Field(default=0.02, gt=0.0)
+    top_n: int = Field(default=20, ge=1)
+    width: int = Field(default=1200, ge=320)
+    height: int = Field(default=800, ge=240)
+    formats: tuple[Literal["svg", "pdf", "png"], ...] = ("svg", "pdf", "png")
+    dpi: int = Field(default=300, ge=72, le=1200)
+    seed: int = 2026
+
+
 class DataConfig(StrictModel):
     """Dataset and distributed streaming settings.
 
@@ -256,6 +324,8 @@ class AppConfig(StrictModel):
     seed: int = 2026
     model: ModelConfig = ModelConfig()
     sample: SampleConfig = SampleConfig()
+    evaluation: EvaluationConfig = EvaluationConfig()
+    visualization: VisualizationConfig = VisualizationConfig()
     data: DataConfig = DataConfig()
     loss: LossConfig = LossConfig()
     trainer: TrainerConfig = TrainerConfig()

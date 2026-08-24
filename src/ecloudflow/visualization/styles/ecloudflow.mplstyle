@@ -1,0 +1,8 @@
+figure.facecolor: white
+axes.facecolor: white
+axes.edgecolor: #25323a
+axes.labelcolor: #18222b
+xtick.color: #18222b
+ytick.color: #18222b
+font.family: DejaVu Sans
+axes.titleweight: semibold

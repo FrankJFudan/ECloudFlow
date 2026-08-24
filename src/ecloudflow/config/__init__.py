@@ -7,6 +7,7 @@ from ecloudflow.config.schema import (
     DataConfig,
     DiscreteLossConfig,
     ECloudLossConfig,
+    EvaluationConfig,
     FlowLossConfig,
     InteractionLossConfig,
     LossConfig,
@@ -16,6 +17,7 @@ from ecloudflow.config.schema import (
     ScoreLossConfig,
     TrainerConfig,
     WeightedLossConfig,
+    VisualizationConfig,
 )
 
 __all__ = [
@@ -24,6 +26,7 @@ __all__ = [
     "DataConfig",
     "DiscreteLossConfig",
     "ECloudLossConfig",
+    "EvaluationConfig",
     "FlowLossConfig",
     "InteractionLossConfig",
     "LossConfig",
@@ -33,5 +36,6 @@ __all__ = [
     "ScoreLossConfig",
     "TrainerConfig",
     "WeightedLossConfig",
+    "VisualizationConfig",
     "load_config",
 ]
