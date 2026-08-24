@@ -25,7 +25,9 @@ class SamplingProfile:
 
     def __post_init__(self) -> None:
         if self.num_steps < 1 or self.corrector_steps < 0:
-            raise ValueError("num_steps must be positive and corrector_steps non-negative.")
+            raise ValueError(
+                "num_steps must be positive and corrector_steps non-negative."
+            )
 
 
 def fast_profile() -> SamplingProfile:
@@ -51,9 +53,12 @@ def get_profile(name: str) -> SamplingProfile:
     :rtype: SamplingProfile
     :raises ValueError: If ``name`` is unknown.
     """
-    profiles = {"fast": fast_profile, "balanced": balanced_profile, "quality": quality_profile}
+    profiles = {
+        "fast": fast_profile,
+        "balanced": balanced_profile,
+        "quality": quality_profile,
+    }
     try:
         return profiles[name.lower()]()
     except (AttributeError, KeyError) as exc:
         raise ValueError(f"unknown sampling profile: {name!r}") from exc
-

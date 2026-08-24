@@ -26,9 +26,15 @@ class CavityAwarePrior:
     :rtype: CavityAwarePrior
     """
 
-    def __init__(self, seed: int | None = None, *, atom_channels: int = 2,
-                 charge_channels: int = 2, bond_channels: int = 2,
-                 latent_channels: int = 1) -> None:
+    def __init__(
+        self,
+        seed: int | None = None,
+        *,
+        atom_channels: int = 2,
+        charge_channels: int = 2,
+        bond_channels: int = 2,
+        latent_channels: int = 1,
+    ) -> None:
         if min(atom_channels, charge_channels, bond_channels, latent_channels) < 1:
             raise ValueError("channel counts must be positive.")
         self.seed = seed
@@ -37,7 +43,13 @@ class CavityAwarePrior:
         self.bond_channels = bond_channels
         self.latent_channels = latent_channels
 
-    def sample(self, condition: Any, num_atoms: int, *, generator: torch.Generator | None = None) -> MolecularState:
+    def sample(
+        self,
+        condition: Any,
+        num_atoms: int,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> MolecularState:
         """Draw an initial state in the cavity's centered coordinate frame.
 
         :param condition: Pocket condition with ``cavity`` and optional
@@ -60,8 +72,14 @@ class CavityAwarePrior:
             bond_channels = reference.bond_logits.shape[1]
             latent_channels = reference.electron_latent.shape[1]
         else:
-            device = getattr(getattr(condition, "pocket", None), "positions", torch.empty(0)).device
-            dtype = getattr(getattr(condition, "pocket", None), "positions", torch.empty(0, dtype=torch.float32)).dtype
+            device = getattr(
+                getattr(condition, "pocket", None), "positions", torch.empty(0)
+            ).device
+            dtype = getattr(
+                getattr(condition, "pocket", None),
+                "positions",
+                torch.empty(0, dtype=torch.float32),
+            ).dtype
             atom_channels, charge_channels = self.atom_channels, self.charge_channels
             bond_channels, latent_channels = self.bond_channels, self.latent_channels
         rng = generator or torch.Generator(device=device)
@@ -75,11 +93,25 @@ class CavityAwarePrior:
         edges = torch.empty((2, 0), dtype=torch.long, device=device)
         state = MolecularState(
             positions=positions,
-            atom_logits=torch.full((num_atoms, atom_channels), 1.0 / atom_channels, dtype=dtype, device=device),
-            charge_logits=torch.full((num_atoms, charge_channels), 1.0 / charge_channels, dtype=dtype, device=device),
+            atom_logits=torch.full(
+                (num_atoms, atom_channels),
+                1.0 / atom_channels,
+                dtype=dtype,
+                device=device,
+            ),
+            charge_logits=torch.full(
+                (num_atoms, charge_channels),
+                1.0 / charge_channels,
+                dtype=dtype,
+                device=device,
+            ),
             halfedge_index=edges,
-            bond_logits=torch.full((0, bond_channels), 1.0 / bond_channels, dtype=dtype, device=device),
-            electron_latent=torch.zeros((num_atoms, latent_channels), dtype=dtype, device=device),
+            bond_logits=torch.full(
+                (0, bond_channels), 1.0 / bond_channels, dtype=dtype, device=device
+            ),
+            electron_latent=torch.zeros(
+                (num_atoms, latent_channels), dtype=dtype, device=device
+            ),
             node_batch=node_batch,
             halfedge_batch=torch.empty(0, dtype=torch.long, device=device),
             frame=getattr(reference, "frame", None),
@@ -88,12 +120,18 @@ class CavityAwarePrior:
             fixed = getattr(condition, "fragment", None)
             if fixed is not None:
                 from ecloudflow.core.masks import clamp_fragment
+
                 state = clamp_fragment(state, fixed)
         return state
 
     @staticmethod
-    def _sample_positions(cavity: Any, count: int, dtype: torch.dtype,
-                          device: torch.device, generator: torch.Generator) -> torch.Tensor:
+    def _sample_positions(
+        cavity: Any,
+        count: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
         if cavity is not None and callable(getattr(cavity, "sample", None)):
             try:
                 values = cavity.sample(count, generator=generator)
@@ -106,47 +144,82 @@ class CavityAwarePrior:
             return values
         bounds = getattr(cavity, "bounds", None)
         if bounds is not None:
-            lower, upper = (torch.as_tensor(v, dtype=dtype, device=device) for v in bounds)
+            lower, upper = (
+                torch.as_tensor(v, dtype=dtype, device=device) for v in bounds
+            )
             if lower.shape != (3,) or upper.shape != (3,):
                 raise ValueError("cavity bounds must contain two [3] vectors.")
-            points = lower + torch.rand((count, 3), generator=generator, device=device, dtype=dtype) * (upper - lower)
+            points = lower + torch.rand(
+                (count, 3), generator=generator, device=device, dtype=dtype
+            ) * (upper - lower)
             contains = getattr(cavity, "contains", None)
             if callable(contains):
                 for _ in range(64):
-                    mask = torch.as_tensor(contains(points), device=device, dtype=torch.bool)
+                    mask = torch.as_tensor(
+                        contains(points), device=device, dtype=torch.bool
+                    )
                     if bool(mask.all()):
                         break
-                    replacement = lower + torch.rand((count, 3), generator=generator, device=device, dtype=dtype) * (upper - lower)
+                    replacement = lower + torch.rand(
+                        (count, 3), generator=generator, device=device, dtype=dtype
+                    ) * (upper - lower)
                     points = torch.where(mask[:, None], points, replacement)
                 CavityAwarePrior._validate_support(cavity, points, count, device)
             return points
-        center = torch.as_tensor(getattr(cavity, "center", (0.0, 0.0, 0.0)), dtype=dtype, device=device)
+        center = torch.as_tensor(
+            getattr(cavity, "center", (0.0, 0.0, 0.0)), dtype=dtype, device=device
+        )
         if center.numel() != 3:
             raise ValueError("cavity center must contain three coordinates.")
         radius = float(getattr(cavity, "radius", getattr(cavity, "half_extent", 5.0)))
         if radius <= 0:
             raise ValueError("cavity radius must be positive.")
-        points = center + (torch.rand((count, 3), generator=generator, device=device, dtype=dtype) * 2 - 1) * radius
+        points = (
+            center
+            + (
+                torch.rand((count, 3), generator=generator, device=device, dtype=dtype)
+                * 2
+                - 1
+            )
+            * radius
+        )
         contains = getattr(cavity, "contains", None)
         if callable(contains):
             for _ in range(128):
-                mask = torch.as_tensor(contains(points), device=device, dtype=torch.bool)
+                mask = torch.as_tensor(
+                    contains(points), device=device, dtype=torch.bool
+                )
                 if bool(mask.all()):
                     break
-                replacement = center + (torch.rand((count, 3), generator=generator, device=device, dtype=dtype) * 2 - 1) * radius
+                replacement = (
+                    center
+                    + (
+                        torch.rand(
+                            (count, 3), generator=generator, device=device, dtype=dtype
+                        )
+                        * 2
+                        - 1
+                    )
+                    * radius
+                )
                 points = torch.where(mask[:, None], points, replacement)
             CavityAwarePrior._validate_support(cavity, points, count, device)
         return points
 
     @staticmethod
-    def _validate_support(cavity: Any, points: torch.Tensor, count: int,
-                           device: torch.device) -> None:
+    def _validate_support(
+        cavity: Any, points: torch.Tensor, count: int, device: torch.device
+    ) -> None:
         """Reject a bounded rejection draw that still violates cavity support."""
         contains = getattr(cavity, "contains", None)
         if not callable(contains):
             return
         mask = torch.as_tensor(contains(points), device=device, dtype=torch.bool)
         if mask.shape != (count,):
-            raise ValueError("cavity.contains must return a boolean mask with shape [N].")
+            raise ValueError(
+                "cavity.contains must return a boolean mask with shape [N]."
+            )
         if not bool(mask.all()):
-            raise ValueError("cavity rejection sampling exhausted its bounded attempts.")
+            raise ValueError(
+                "cavity rejection sampling exhausted its bounded attempts."
+            )

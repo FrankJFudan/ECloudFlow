@@ -7,10 +7,14 @@ from ecloudflow.sampling.solver import EulerSolver
 
 def _state(x: float = 1.0):
     return MolecularState(
-        positions=torch.tensor([[x, 0.0, 0.0]]), atom_logits=torch.tensor([[1.0, 0.0]]),
-        charge_logits=torch.tensor([[1.0, 0.0]]), halfedge_index=torch.empty((2, 0), dtype=torch.long),
-        bond_logits=torch.empty((0, 2)), electron_latent=torch.zeros((1, 1)),
-        node_batch=torch.zeros(1, dtype=torch.long), halfedge_batch=torch.empty(0, dtype=torch.long),
+        positions=torch.tensor([[x, 0.0, 0.0]]),
+        atom_logits=torch.tensor([[1.0, 0.0]]),
+        charge_logits=torch.tensor([[1.0, 0.0]]),
+        halfedge_index=torch.empty((2, 0), dtype=torch.long),
+        bond_logits=torch.empty((0, 2)),
+        electron_latent=torch.zeros((1, 1)),
+        node_batch=torch.zeros(1, dtype=torch.long),
+        halfedge_batch=torch.empty(0, dtype=torch.long),
     )
 
 

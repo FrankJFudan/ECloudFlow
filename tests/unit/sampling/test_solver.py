@@ -27,6 +27,7 @@ def test_heun_is_more_accurate_than_euler_on_linear_field():
     generator = torch.Generator().manual_seed(5)
     heun = HeunSolver(8).integrate(_state(), _field, (), generator)
     exact = torch.exp(torch.tensor(1.0))
-    assert abs(heun.final.positions[0, 0] - exact) < abs(euler.final.positions[0, 0] - exact)
+    assert abs(heun.final.positions[0, 0] - exact) < abs(
+        euler.final.positions[0, 0] - exact
+    )
     assert euler.nfe == 8 and heun.nfe == 16
-

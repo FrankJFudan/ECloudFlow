@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import inspect
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 
 from ecloudflow.core.types import MolecularState
 from ecloudflow.exceptions import SamplingNumericsError
-
 
 VectorFieldCallable = Callable[..., Any]
 StateHook = Callable[..., MolecularState]
@@ -45,7 +43,9 @@ class SamplingTrajectory:
         return {"wall_time": self.wall_time}
 
 
-def _call_field(field: VectorFieldCallable, state: MolecularState, t: torch.Tensor) -> Any:
+def _call_field(
+    field: VectorFieldCallable, state: MolecularState, t: torch.Tensor
+) -> Any:
     """Call common vector-field signatures without masking user errors."""
     try:
         return field(state, t)
@@ -62,31 +62,67 @@ def _derivative_state(value: Any, state: MolecularState) -> MolecularState:
     if isinstance(value, dict):
         zeros = {
             name: torch.zeros_like(getattr(state, name))
-            for name in ("positions", "atom_logits", "charge_logits", "bond_logits", "electron_latent")
+            for name in (
+                "positions",
+                "atom_logits",
+                "charge_logits",
+                "bond_logits",
+                "electron_latent",
+            )
         }
         zeros.update({k: v for k, v in value.items() if k in zeros})
         return state.replace(**zeros)
     if isinstance(value, (tuple, list)) and len(value) == 7:
-        return state.replace(positions=value[0], atom_logits=value[1], charge_logits=value[2], bond_logits=value[3], electron_latent=value[4])
+        return state.replace(
+            positions=value[0],
+            atom_logits=value[1],
+            charge_logits=value[2],
+            bond_logits=value[3],
+            electron_latent=value[4],
+        )
     raise TypeError("vector field must return MolecularState or a state-field mapping.")
 
 
-def _step(state: MolecularState, deriv: MolecularState, dt: torch.Tensor) -> MolecularState:
+def _step(
+    state: MolecularState, deriv: MolecularState, dt: torch.Tensor
+) -> MolecularState:
     changes: dict[str, torch.Tensor] = {}
-    for name in ("positions", "atom_logits", "charge_logits", "bond_logits", "electron_latent"):
+    for name in (
+        "positions",
+        "atom_logits",
+        "charge_logits",
+        "bond_logits",
+        "electron_latent",
+    ):
         candidate = getattr(state, name) + dt * getattr(deriv, name)
         # Preserve normalized categorical simplex semantics when inputs are probabilities.
-        if name != "positions" and candidate.numel() and bool((getattr(state, name) >= 0).all()):
+        if (
+            name != "positions"
+            and candidate.numel()
+            and bool((getattr(state, name) >= 0).all())
+        ):
             old = getattr(state, name)
-            if bool((old >= 0).all()) and bool(torch.allclose(old.sum(-1), torch.ones_like(old.sum(-1)), atol=1e-4, rtol=1e-4)):
+            if bool((old >= 0).all()) and bool(
+                torch.allclose(
+                    old.sum(-1), torch.ones_like(old.sum(-1)), atol=1e-4, rtol=1e-4
+                )
+            ):
                 candidate = candidate.clamp_min(0)
-                candidate = candidate / candidate.sum(-1, keepdim=True).clamp_min(torch.finfo(candidate.dtype).tiny)
+                candidate = candidate / candidate.sum(-1, keepdim=True).clamp_min(
+                    torch.finfo(candidate.dtype).tiny
+                )
         changes[name] = candidate
     return state.replace(**changes)
 
 
 def _validate_finite(state: MolecularState) -> None:
-    for name in ("positions", "atom_logits", "charge_logits", "bond_logits", "electron_latent"):
+    for name in (
+        "positions",
+        "atom_logits",
+        "charge_logits",
+        "bond_logits",
+        "electron_latent",
+    ):
         if not bool(torch.isfinite(getattr(state, name)).all()):
             raise SamplingNumericsError(f"non-finite values in {name} during sampling.")
 
@@ -102,9 +138,17 @@ class _BaseSolver:
         if not isinstance(generator, torch.Generator):
             raise TypeError("generator must be a torch.Generator owned by the caller.")
         if generator.device != state.positions.device:
-            raise ValueError(f"generator device {generator.device} does not match state device {state.positions.device}.")
+            raise ValueError(
+                f"generator device {generator.device} does not match state device {state.positions.device}."
+            )
 
-    def _hook(self, state: MolecularState, hooks: Sequence[StateHook], t: torch.Tensor, generator: torch.Generator) -> MolecularState:
+    def _hook(
+        self,
+        state: MolecularState,
+        hooks: Sequence[StateHook],
+        t: torch.Tensor,
+        generator: torch.Generator,
+    ) -> MolecularState:
         for hook in hooks:
             try:
                 state = hook(state, t, generator)
@@ -121,8 +165,13 @@ class _BaseSolver:
         _validate_finite(state)
         return state
 
-    def integrate(self, state: MolecularState, vector_field: VectorFieldCallable,
-                  hooks: Sequence[StateHook] = (), generator: torch.Generator | None = None) -> SamplingTrajectory:
+    def integrate(
+        self,
+        state: MolecularState,
+        vector_field: VectorFieldCallable,
+        hooks: Sequence[StateHook] = (),
+        generator: torch.Generator | None = None,
+    ) -> SamplingTrajectory:
         """Integrate a molecular state with post-substep constraint hooks.
 
         :param state: Initial flattened molecular state.
@@ -139,27 +188,60 @@ class _BaseSolver:
         # Normalize the initial state through the same exact constraints used
         # after each substep, so retained trajectories have no unconstrained
         # frame at index zero.
-        current = self._hook(state, hooks, torch.tensor(0.0, dtype=state.positions.dtype, device=state.positions.device), rng)
+        current = self._hook(
+            state,
+            hooks,
+            torch.tensor(
+                0.0, dtype=state.positions.dtype, device=state.positions.device
+            ),
+            rng,
+        )
         frames: list[MolecularState] = [current] if self.save_every_step else []
         nfe = 0
         for index in range(self.num_steps):
-            t = torch.tensor(index / self.num_steps, dtype=state.positions.dtype, device=state.positions.device)
-            t_next = torch.tensor((index + 1) / self.num_steps, dtype=state.positions.dtype, device=state.positions.device)
+            t = torch.tensor(
+                index / self.num_steps,
+                dtype=state.positions.dtype,
+                device=state.positions.device,
+            )
+            t_next = torch.tensor(
+                (index + 1) / self.num_steps,
+                dtype=state.positions.dtype,
+                device=state.positions.device,
+            )
             current, evaluations = self._advance(current, vector_field, t, t_next)
             nfe += evaluations
             current = self._hook(current, hooks, t_next, rng)
             if self.save_every_step:
                 frames.append(current)
-        return SamplingTrajectory(current, tuple(frames), nfe, time.perf_counter() - started, {"num_steps": self.num_steps})
+        return SamplingTrajectory(
+            current,
+            tuple(frames),
+            nfe,
+            time.perf_counter() - started,
+            {"num_steps": self.num_steps},
+        )
 
-    def _advance(self, state: MolecularState, field: VectorFieldCallable, t: torch.Tensor, t_next: torch.Tensor) -> tuple[MolecularState, int]:
+    def _advance(
+        self,
+        state: MolecularState,
+        field: VectorFieldCallable,
+        t: torch.Tensor,
+        t_next: torch.Tensor,
+    ) -> tuple[MolecularState, int]:
         raise NotImplementedError
 
 
 class EulerSolver(_BaseSolver):
     """Integrate with first-order explicit Euler updates."""
 
-    def _advance(self, state: MolecularState, field: VectorFieldCallable, t: torch.Tensor, t_next: torch.Tensor) -> tuple[MolecularState, int]:
+    def _advance(
+        self,
+        state: MolecularState,
+        field: VectorFieldCallable,
+        t: torch.Tensor,
+        t_next: torch.Tensor,
+    ) -> tuple[MolecularState, int]:
         derivative = _derivative_state(_call_field(field, state, t), state)
         _validate_finite(derivative)
         return _step(state, derivative, t_next - t), 1
@@ -168,7 +250,13 @@ class EulerSolver(_BaseSolver):
 class HeunSolver(_BaseSolver):
     """Integrate with second-order predictor-corrector Heun updates."""
 
-    def _advance(self, state: MolecularState, field: VectorFieldCallable, t: torch.Tensor, t_next: torch.Tensor) -> tuple[MolecularState, int]:
+    def _advance(
+        self,
+        state: MolecularState,
+        field: VectorFieldCallable,
+        t: torch.Tensor,
+        t_next: torch.Tensor,
+    ) -> tuple[MolecularState, int]:
         dt = t_next - t
         first = _derivative_state(_call_field(field, state, t), state)
         _validate_finite(first)
