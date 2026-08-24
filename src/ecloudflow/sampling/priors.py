@@ -102,6 +102,7 @@ class CavityAwarePrior:
             values = torch.as_tensor(values, dtype=dtype, device=device)
             if values.shape != (count, 3):
                 raise ValueError("cavity.sample must return [N, 3] coordinates.")
+            CavityAwarePrior._validate_support(cavity, values, count, device)
             return values
         bounds = getattr(cavity, "bounds", None)
         if bounds is not None:
@@ -117,6 +118,7 @@ class CavityAwarePrior:
                         break
                     replacement = lower + torch.rand((count, 3), generator=generator, device=device, dtype=dtype) * (upper - lower)
                     points = torch.where(mask[:, None], points, replacement)
+                CavityAwarePrior._validate_support(cavity, points, count, device)
             return points
         center = torch.as_tensor(getattr(cavity, "center", (0.0, 0.0, 0.0)), dtype=dtype, device=device)
         if center.numel() != 3:
@@ -133,4 +135,18 @@ class CavityAwarePrior:
                     break
                 replacement = center + (torch.rand((count, 3), generator=generator, device=device, dtype=dtype) * 2 - 1) * radius
                 points = torch.where(mask[:, None], points, replacement)
+            CavityAwarePrior._validate_support(cavity, points, count, device)
         return points
+
+    @staticmethod
+    def _validate_support(cavity: Any, points: torch.Tensor, count: int,
+                           device: torch.device) -> None:
+        """Reject a bounded rejection draw that still violates cavity support."""
+        contains = getattr(cavity, "contains", None)
+        if not callable(contains):
+            return
+        mask = torch.as_tensor(contains(points), device=device, dtype=torch.bool)
+        if mask.shape != (count,):
+            raise ValueError("cavity.contains must return a boolean mask with shape [N].")
+        if not bool(mask.all()):
+            raise ValueError("cavity rejection sampling exhausted its bounded attempts.")

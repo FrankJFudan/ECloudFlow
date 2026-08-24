@@ -25,8 +25,7 @@ class ScoreCorrector:
     def __init__(self, snr: float = 0.16, steps: int = 1, *, edit_mask: torch.Tensor | None = None) -> None:
         if not torch.isfinite(torch.tensor(snr)) or snr <= 0:
             raise ValueError("snr must be finite and positive.")
-        if steps < 0:
-            raise ValueError("steps must be non-negative.")
+        self._validate_steps(steps, "steps")
         self.snr, self.steps, self.edit_mask = float(snr), int(steps), edit_mask
 
     def correct(self, state: MolecularState, score: VectorFieldCallable,
@@ -46,7 +45,7 @@ class ScoreCorrector:
         rng = generator or torch.Generator(device=state.positions.device)
         if rng.device != state.positions.device:
             raise ValueError("generator device must match state device.")
-        count = self.steps if steps is None else steps
+        count = self.steps if steps is None else self._validate_steps(steps, "steps override")
         current = state
         frames: list[MolecularState] = [current]
         started, nfe = time.perf_counter(), 0
@@ -72,11 +71,24 @@ class ScoreCorrector:
             for hook in hooks:
                 try:
                     current = hook(current, t, rng)
-                except TypeError:
-                    current = hook(current)
+                except TypeError as first:
+                    try:
+                        current = hook(current, t)
+                    except TypeError:
+                        try:
+                            current = hook(current)
+                        except TypeError:
+                            raise first
             _validate_finite(current)
             frames.append(current)
         return SamplingTrajectory(current, tuple(frames), nfe, time.perf_counter() - started, {"corrector_steps": count})
+
+    @staticmethod
+    def _validate_steps(value: int, name: str) -> int:
+        """Validate an integer correction count, excluding booleans."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer.")
+        return value
 
     @staticmethod
     def _apply_other_channels(state: MolecularState, derivative: MolecularState, step: torch.Tensor,
