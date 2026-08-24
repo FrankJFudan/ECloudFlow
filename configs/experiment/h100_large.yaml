@@ -1,0 +1,27 @@
+# @package _global_
+defaults:
+  - _self_
+  - /train: stage3
+  - override /model: large
+  - override /data: pdbbind
+
+benchmark:
+  warmup_steps: 10
+  measurement_steps: 100
+  global_batch_size: 32
+  devices: [1, 2, 4]
+  profile: balanced
+  output_dir: runs/h100-scaling
+  seed: 2026
+
+trainer:
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16-mixed
+  devices: 4
+  accumulate_grad_batches: 8
+  max_steps: 500000
+  max_epochs: 1000
+  checkpoint_dir: outputs/h100-large/checkpoints
+  deterministic: true
+  benchmark: false
