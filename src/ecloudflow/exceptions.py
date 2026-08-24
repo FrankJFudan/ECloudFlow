@@ -19,3 +19,7 @@ class FragmentInvariantError(ECloudFlowError, ValueError):
 
 class DataValidationError(ECloudFlowError, ValueError):
     """Raise when a source structure cannot form a valid ECloudFlow sample."""
+
+
+class SamplingNumericsError(ECloudFlowError, ValueError):
+    """Raise when a sampling trajectory produces NaN or infinite values."""
