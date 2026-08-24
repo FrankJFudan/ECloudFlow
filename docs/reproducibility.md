@@ -11,11 +11,13 @@ ecloudflow doctor --json --output-dir runs/doctor
 ecloudflow config show +experiment=smoke > runs/smoke/resolved-config.json
 ```
 
-For generation, retain `generation.json`, `samples.csv`, `samples.parquet`,
-`summary.xlsx`, `summary.json`, `ranked.sdf`, raw and relaxed poses, and
-`failed.csv`. For evaluation, retain `evaluation.json`, report HTML, figures,
-and the exact command line. Temporary files are atomically renamed so a
-published artifact is complete.
+For generation, retain `resolved-config.json`, `generation.json`,
+`samples.csv`, `samples.parquet`, `summary.xlsx`, `summary.json`, `ranked.sdf`,
+raw and relaxed poses, and `failed.csv`.  The resolved configuration includes
+the effective profile, attempt bound, seed, checkpoint, and docking request.
+For evaluation, retain `evaluation.json`, report HTML, figures, and the exact
+command line. Temporary files are atomically renamed so a published artifact
+is complete.
 
 Use fixed seeds for preprocessing, model initialization, sampling, bootstrap,
 and plotting. Record NFE and attempt bounds, not just wall time. If CUDA,

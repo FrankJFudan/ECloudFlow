@@ -5,7 +5,17 @@ import pytest
 from typer.testing import CliRunner
 
 _COMMAND = re.compile(r"^\s*ecloudflow\s+([^\n`]+)", re.MULTILINE)
-_KNOWN = {"doctor", "config", "data", "train", "benchmark", "sample", "evaluate", "report", "visualize"}
+_KNOWN = {
+    "doctor",
+    "config",
+    "data",
+    "train",
+    "benchmark",
+    "sample",
+    "evaluate",
+    "report",
+    "visualize",
+}
 
 
 def extract_ecloudflow_commands(path: Path) -> list[str]:
@@ -37,3 +47,28 @@ def test_extractor_finds_core_workflows():
     commands = extract_ecloudflow_commands(Path("README.md"))
     roots = {command.split()[0] for command in commands}
     assert {"doctor", "sample", "evaluate", "report"}.issubset(roots)
+
+
+def test_documented_benchmark_device_options_execute(tmp_path: Path) -> None:
+    """The repeatable device syntax used in the README reaches the CLI."""
+    from ecloudflow.cli.main import app
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark",
+            "--devices",
+            "1",
+            "--devices",
+            "2",
+            "--devices",
+            "4",
+            "--steps",
+            "1",
+            "--dry-run",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert (tmp_path / "scaling.json").is_file()

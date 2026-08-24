@@ -78,9 +78,12 @@ ecloudflow visualize molecule runs/smoke --id toy_pocket-000001
 ecloudflow visualize ecloud runs/smoke
 ```
 
-The run contains `generation.json`, `samples.csv`, `samples.parquet`,
-`summary.xlsx`, `summary.json`, `ranked.sdf`, `failed.csv`, raw/relaxed SDF
-poses, `evaluation.json`, `report.html`, and publication figures.
+The run contains `resolved-config.json`, `generation.json`, `samples.csv`,
+`samples.parquet`, `summary.xlsx`, `summary.json`, `ranked.sdf`, `failed.csv`,
+raw/relaxed SDF poses, `evaluation.json`, `report.html`, and publication
+figures.  `resolved-config.json` records the fully composed configuration and
+the effective command request, including profile, attempt bound, seed,
+checkpoint, and docking selection.
 
 ## Data Preparation
 
@@ -154,8 +157,11 @@ ecloudflow benchmark --devices 1 --devices 2 --devices 4 \
 
 The scripts print Git and dataset-manifest hashes.  `run_h100_smoke.sh` uses a
 local benchmark by default; set `ECLOUDFLOW_RUN_NCCL=1` on the server to invoke
-`torchrun --nproc_per_node=4`.  Local CI uses a clearly labeled CPU simulation
-when requested device counts are not visible.
+`torchrun --nproc_per_node=4`.  The NCCL scaling script stores raw one-, two-,
+and four-process reports under `dev1/`, `dev2/`, and `dev4/`, then publishes a
+combined `scaling.json`/`scaling.csv` at the requested output root with
+recomputed speedup and efficiency.  Local CI uses a clearly labeled CPU
+simulation when requested device counts are not visible.
 
 ## Sampling
 

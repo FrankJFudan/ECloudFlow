@@ -20,6 +20,10 @@ Set `ECLOUDFLOW_RUN_NCCL=1` on the server to invoke the four-rank torchrun
 path. The benchmark keeps model and global batch fixed while varying device
 count, measuring examples/second, optimizer steps/second, peak allocated and
 reserved memory, speedup, efficiency, NFE, valid yield, and GPU-hours.
+NCCL scaling keeps the raw one-, two-, and four-process reports in separate
+`dev1/`, `dev2/`, and `dev4/` directories and writes a combined root report
+after all three jobs succeed. If no manifest is available, the report labels
+its data fingerprint as a configuration fallback rather than a dataset hash.
 
 ## Correctness rules
 
