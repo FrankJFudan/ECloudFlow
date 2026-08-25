@@ -35,3 +35,9 @@ work, device counts, warm-up, measurement steps, and tolerances.
 
 Resolved configuration is serialized into run manifests and checkpoints.
 Machine paths, credentials, and local overrides belong outside version control.
+
+Editable installs read the repository-root `configs/` tree. Regular wheel
+installs read an identical packaged copy. Set `ECLOUDFLOW_CONFIG_DIR` to a
+complete external tree containing `config.yaml` when server-specific presets
+must remain outside the checkout. A unit test requires the editable and
+packaged defaults to remain byte-identical.

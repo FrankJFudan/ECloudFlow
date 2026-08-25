@@ -23,12 +23,18 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from ecloudflow.chemistry.relax import relax_molecule
+from ecloudflow.chemistry.vocabulary import ChemicalVocabulary
 from ecloudflow.core.types import FragmentCondition
 from ecloudflow.docking.base import DockingResult, DockingStatus
 from ecloudflow.evaluation.outputs import OutputBundle, write_ranked_outputs
 from ecloudflow.evaluation.ranking import RankedMolecule, rank_molecules
-from ecloudflow.sampling.pipeline import SamplingPipeline
-from ecloudflow.sampling.profiles import get_profile
+from ecloudflow.models import ECloudFlowModel
+from ecloudflow.sampling.pipeline import (
+    SamplingPipeline,
+    build_fragment_condition,
+    predict_atom_count,
+)
+from ecloudflow.sampling.profiles import SamplingProfile, get_profile
 from ecloudflow.sampling.results import (
     GenerationAttempt,
     GenerationMode,
@@ -176,10 +182,25 @@ class ECloudFlowPipeline:
         else:
             payload = checkpoint
 
+        built_from_payload = False
         if model_factory is not None:
             model = _call_factory(model_factory, payload)
-        if model is not None and payload is not None and load_weights:
+        if (
+            model is None
+            and candidate_generator is None
+            and isinstance(payload, Mapping)
+        ):
+            model = _build_checkpoint_model(payload, map_location=map_location)
+            built_from_payload = True
+        if (
+            model is not None
+            and payload is not None
+            and load_weights
+            and not built_from_payload
+        ):
             _load_model_state(model, payload)
+        if isinstance(model, ECloudFlowModel):
+            model.eval()
         if candidate_generator is None and model is None and callable(payload):
             candidate_generator = payload
         if candidate_generator is None and model is None and callable(checkpoint):
@@ -196,7 +217,7 @@ class ECloudFlowPipeline:
         num_molecules: int,
         fragment: Any = None,
         mode: GenerationMode = GenerationMode.DE_NOVO,
-        profile: str = "balanced",
+        profile: str | SamplingProfile = "balanced",
         max_attempts: int | None = None,
         output_dir: str | Path | None = None,
         seed: int = 2026,
@@ -209,8 +230,9 @@ class ECloudFlowPipeline:
             output coordinate frame.
         :param num_molecules: Target count of valid unique molecules after
             exact graph decoding and RDKit sanitization.
-        :param fragment: Optional positioned fragment for grow/link/replace/
-            merge generation.
+        :param fragment: Optional positioned fragment path/object for grow or
+            replace generation, or a non-empty sequence of paths/objects for
+            link and merge generation.
         :param mode: De novo or fragment-conditioned generation objective.
         :param profile: Named ``fast``, ``balanced``, or ``quality`` preset.
         :param max_attempts: Bounded attempts; defaults to five times target.
@@ -248,9 +270,20 @@ class ECloudFlowPipeline:
         """
         if not isinstance(request, GenerationRequest):
             raise TypeError("request must be a GenerationRequest.")
-        profile = get_profile(request.profile)
+        profile = (
+            request.profile
+            if isinstance(request.profile, SamplingProfile)
+            else get_profile(request.profile)
+        )
         max_attempts = request.max_attempts or 5 * request.num_molecules
         destination = _prepare_output_dir(request.output_dir)
+        fragment = _prepare_fragment_condition(
+            request.pocket,
+            request.fragment,
+            request.mode,
+            request.seed,
+            self.model,
+        )
         valid: list[GenerationRecord] = []
         attempts: list[GenerationAttempt] = []
         seen: set[str] = set()
@@ -266,10 +299,10 @@ class ECloudFlowPipeline:
                 generator = _make_generator(attempt_seed)
                 candidate = self.sampler.sample(
                     pocket=request.pocket,
-                    fragment=request.fragment,
+                    fragment=fragment,
                     fixed=(
-                        request.fragment
-                        if isinstance(request.fragment, FragmentCondition)
+                        fragment
+                        if isinstance(fragment, FragmentCondition)
                         else None
                     ),
                     mode=request.mode,
@@ -280,6 +313,8 @@ class ECloudFlowPipeline:
                 )
                 candidate, metadata = _unwrap_candidate(candidate)
                 molecule = _coerce_molecule(candidate, attempt_seed)
+                if isinstance(fragment, FragmentCondition):
+                    _validate_fragment_output(molecule, fragment)
                 canonical = Chem.MolToSmiles(
                     molecule, canonical=True, isomericSmiles=True
                 )
@@ -330,8 +365,8 @@ class ECloudFlowPipeline:
                     relaxation_method=self.relaxation_method,
                     relaxation_iterations=self.relaxation_iterations,
                     fixed_atom_mask=(
-                        request.fragment.fixed_atom_mask
-                        if isinstance(request.fragment, FragmentCondition)
+                        fragment.fixed_atom_mask
+                        if isinstance(fragment, FragmentCondition)
                         else None
                     ),
                 )
@@ -387,6 +422,15 @@ class ECloudFlowPipeline:
         )
         if destination is not None:
             _write_manifest(destination / "generation.json", request, result)
+        if self.model is not None and result.valid_count == 0:
+            first_failure = next(
+                (attempt.reason for attempt in attempts if attempt.reason),
+                "no candidate was returned",
+            )
+            raise RuntimeError(
+                "checkpoint-backed sampling produced no valid molecule; "
+                f"first attempt: {first_failure}"
+            )
         if request.strict_count and result.shortfall:
             raise GenerationShortfallError(
                 f"requested {request.num_molecules} unique molecules but obtained "
@@ -514,6 +558,192 @@ class _CandidateRejected(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def _prepare_fragment_condition(
+    pocket: Any,
+    fragment: Any,
+    mode: GenerationMode,
+    seed: int,
+    model: Any,
+) -> Any:
+    """Convert an existing fragment file into the exact sampling contract.
+
+    :param pocket: Pocket source defining the local binding frame.
+    :param fragment: Fragment condition, SDF path/sequence of paths, or
+        injected fixture value.
+    :param mode: Requested generation objective.
+    :param seed: Request seed used for deterministic editable-node placement.
+    :param model: Optional loaded model whose device/dtype own inference.
+    :return: Exact :class:`FragmentCondition` for real file inputs, otherwise
+        the original injected value for backwards-compatible test services.
+    :rtype: object
+    :raises ValueError: If an existing fragment file cannot form a positioned
+        graph condition in the pocket coordinate frame.
+
+    Conversion happens once per public request, before bounded attempts.  The
+    first fragment nodes preserve source atom order, identity, formal charge,
+    internal bonds, and coordinates; editable capacity is appended after them.
+    This prevents attempt-specific parsing or random masks from changing the
+    conditioning problem.
+    """
+    if mode is GenerationMode.DE_NOVO or fragment is None:
+        return fragment
+    if isinstance(fragment, FragmentCondition):
+        return fragment
+    if not _fragment_sources_are_supported(fragment):
+        return fragment
+    device, dtype = _model_device_dtype(model)
+    fallback_extra_atoms = {
+        GenerationMode.GROW: 8,
+        GenerationMode.LINK: 10,
+        GenerationMode.REPLACE: 8,
+        GenerationMode.MERGE: 10,
+    }[mode]
+    extra_atoms = fallback_extra_atoms
+    if isinstance(model, ECloudFlowModel):
+        fixed_only = build_fragment_condition(
+            pocket,
+            fragment,
+            extra_atoms=0,
+            device=device,
+            dtype=dtype,
+            seed=seed,
+            task_id=mode.value,
+            electron_latent_dim=int(model.electron_latent_dim),
+        )
+        predicted_count = predict_atom_count(model, pocket, fixed=fixed_only)
+        fixed_count = int(fixed_only.fixed_atom_mask.sum())
+        if predicted_count < fixed_count:
+            raise ValueError(
+                "model predicted fewer atoms than the fixed fragment"
+            )
+        # A count equal to the fixed scaffold is a valid no-growth outcome. Keep
+        # the state size identical to the model's categorical prediction instead
+        # of appending an artificial editable atom (which would violate the
+        # learned count and can make a max-sized fragment impossible to sample).
+        extra_atoms = predicted_count - fixed_count
+    return build_fragment_condition(
+        pocket,
+        fragment,
+        extra_atoms=extra_atoms,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        task_id=mode.value,
+        electron_latent_dim=int(getattr(model, "electron_latent_dim", 48)),
+    )
+
+
+def _model_device_dtype(model: Any) -> tuple[torch.device, torch.dtype]:
+    """Return model inference placement or the portable CPU default."""
+    if model is None or not hasattr(model, "parameters"):
+        return torch.device("cpu"), torch.float32
+    try:
+        parameter = next(model.parameters())
+    except StopIteration:
+        return torch.device("cpu"), torch.float32
+    dtype = parameter.dtype
+    if dtype in (torch.float16, torch.bfloat16):
+        dtype = torch.float32
+    return parameter.device, dtype
+
+
+def _fragment_sources_are_supported(fragment: Any) -> bool:
+    """Return whether a fragment source can form an exact positioned condition.
+
+    Existing files are checked eagerly so arbitrary fixture strings remain
+    available to injected candidate services. RDKit molecules are accepted
+    directly, and mixed path/molecule sequences are normalized by
+    :func:`build_fragment_condition` without changing their atom order.
+    """
+    if isinstance(fragment, Chem.Mol):
+        return True
+    if isinstance(fragment, (str, Path)):
+        return Path(fragment).is_file()
+    if isinstance(fragment, (list, tuple)) and fragment:
+        return all(
+            isinstance(value, Chem.Mol)
+            or (isinstance(value, (str, Path)) and Path(value).is_file())
+            for value in fragment
+        )
+    return False
+
+
+def _validate_fragment_output(
+    molecule: Chem.Mol, condition: FragmentCondition
+) -> None:
+    """Reject any final molecule that changed an exact fragment invariant.
+
+    :param molecule: Sanitized candidate in the original pocket coordinate frame.
+    :param condition: Local-frame exact fragment reference and masks.
+    :return: None when fixed atom identity, formal charge, internal connectivity,
+        bond order semantics, and global coordinates all match.
+    :rtype: None
+    :raises _CandidateRejected: If a fixed value changed or the conformer is absent.
+
+    Atom indices are intentionally stable: fragment atoms occupy the first
+    reference nodes and generated atoms are appended.  Aromatic RDKit bonds are
+    accepted for fixed Kekule single/double ring edges because sanitization
+    recovers aromaticity after the exact decoder has already enforced the stored
+    alternating bond classes. Coordinate comparison uses a tight serialization
+    tolerance only because RDKit conformers store C++ doubles, while all tensor
+    clamping before reconstruction is bitwise exact.
+    """
+    reference = condition.reference
+    fixed = condition.fixed_atom_mask.detach().cpu()
+    indices = torch.nonzero(fixed, as_tuple=False).flatten().tolist()
+    if molecule.GetNumAtoms() != reference.positions.shape[0]:
+        raise _CandidateRejected("fragment_invariant_failed:atom_count_changed")
+    vocabulary = ChemicalVocabulary.default_ligand()
+    atoms = reference.atom_logits.argmax(dim=-1).detach().cpu()
+    charges = reference.charge_logits.argmax(dim=-1).detach().cpu()
+    for index in indices:
+        atom = molecule.GetAtomWithIdx(index)
+        if atom.GetSymbol() != vocabulary.atom_symbol(int(atoms[index])):
+            raise _CandidateRejected(
+                f"fragment_invariant_failed:atom_identity:{index}"
+            )
+        expected_charge = vocabulary.formal_charges[int(charges[index])]
+        if atom.GetFormalCharge() != expected_charge:
+            raise _CandidateRejected(
+                f"fragment_invariant_failed:formal_charge:{index}"
+            )
+    if molecule.GetNumConformers() != 1:
+        raise _CandidateRejected("fragment_invariant_failed:missing_pose")
+    expected_positions = reference.positions.detach().cpu()
+    if reference.frame is not None:
+        expected_positions = reference.frame.to_global(reference.positions).detach().cpu()
+    observed = torch.tensor(
+        molecule.GetConformer().GetPositions(), dtype=expected_positions.dtype
+    )
+    if not torch.allclose(
+        observed[fixed], expected_positions[fixed], atol=1.0e-5, rtol=0.0
+    ):
+        raise _CandidateRejected("fragment_invariant_failed:coordinates")
+    source, target = reference.halfedge_index.detach().cpu()
+    fixed_bonds = condition.fixed_bond_mask.detach().cpu()
+    expected_classes = reference.bond_logits.argmax(dim=-1).detach().cpu()
+    for edge_index in torch.nonzero(fixed_bonds, as_tuple=False).flatten().tolist():
+        first, second = int(source[edge_index]), int(target[edge_index])
+        expected_order = vocabulary.bond_orders[int(expected_classes[edge_index])]
+        bond = molecule.GetBondBetweenAtoms(first, second)
+        if expected_order == 0.0 and bond is None:
+            continue
+        if expected_order == 0.0:
+            raise _CandidateRejected(
+                f"fragment_invariant_failed:unexpected_internal_bond:{first}-{second}"
+            )
+        if bond is None:
+            raise _CandidateRejected(
+                f"fragment_invariant_failed:internal_bond_missing:{first}-{second}"
+            )
+        observed_order = float(bond.GetBondTypeAsDouble())
+        aromatic_equivalent = bond.GetIsAromatic() and expected_order in {1.0, 2.0}
+        if not aromatic_equivalent and observed_order != expected_order:
+            raise _CandidateRejected(
+                f"fragment_invariant_failed:internal_bond_order:{first}-{second}"
+            )
 
 
 def _coerce_molecule(candidate: Any, seed: int) -> Chem.Mol:
@@ -645,7 +875,11 @@ def _write_manifest(
         "fragment": _display_source(request.fragment),
         "num_molecules": request.num_molecules,
         "mode": request.mode.value,
-        "profile": request.profile,
+        "profile": (
+            request.profile.name
+            if isinstance(request.profile, SamplingProfile)
+            else request.profile
+        ),
         "max_attempts": request.max_attempts,
         "seed": request.seed,
         "strict_count": request.strict_count,
@@ -682,7 +916,7 @@ def _elapsed(started: float) -> float:
     return max(0.0, float(time.monotonic() - started))
 
 
-def _display_source(value: Any) -> str | None:
+def _display_source(value: Any) -> Any:
     """Convert path-like and scalar request sources into stable text."""
     if value is None:
         return None
@@ -690,6 +924,8 @@ def _display_source(value: Any) -> str | None:
         return str(value)
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_display_source(item) for item in value]
     return type(value).__name__
 
 
@@ -768,8 +1004,182 @@ def _load_model_state(model: Any, payload: Any) -> None:
             if isinstance(candidate, Mapping):
                 state = candidate
                 break
-    if isinstance(state, Mapping):
-        model.load_state_dict(state, strict=False)
+    if not isinstance(state, Mapping):
+        raise TypeError("checkpoint does not contain a recognizable state dictionary")
+    if isinstance(model, ECloudFlowModel):
+        state = _joint_backbone_state(
+            {key: value for key, value in state.items() if isinstance(value, torch.Tensor)}
+        )
+    model.load_state_dict(state, strict=True)
+
+
+def _build_checkpoint_model(
+    payload: Mapping[str, Any], *, map_location: str | torch.device
+) -> ECloudFlowModel:
+    """Construct and strictly restore an ECloudFlow model from Lightning state.
+
+    :param payload: Loaded Lightning or plain PyTorch checkpoint mapping.
+    :param map_location: Requested inference device used for the restored model.
+    :return: Evaluation-mode joint backbone with every expected tensor restored.
+    :rtype: ECloudFlowModel
+    :raises ValueError: If the checkpoint has no recognizable backbone state,
+        contains an incomplete architecture, or its metadata conflicts with
+        tensor-derived dimensions.
+
+    Lightning stores training-module keys below ``joint_backbone.*`` whereas a
+    model-only checkpoint stores them without a prefix.  The loader normalizes
+    only these two documented layouts, derives all shape-identifiable widths
+    from tensors, and reads ``lmax``/electron layout from the embedded resolved
+    configuration when available.  Strict loading rejects missing, unexpected,
+    or shape-incompatible tensors before sampling begins; auxiliary optimizer,
+    tokenizer, decoder, EMA, and loss-scaler entries are deliberately excluded.
+    """
+    raw_state = _checkpoint_state(payload)
+    state = _joint_backbone_state(raw_state)
+    required = {
+        "pocket_encoder.null_embedding",
+        "position_velocity_head.weight",
+        "atom_head.network.2.weight",
+        "charge_head.network.2.weight",
+        "bond_head.network.2.weight",
+        "count_predictor.head.2.weight",
+        "electron_velocity_head.parameters_head.2.weight",
+    }
+    missing = sorted(required - set(state))
+    if missing:
+        raise ValueError(
+            "checkpoint state_dict does not contain a complete ECloudFlow "
+            f"joint_backbone; missing {', '.join(missing)}"
+        )
+    scalar_dim = int(state["pocket_encoder.null_embedding"].shape[0])
+    vector_dim = int(state["position_velocity_head.weight"].shape[0]) - 1
+    atom_classes = int(state["atom_head.network.2.weight"].shape[0])
+    charge_classes = int(state["charge_head.network.2.weight"].shape[0])
+    bond_classes = int(state["bond_head.network.2.weight"].shape[0])
+    max_atoms = int(state["count_predictor.head.2.weight"].shape[0]) - 1
+    electron_vector_dim = (
+        int(state["electron_velocity_head.parameters_head.2.weight"].shape[0]) - 3
+    )
+    block_indices = {
+        int(key.split(".")[2])
+        for key in state
+        if key.startswith("pocket_encoder.blocks.") and key.split(".")[2].isdigit()
+    }
+    if not block_indices or block_indices != set(range(max(block_indices) + 1)):
+        raise ValueError("checkpoint has an incomplete pocket encoder block sequence")
+    architecture = _checkpoint_architecture(payload)
+    lmax = int(architecture.get("lmax", 2))
+    electron_latent_dim = int(architecture.get("electron_latent_dim", 48))
+    configured = {
+        "scalar_dim": scalar_dim,
+        "vector_dim": vector_dim,
+        "num_blocks": len(block_indices),
+        "lmax": lmax,
+    }
+    for name, inferred in configured.items():
+        if name in architecture and int(architecture[name]) != inferred:
+            raise ValueError(
+                f"checkpoint model metadata {name}={architecture[name]} conflicts "
+                f"with state_dict value {inferred}"
+            )
+    vocabulary = ChemicalVocabulary.default_ligand()
+    expected_channels = (
+        len(vocabulary.atom_symbols),
+        len(vocabulary.formal_charges),
+        len(vocabulary.bond_classes),
+    )
+    if (atom_classes, charge_classes, bond_classes) != expected_channels:
+        raise ValueError(
+            "checkpoint atom/charge/bond channels do not match the canonical "
+            f"ligand vocabulary: {(atom_classes, charge_classes, bond_classes)}"
+        )
+    model = ECloudFlowModel(
+        scalar_dim=scalar_dim,
+        vector_dim=vector_dim,
+        num_blocks=len(block_indices),
+        lmax=lmax,
+        electron_latent_dim=electron_latent_dim,
+        electron_vector_dim=electron_vector_dim,
+        atom_classes=atom_classes,
+        charge_classes=charge_classes,
+        bond_classes=bond_classes,
+        max_atoms=max_atoms,
+        pocket_cutoff=float(architecture.get("pocket_cutoff", 8.0)),
+        cross_cutoff=float(architecture.get("cross_cutoff", 8.0)),
+    )
+    try:
+        model.load_state_dict(dict(state), strict=True)
+    except RuntimeError as error:
+        raise ValueError(f"checkpoint joint_backbone is incompatible: {error}") from error
+    device = torch.device(map_location)
+    model.to(device=device)
+    model.eval()
+    return model
+
+
+def _checkpoint_state(payload: Mapping[str, Any]) -> Mapping[str, torch.Tensor]:
+    """Extract a tensor state mapping from documented checkpoint containers."""
+    state: Any = payload
+    for key in ("state_dict", "model_state_dict", "model"):
+        candidate = payload.get(key)
+        if isinstance(candidate, Mapping):
+            state = candidate
+            break
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError("checkpoint does not contain a non-empty state_dict")
+    if not all(isinstance(key, str) for key in state):
+        raise ValueError("checkpoint state_dict keys must be strings")
+    tensors = {key: value for key, value in state.items() if isinstance(value, torch.Tensor)}
+    if not tensors:
+        raise ValueError("checkpoint state_dict contains no tensors")
+    return tensors
+
+
+def _joint_backbone_state(
+    state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Normalize model-only or Lightning joint-backbone key prefixes."""
+    marker = "pocket_encoder.null_embedding"
+    if marker in state:
+        return dict(state)
+    for prefix in ("joint_backbone.", "model.", "module.joint_backbone."):
+        normalized = {
+            key[len(prefix) :]: value
+            for key, value in state.items()
+            if key.startswith(prefix)
+        }
+        if marker in normalized:
+            return normalized
+    raise ValueError(
+        "checkpoint state_dict is not an ECloudFlow model-only or Lightning "
+        "joint_backbone layout"
+    )
+
+
+def _checkpoint_architecture(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Read optional architecture metadata without accepting arbitrary objects."""
+    candidates: list[Any] = []
+    reproducibility = payload.get("ecloudflow_reproducibility")
+    if isinstance(reproducibility, Mapping):
+        resolved = reproducibility.get("resolved_config")
+        if isinstance(resolved, Mapping):
+            candidates.append(resolved.get("model"))
+    hyperparameters = payload.get("hyper_parameters")
+    if isinstance(hyperparameters, Mapping):
+        candidates.extend(
+            (
+                hyperparameters.get("model_config"),
+                hyperparameters.get("model"),
+            )
+        )
+        resolved = hyperparameters.get("resolved_config")
+        if isinstance(resolved, Mapping):
+            candidates.append(resolved.get("model"))
+    candidates.append(payload.get("model_config"))
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            return dict(candidate)
+    return {}
 
 
 def _call_factory(factory: Callable[..., Any], payload: Any) -> Any:

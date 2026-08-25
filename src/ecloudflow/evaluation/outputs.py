@@ -106,6 +106,7 @@ def _failed_row(record: GenerationRecord) -> dict[str, Any]:
         "molecule_id": None,
         "pocket_id": properties.get("pocket_id"),
         "temporary_id": record.temporary_id,
+        "smiles": record.canonical_smiles,
         "canonical_smiles": record.canonical_smiles,
         "isomeric_smiles": record.canonical_smiles,
         "sa": _first(properties, "sa", "sa_score", "synthetic_accessibility"),

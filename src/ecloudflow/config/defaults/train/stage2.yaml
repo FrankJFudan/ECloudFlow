@@ -1,0 +1,5 @@
+# @package _global_
+stage: ligand_pretrain
+loss:
+  interaction:
+    weight: 0.0

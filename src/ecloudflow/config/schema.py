@@ -12,13 +12,56 @@ class StrictModel(BaseModel):
 
 
 class ModelConfig(StrictModel):
-    """Model-width settings shared by all ECloudFlow backbones."""
+    """Model-width and electron-field settings shared by all backbones.
+
+    :param name: Named architecture scale used by experiment presets.
+    :param scalar_dim: Invariant hidden-channel width.
+    :param vector_dim: Cartesian vector-channel multiplicity.
+    :param num_blocks: Number of equivariant message-passing blocks.
+    :param lmax: Largest electron-field angular order.
+    :param electron_latent_dim: Packed electron-token component width.
+    :param electron_vector_dim: Multiplicity of the packed ``1o`` block.
+    :param field_n_radial: Number of compact radial basis functions.
+    :param field_cutoff: Electron decoder support radius in angstroms.
+    :param field_chunk_size: Maximum query points decoded in one chunk.
+    :param max_atoms: Inclusive atom-count class limit.
+    :return: Frozen architecture configuration with a valid packed irrep layout.
+    :rtype: ModelConfig
+    :raises ValueError: If the packed latent leaves no invariant scalar channel.
+
+    These values determine checkpoint tensor shapes and therefore must be
+    explicit in the resolved training configuration. They contain no device,
+    distributed-rank, filesystem, or random state.
+    """
 
     name: Literal["tiny", "base", "large"] = "tiny"
     scalar_dim: int = Field(default=64, ge=16)
     vector_dim: int = Field(default=16, ge=4)
     num_blocks: int = Field(default=3, ge=1)
     lmax: int = Field(default=2, ge=0, le=4)
+    electron_latent_dim: int = Field(default=48, ge=1)
+    electron_vector_dim: int = Field(default=8, ge=0)
+    field_n_radial: int = Field(default=6, ge=1)
+    field_cutoff: float = Field(default=5.0, gt=0.0)
+    field_chunk_size: int = Field(default=4096, ge=1)
+    max_atoms: int = Field(default=64, ge=1)
+
+    @model_validator(mode="after")
+    def validate_electron_layout(self) -> "ModelConfig":
+        """Require all configured irreps plus one invariant scalar channel."""
+        if self.lmax > 0 and self.electron_vector_dim == 0:
+            raise ValueError("electron_vector_dim must be positive when lmax is nonzero.")
+        higher_width = sum(2 * order + 1 for order in range(2, self.lmax + 1))
+        if (
+            self.electron_latent_dim
+            - 3 * self.electron_vector_dim
+            - higher_width
+            <= 0
+        ):
+            raise ValueError(
+                "electron_latent_dim must retain configured irreps and one scalar."
+            )
+        return self
 
 
 class SampleConfig(StrictModel):
@@ -123,6 +166,9 @@ class BenchmarkConfig(StrictModel):
     :param speedup_tolerance: Permitted relative scaling regression.
     :param memory_tolerance: Permitted relative memory regression.
     :param valid_yield_tolerance: Permitted relative yield regression.
+    :param workload: Actual model workload used by non-dry benchmark runs.
+    :param ligand_nodes: Synthetic ligand nodes per timed complex.
+    :param pocket_nodes: Synthetic pocket nodes per timed complex.
     :return: Frozen benchmark configuration without device side effects.
     :rtype: BenchmarkConfig
     """
@@ -137,6 +183,9 @@ class BenchmarkConfig(StrictModel):
     speedup_tolerance: float = Field(default=0.1, ge=0.0, le=1.0)
     memory_tolerance: float = Field(default=0.1, ge=0.0, le=1.0)
     valid_yield_tolerance: float = Field(default=0.0, ge=0.0, le=1.0)
+    workload: Literal["ecloudflow_forward"] = "ecloudflow_forward"
+    ligand_nodes: int = Field(default=24, ge=1, le=256)
+    pocket_nodes: int = Field(default=96, ge=1, le=2048)
 
     @model_validator(mode="after")
     def validate_devices(self) -> "BenchmarkConfig":
@@ -313,6 +362,8 @@ class TrainerConfig(StrictModel):
     :param every_n_train_steps: Positive periodic checkpoint interval.
     :param save_last: Whether the latest complete checkpoint is retained.
     :param resume_from: Optional Lightning checkpoint used for strict resume.
+    :param init_from: Optional prior-stage checkpoint used for model-only weight
+        initialization with fresh optimizer, EMA, loss-scaler, and data state.
     :param reproducible_resume: Require complete identity and rank-local state.
     :param deterministic: Request deterministic Lightning/PyTorch algorithms.
     :param benchmark: Enable backend autotuning; incompatible with determinism.
@@ -320,6 +371,10 @@ class TrainerConfig(StrictModel):
     :param log_every_n_steps: Positive logger interval.
     :param nan_failure_threshold: Nonfinite batches allowed before termination.
     :param max_nan_artifacts: Maximum diagnostic files published by rank zero.
+    :param learning_rate: Positive AdamW learning rate.
+    :param weight_decay: Non-negative AdamW decoupled weight decay.
+    :param ema_decay: Exponential moving-average coefficient in ``[0,1)``.
+    :param interior_noise: Positive stochastic-interpolant noise multiplier.
     :return: Frozen validated runtime configuration with no device side effects.
     :rtype: TrainerConfig
     :raises ValueError: If deterministic and benchmark modes are both enabled.
@@ -343,6 +398,7 @@ class TrainerConfig(StrictModel):
     every_n_train_steps: int = Field(default=1000, ge=1)
     save_last: bool = True
     resume_from: str | None = None
+    init_from: str | None = None
     reproducible_resume: bool = True
     deterministic: bool = True
     benchmark: bool = False
@@ -350,12 +406,18 @@ class TrainerConfig(StrictModel):
     log_every_n_steps: int = Field(default=50, ge=1)
     nan_failure_threshold: int = Field(default=1, ge=1)
     max_nan_artifacts: int = Field(default=3, ge=0)
+    learning_rate: float = Field(default=1.0e-4, gt=0.0)
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    ema_decay: float = Field(default=0.999, ge=0.0, lt=1.0)
+    interior_noise: float = Field(default=0.2, gt=0.0)
 
     @model_validator(mode="after")
     def validate_backend_modes(self) -> "TrainerConfig":
-        """Reject backend autotuning when exact deterministic replay is requested."""
+        """Reject incompatible backend and checkpoint initialization modes."""
         if self.deterministic and self.benchmark:
             raise ValueError("benchmark must be false when deterministic is true.")
+        if self.resume_from is not None and self.init_from is not None:
+            raise ValueError("resume_from and init_from are mutually exclusive.")
         return self
 
 

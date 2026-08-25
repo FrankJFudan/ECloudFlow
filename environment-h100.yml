@@ -1,0 +1,8 @@
+name: ecloudflow-h100
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.18
+  - pip=25.1
+  - setuptools=78.1.1
+  - git

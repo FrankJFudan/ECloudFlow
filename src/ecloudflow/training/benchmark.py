@@ -20,10 +20,12 @@ from torch import distributed as dist
 from torch import nn, optim
 
 from ecloudflow.config import AppConfig, BenchmarkConfig, DataConfig, load_config
+from ecloudflow.core import GenerationCondition, MolecularState, PocketGraph
 from ecloudflow.exceptions import BenchmarkError
+from ecloudflow.models import ECloudFlowModel
 from ecloudflow.sampling.profiles import get_profile
 
-_MODEL_WIDTH = 256
+_DRY_RUN_REFERENCE_WIDTH = 256
 
 
 @dataclass(frozen=True)
@@ -42,9 +44,9 @@ class BenchmarkRow:
     peak_memory_bytes: int
     reserved_memory_bytes: int
     communication_time_seconds: float | None
-    nfe: int
-    valid_count: int
-    valid_yield: float
+    nfe: int | None
+    valid_count: int | None
+    valid_yield: float | None
     gpu_hours: float
     wall_time_seconds: float
     speedup: float = 1.0
@@ -52,6 +54,9 @@ class BenchmarkRow:
     dry_run: bool = False
     mode: str = "dry-run"
     config: str = ""
+    workload: str = "unidentified"
+    input_source: str = "unidentified"
+    model_forward_calls: int = 0
 
     def __post_init__(self) -> None:
         """Reject malformed measurements before they reach JSON or CSV output."""
@@ -64,8 +69,7 @@ class BenchmarkRow:
             self.samples,
             self.peak_memory_bytes,
             self.reserved_memory_bytes,
-            self.nfe,
-            self.valid_count,
+            self.model_forward_calls,
         )
         if any(
             isinstance(value, bool) or not isinstance(value, int)
@@ -79,15 +83,18 @@ class BenchmarkRow:
             or self.global_batch_size < 1
             or self.local_batch_size < 1
             or self.samples < 0
-            or self.nfe < 0
             or self.peak_memory_bytes <= 0
             or self.reserved_memory_bytes < self.peak_memory_bytes
         ):
             raise ValueError("benchmark row contains invalid integer measurements")
+        for name, value in (("nfe", self.nfe), ("valid_count", self.valid_count)):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer or None")
         numeric = (
             self.samples_per_second,
             self.optimizer_steps_per_second,
-            self.valid_yield,
             self.gpu_hours,
             self.wall_time_seconds,
             self.speedup,
@@ -95,8 +102,13 @@ class BenchmarkRow:
         )
         if any(not math.isfinite(float(value)) or value < 0 for value in numeric):
             raise ValueError("benchmark row contains non-finite metrics")
-        if self.valid_yield > 1.0:
-            raise ValueError("valid_yield must be in [0, 1]")
+        if self.valid_yield is not None and (
+            not math.isfinite(float(self.valid_yield))
+            or not 0.0 <= self.valid_yield <= 1.0
+        ):
+            raise ValueError("valid_yield must be in [0, 1] or None")
+        if not self.workload or not self.input_source:
+            raise ValueError("workload and input_source must be non-empty")
         if self.communication_time_seconds is not None and (
             not math.isfinite(float(self.communication_time_seconds))
             or self.communication_time_seconds < 0
@@ -132,6 +144,9 @@ class BenchmarkRow:
             "mode": self.mode,
             "backend": self.backend,
             "config": self.config,
+            "workload": self.workload,
+            "input_source": self.input_source,
+            "model_forward_calls": self.model_forward_calls,
         }
 
     @property
@@ -145,16 +160,16 @@ class BenchmarkRow:
         return self.peak_memory_bytes
 
     @property
-    def communication_seconds(self) -> float:
-        """Return communication time as a numeric value for legacy consumers."""
-        return float(self.communication_time_seconds or 0.0)
+    def communication_seconds(self) -> float | None:
+        """Return measured communication time without fabricating zero."""
+        return self.communication_time_seconds
 
     @property
     def backend(self) -> str:
         """Return a stable backend label for machine-readable reports."""
         if self.dry_run:
             return "cpu-simulated"
-        return "cuda-ddp" if self.mode == "distributed" else self.mode
+        return "cuda-ddp" if self.mode in {"local", "distributed"} else self.mode
 
 
 ScalingRow = BenchmarkRow
@@ -215,25 +230,12 @@ class ScalingReport:
         return json_path, csv_path, env_path
 
 
-class _SyntheticWorkload(nn.Module):
-    """Small deterministic network used for real and dry-run timing."""
-
-    def __init__(self, width: int = _MODEL_WIDTH) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(width, width * 2),
-            nn.GELU(),
-            nn.Linear(width * 2, width),
-        )
-
-    def forward(
-        self, inputs: torch.Tensor
-    ) -> torch.Tensor:  # pragma: no cover - tiny wrapper
-        return self.net(inputs)
-
-
 def measured_stub_nfe(profile: str) -> int:
-    """Return the profile-specific NFE used by benchmark reports."""
+    """Return the theoretical solver NFE for a named sampling profile.
+
+    This helper describes a configured numerical schedule only. Benchmark
+    reports never present it as an observed model or chemistry measurement.
+    """
     resolved = get_profile(profile)
     return (
         resolved.num_steps * (2 if resolved.solver == "heun" else 1)
@@ -245,6 +247,7 @@ def benchmark_hashes(
     config: str,
     benchmark: BenchmarkConfig,
     data: DataConfig | None = None,
+    app_config: AppConfig | None = None,
 ) -> dict[str, str]:
     """Return stable git/config/data fingerprints for shell scripts.
 
@@ -264,8 +267,14 @@ def benchmark_hashes(
     payload = json.dumps(
         {
             "config": normalized,
-            "benchmark": benchmark.model_dump(mode="json"),
-            "data": data.model_dump(mode="json") if data is not None else None,
+            "resolved": (
+                app_config.model_dump(mode="json")
+                if app_config is not None
+                else {
+                    "benchmark": benchmark.model_dump(mode="json"),
+                    "data": data.model_dump(mode="json") if data is not None else None,
+                }
+            ),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -273,7 +282,7 @@ def benchmark_hashes(
     data_hash, data_source = _dataset_fingerprint(payload, data=data)
     return {
         "git": _git_hash(),
-        "config": _sha256_text(normalized),
+        "config": _sha256_bytes(payload),
         "data": data_hash,
         "data_source": data_source,
     }
@@ -448,12 +457,11 @@ def merge_scaling_reports(
         "global_batch_size",
         "local_batch_size",
         "samples",
-        "nfe",
-        "valid_count",
         "peak_memory_bytes",
         "peak_allocated_memory_bytes",
         "peak_reserved_memory_bytes",
         "reserved_memory_bytes",
+        "model_forward_calls",
     }
     float_fields = {
         "samples_per_second",
@@ -510,8 +518,21 @@ def merge_scaling_reports(
             } else 0
             if row[key] < minimum:
                 raise BenchmarkError(f"invalid {key} in scaling row: {source}")
+        for key in ("nfe", "valid_count"):
+            if key not in row or row[key] is None:
+                continue
+            try:
+                row[key] = _report_integer(row[key], key)
+            except (TypeError, ValueError) as error:
+                raise BenchmarkError(f"invalid {key} in scaling row: {source}") from error
+            if row[key] < 0:
+                raise BenchmarkError(f"invalid {key} in scaling row: {source}")
         for key in float_fields.intersection(row):
-            if key == "communication_time_seconds" and row[key] is None:
+            if key in {
+                "communication_time_seconds",
+                "communication_seconds",
+                "valid_yield",
+            } and row[key] is None:
                 continue
             try:
                 row[key] = _report_float(row[key], key)
@@ -519,7 +540,11 @@ def merge_scaling_reports(
                 raise BenchmarkError(f"invalid {key} in scaling row: {source}") from error
             if row[key] < 0:
                 raise BenchmarkError(f"invalid {key} in scaling row: {source}")
-        if "valid_yield" in row and not 0.0 <= row["valid_yield"] <= 1.0:
+        if (
+            "valid_yield" in row
+            and row["valid_yield"] is not None
+            and not 0.0 <= row["valid_yield"] <= 1.0
+        ):
             raise BenchmarkError(f"invalid valid_yield in scaling row: {source}")
         if {
             "devices",
@@ -530,7 +555,7 @@ def merge_scaling_reports(
         if {
             "valid_count",
             "samples",
-        }.issubset(row) and row["valid_count"] > row["samples"]:
+        }.issubset(row) and row["valid_count"] is not None and row["valid_count"] > row["samples"]:
             raise BenchmarkError(f"valid count exceeds samples in scaling row: {source}")
         if {
             "peak_memory_bytes",
@@ -543,6 +568,20 @@ def merge_scaling_reports(
             "samples",
         }.issubset(row) and row["samples"] != row["global_batch_size"] * row["measurement_steps"]:
             raise BenchmarkError(f"sample count mismatch in scaling row: {source}")
+        compatibility = {
+            "dry_run": row.get("dry_run"),
+            "backend": row.get("backend"),
+            "workload": row.get("workload"),
+            "input_source": row.get("input_source"),
+            "mode_family": _benchmark_mode_family(row.get("mode")),
+        }
+        for key, value in compatibility.items():
+            shared_key = f"compatibility:{key}"
+            if shared_key in shared_fields and value != shared_fields[shared_key]:
+                raise BenchmarkError(
+                    f"scaling reports disagree on {key}: {source}"
+                )
+            shared_fields[shared_key] = value
         for key in (
             "profile",
             "warmup_steps",
@@ -614,6 +653,15 @@ def merge_scaling_reports(
         compatibility_json.write_text(json_text, encoding="utf-8")
         compatibility_csv.write_bytes(csv_path.read_bytes())
     return paths
+
+
+def _benchmark_mode_family(value: Any) -> str | None:
+    """Normalize row modes that legitimately differ with DDP world size."""
+    if value in {"local", "distributed"}:
+        return "model-measurement"
+    if value in {"dry-run", "simulation", "schema-only"}:
+        return "schema-simulation"
+    return str(value) if value is not None else None
 
 
 def benchmark_scaling(
@@ -697,13 +745,16 @@ def benchmark_scaling(
             device_count=count,
             steps=steps,
             config=config,
+            app_config=resolved,
             benchmark=benchmark,
             dry_run=dry_run,
         )
         for count in device_counts
     ]
     rows = _attach_scaling(rows)
-    hashes = benchmark_hashes(config, benchmark, data=resolved.data)
+    hashes = benchmark_hashes(
+        config, benchmark, data=resolved.data, app_config=resolved
+    )
     report_metadata = {
         "git": _git_hash(),
         "hashes": hashes,
@@ -717,6 +768,15 @@ def benchmark_scaling(
         "torch": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
         "benchmark": benchmark.model_dump(mode="json"),
+        "workload": (
+            "schema-simulation" if dry_run else "ecloudflow-training-step"
+        ),
+        "input_source": (
+            "analytical-estimate"
+            if dry_run
+            else "deterministic-synthetic-complexes"
+        ),
+        "chemistry_metrics_measured": False,
     }
     if metadata:
         report_metadata.update(metadata)
@@ -778,14 +838,13 @@ def _benchmark_one_count(
     device_count: int,
     steps: int,
     config: str,
+    app_config: AppConfig,
     benchmark: BenchmarkConfig,
     dry_run: bool,
 ) -> BenchmarkRow:
     if device_count < 1:
         raise BenchmarkError("device counts must be positive integers.")
-    profile = get_profile(benchmark.profile)
     local_batch = _local_batch_size(benchmark.global_batch_size, device_count)
-    nfe = measured_stub_nfe(profile.name)
     if dry_run or (device_count > 1 and not _distributed_ready()):
         return _synthetic_row(
             device_count=device_count,
@@ -793,24 +852,23 @@ def _benchmark_one_count(
             config=config,
             benchmark=benchmark,
             local_batch=local_batch,
-            nfe=nfe,
         )
     if device_count > 1:
         return _distributed_row(
             device_count=device_count,
             steps=steps,
             config=config,
+            app_config=app_config,
             benchmark=benchmark,
             local_batch=local_batch,
-            nfe=nfe,
         )
     return _local_row(
         device_count=device_count,
         steps=steps,
         config=config,
+        app_config=app_config,
         benchmark=benchmark,
         local_batch=local_batch,
-        nfe=nfe,
     )
 
 
@@ -821,19 +879,19 @@ def _synthetic_row(
     config: str,
     benchmark: BenchmarkConfig,
     local_batch: int,
-    nfe: int,
 ) -> BenchmarkRow:
-    base_step = 0.02 + 0.00015 * benchmark.global_batch_size + 0.00002 * nfe
+    theoretical_nfe = measured_stub_nfe(benchmark.profile)
+    base_step = 0.02 + 0.00015 * benchmark.global_batch_size + 0.00002 * theoretical_nfe
     scale = 1.0 + 0.8 * (device_count - 1)
     wall_time = steps * base_step / scale
     samples = benchmark.global_batch_size * steps
     samples_per_second = samples / wall_time
     optimizer_steps_per_second = steps / wall_time
-    peak_memory = _estimated_memory_bytes(local_batch, device_count, benchmark, nfe)
+    peak_memory = _estimated_memory_bytes(
+        local_batch, device_count, benchmark, theoretical_nfe
+    )
     reserved_memory = int(peak_memory * 1.1)
-    communication = 0.0 if device_count == 1 else wall_time * 0.15
-    valid_count = samples
-    valid_yield = 1.0
+    communication = None
     gpu_hours = wall_time * device_count / 3600.0
     return BenchmarkRow(
         devices=device_count,
@@ -848,14 +906,17 @@ def _synthetic_row(
         peak_memory_bytes=peak_memory,
         reserved_memory_bytes=reserved_memory,
         communication_time_seconds=communication,
-        nfe=nfe,
-        valid_count=valid_count,
-        valid_yield=valid_yield,
+        nfe=None,
+        valid_count=None,
+        valid_yield=None,
         gpu_hours=gpu_hours,
         wall_time_seconds=wall_time,
         dry_run=True,
         mode="dry-run",
         config=config,
+        workload="schema-simulation",
+        input_source="analytical-estimate",
+        model_forward_calls=0,
     )
 
 
@@ -864,9 +925,9 @@ def _local_row(
     device_count: int,
     steps: int,
     config: str,
+    app_config: AppConfig,
     benchmark: BenchmarkConfig,
     local_batch: int,
-    nfe: int,
 ) -> BenchmarkRow:
     device = (
         torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
@@ -874,8 +935,7 @@ def _local_row(
     if device.type == "cuda":
         torch.cuda.set_device(device)
     seed = benchmark.seed + device_count
-    width = _MODEL_WIDTH
-    model = _SyntheticWorkload(width).to(device)
+    model = ECloudFlowModel.from_config(app_config.model).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-3)
     measurement = _run_measurement(
         model=model,
@@ -885,6 +945,9 @@ def _local_row(
         warmup_steps=benchmark.warmup_steps,
         measurement_steps=steps,
         seed=seed,
+        ligand_nodes=benchmark.ligand_nodes,
+        pocket_nodes=benchmark.pocket_nodes,
+        precision=app_config.trainer.precision,
     )
     return _row_from_measurement(
         device_count=device_count,
@@ -892,7 +955,6 @@ def _local_row(
         config=config,
         local_batch=local_batch,
         steps=steps,
-        nfe=nfe,
         measurement=measurement,
         mode="local",
         dry_run=False,
@@ -904,9 +966,9 @@ def _distributed_row(
     device_count: int,
     steps: int,
     config: str,
+    app_config: AppConfig,
     benchmark: BenchmarkConfig,
     local_batch: int,
-    nfe: int,
 ) -> BenchmarkRow:
     if not _distributed_ready():
         raise BenchmarkError("multi-device benchmark requires torchrun initialization.")
@@ -922,7 +984,7 @@ def _distributed_row(
     else:
         device = torch.device("cpu")
     seed = benchmark.seed + local_rank
-    model = _SyntheticWorkload().to(device)
+    model = ECloudFlowModel.from_config(app_config.model).to(device)
     if device.type == "cuda":
         model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     else:
@@ -936,6 +998,9 @@ def _distributed_row(
         warmup_steps=benchmark.warmup_steps,
         measurement_steps=steps,
         seed=seed,
+        ligand_nodes=benchmark.ligand_nodes,
+        pocket_nodes=benchmark.pocket_nodes,
+        precision=app_config.trainer.precision,
     )
     # Strong scaling is reported from the slowest rank, not whichever rank
     # happened to publish the artifact first.
@@ -963,7 +1028,6 @@ def _distributed_row(
         config=config,
         local_batch=local_batch,
         steps=steps,
-        nfe=nfe,
         measurement=measurement,
         mode="distributed",
         dry_run=False,
@@ -978,6 +1042,15 @@ class _Measurement:
     reserved_memory_bytes: int
 
 
+@dataclass(frozen=True)
+class _BenchmarkBatch:
+    """Hold one deterministic model-shaped batch outside the timed region."""
+
+    state: MolecularState
+    time: torch.Tensor
+    condition: GenerationCondition
+
+
 def _run_measurement(
     *,
     model: nn.Module,
@@ -987,15 +1060,26 @@ def _run_measurement(
     warmup_steps: int,
     measurement_steps: int,
     seed: int,
+    ligand_nodes: int,
+    pocket_nodes: int,
+    precision: str,
 ) -> _Measurement:
     rng = torch.Generator(device=device)
     rng.manual_seed(seed)
+    batch = _build_benchmark_batch(
+        model,
+        local_batch=local_batch,
+        ligand_nodes=ligand_nodes,
+        pocket_nodes=pocket_nodes,
+        device=device,
+        generator=rng,
+    )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
     model.train()
     for _ in range(warmup_steps):
-        _single_step(model, optimizer, local_batch, device, rng)
+        _single_step(model, optimizer, batch, device, precision)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
@@ -1003,7 +1087,7 @@ def _run_measurement(
     compute_total = 0.0
     for _ in range(measurement_steps):
         step_compute_start = time.perf_counter()
-        _single_step(model, optimizer, local_batch, device, rng)
+        _single_step(model, optimizer, batch, device, precision)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         step_end = time.perf_counter()
@@ -1026,18 +1110,127 @@ def _run_measurement(
 def _single_step(
     model: nn.Module,
     optimizer: optim.Optimizer,
-    local_batch: int,
+    batch: _BenchmarkBatch,
     device: torch.device,
-    generator: torch.Generator,
+    precision: str,
 ) -> None:
-    inputs = torch.randn(
-        (local_batch, _MODEL_WIDTH), generator=generator, device=device
-    )
-    outputs = model(inputs)
-    loss = outputs.square().mean()
+    """Run one real ECloudFlow forward/backward/optimizer benchmark step."""
+    autocast_dtype = {
+        "bf16-mixed": torch.bfloat16,
+        "16-mixed": torch.float16,
+    }.get(precision)
+    with torch.autocast(
+        device_type=device.type,
+        dtype=autocast_dtype,
+        enabled=autocast_dtype is not None,
+    ):
+        prediction = model(batch.state, batch.time, batch.condition)
+        tensors = (
+            prediction.position_velocity,
+            prediction.position_score,
+            prediction.electron_velocity,
+            prediction.electron_score,
+            prediction.atom_logits,
+            prediction.charge_logits,
+            prediction.bond_logits,
+            prediction.count_logits,
+            prediction.affinity,
+            prediction.affinity_log_variance,
+            prediction.interaction_logits,
+        )
+        terms = [value.float().square().mean() for value in tensors if value.numel()]
+        loss = torch.stack(terms).mean()
     loss.backward()
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
+
+
+def _build_benchmark_batch(
+    model: nn.Module,
+    *,
+    local_batch: int,
+    ligand_nodes: int,
+    pocket_nodes: int,
+    device: torch.device,
+    generator: torch.Generator,
+) -> _BenchmarkBatch:
+    """Create deterministic contract-valid tensors for the actual model.
+
+    :param model: Bare or DDP-wrapped :class:`ECloudFlowModel` whose declared
+        categorical and electron widths define the generated tensors.
+    :param local_batch: Number of independent complexes on this rank.
+    :param ligand_nodes: Ligand nodes allocated per complex.
+    :param pocket_nodes: Pocket atoms allocated per complex.
+    :param device: Rank-local CUDA device.
+    :param generator: Rank-seeded device generator used only before timing.
+    :return: Immutable state, time, and pocket condition accepted by the model.
+    :rtype: _BenchmarkBatch
+
+    Inputs are synthetic and therefore cannot support chemistry-validity or
+    binding claims. They do exercise the configured ECloudFlow message blocks,
+    electron heads, categorical heads, gradients, optimizer, and DDP collectives.
+    Their construction is deliberately outside the measured interval.
+    """
+    bare = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+    if not isinstance(bare, ECloudFlowModel):
+        raise TypeError("benchmark workload requires ECloudFlowModel")
+    total_nodes = local_batch * ligand_nodes
+    positions = torch.randn(
+        (total_nodes, 3), device=device, generator=generator
+    ) * 2.5
+    node_batch = torch.arange(local_batch, device=device).repeat_interleave(
+        ligand_nodes
+    )
+    base_edges = torch.triu_indices(
+        ligand_nodes, ligand_nodes, offset=1, device=device
+    )
+    edges_per_complex = base_edges.shape[1]
+    offsets = (
+        torch.arange(local_batch, device=device) * ligand_nodes
+    ).repeat_interleave(edges_per_complex)
+    halfedge_index = base_edges.repeat(1, local_batch) + offsets[None, :]
+    halfedge_batch = torch.arange(local_batch, device=device).repeat_interleave(
+        edges_per_complex
+    )
+    state = MolecularState(
+        positions=positions,
+        atom_logits=torch.randn(
+            (total_nodes, bare.atom_classes), device=device, generator=generator
+        ),
+        charge_logits=torch.randn(
+            (total_nodes, bare.charge_classes), device=device, generator=generator
+        ),
+        halfedge_index=halfedge_index,
+        bond_logits=torch.randn(
+            (halfedge_index.shape[1], bare.bond_classes),
+            device=device,
+            generator=generator,
+        ),
+        electron_latent=torch.randn(
+            (total_nodes, bare.electron_latent_dim),
+            device=device,
+            generator=generator,
+        ),
+        node_batch=node_batch,
+        halfedge_batch=halfedge_batch,
+    )
+    total_pocket_nodes = local_batch * pocket_nodes
+    pocket = PocketGraph(
+        positions=torch.randn(
+            (total_pocket_nodes, 3), device=device, generator=generator
+        ) * 4.0,
+        features=torch.randn(
+            (total_pocket_nodes, 16), device=device, generator=generator
+        ),
+        batch=torch.arange(local_batch, device=device).repeat_interleave(
+            pocket_nodes
+        ),
+    )
+    return _BenchmarkBatch(
+        state=state,
+        time=torch.full((local_batch,), 0.5, device=device),
+        condition=GenerationCondition(pocket=pocket),
+    )
 
 
 def _row_from_measurement(
@@ -1047,7 +1240,6 @@ def _row_from_measurement(
     config: str,
     local_batch: int,
     steps: int,
-    nfe: int,
     measurement: _Measurement,
     mode: str,
     dry_run: bool,
@@ -1055,13 +1247,9 @@ def _row_from_measurement(
     samples = benchmark.global_batch_size * steps
     samples_per_second = samples / measurement.wall_time_seconds
     optimizer_steps_per_second = steps / measurement.wall_time_seconds
-    valid_count = samples
-    valid_yield = valid_count / samples if samples else 0.0
-    communication = (
-        max(0.0, measurement.wall_time_seconds - measurement.compute_time_seconds)
-        if device_count > 1
-        else None
-    )
+    # Backward includes NCCL collectives, so wall-minus-step timing cannot
+    # isolate communication without a profiler trace. Leave it unmeasured.
+    communication = None
     gpu_hours = measurement.wall_time_seconds * device_count / 3600.0
     return BenchmarkRow(
         devices=device_count,
@@ -1076,14 +1264,17 @@ def _row_from_measurement(
         peak_memory_bytes=measurement.peak_memory_bytes,
         reserved_memory_bytes=measurement.reserved_memory_bytes,
         communication_time_seconds=communication,
-        nfe=nfe,
-        valid_count=valid_count,
-        valid_yield=valid_yield,
+        nfe=None,
+        valid_count=None,
+        valid_yield=None,
         gpu_hours=gpu_hours,
         wall_time_seconds=measurement.wall_time_seconds,
         dry_run=dry_run,
         mode=mode,
         config=config,
+        workload="ecloudflow-training-step",
+        input_source="deterministic-synthetic-complexes",
+        model_forward_calls=steps * device_count,
     )
 
 
@@ -1108,8 +1299,10 @@ def _estimated_memory_bytes(
     benchmark: BenchmarkConfig | None,
     nfe: int,
 ) -> int:
-    profile_width = 4 * _MODEL_WIDTH * (2 * _MODEL_WIDTH + 1)
-    batch_term = local_batch * _MODEL_WIDTH * 8
+    profile_width = 4 * _DRY_RUN_REFERENCE_WIDTH * (
+        2 * _DRY_RUN_REFERENCE_WIDTH + 1
+    )
+    batch_term = local_batch * _DRY_RUN_REFERENCE_WIDTH * 8
     profile_term = (
         benchmark.global_batch_size if benchmark is not None else local_batch
     ) * max(1, device_count)

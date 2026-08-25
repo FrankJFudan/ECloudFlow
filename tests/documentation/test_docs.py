@@ -13,6 +13,7 @@ REQUIRED = (
     "docs/distributed.md",
     "docs/visualization.md",
     "docs/reproducibility.md",
+    "docs/server.md",
     "examples/python_api.py",
 )
 FORBIDDEN = ("TODO", "TBD", "FIXME", "implement later")

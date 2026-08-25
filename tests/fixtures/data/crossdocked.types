@@ -1,0 +1,3 @@
+# label affinity rmsd receptor ligand target
+0 0 0.50 target/receptor_0.pdb target/ligand_1.sdf 0
+0 0 1.50 target/receptor_0.pdb target/ligand_0.sdf 0

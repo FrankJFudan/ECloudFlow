@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - _self_
+  - /train: stage3
+  - override /model: tiny
+  - override /data: pdbbind
+
+benchmark:
+  warmup_steps: 1
+  measurement_steps: 2
+  global_batch_size: 8
+  devices: [1]
+  profile: fast
+  output_dir: runs/h100-smoke
+  seed: 2026
+
+trainer:
+  accelerator: gpu
+  strategy: ddp
+  precision: bf16-mixed
+  devices: 4
+  max_steps: 2
+  max_epochs: 1
+  checkpoint_dir: outputs/h100-smoke/checkpoints
+  deterministic: true
+  benchmark: false

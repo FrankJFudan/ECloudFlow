@@ -185,7 +185,11 @@ def segment_softmax(
     for destination in range(count):
         selected = index == destination
         if bool(selected.any()):
-            output[selected] = torch.softmax(logits[selected], dim=0)
+            # CUDA BF16/FP16 kernels do not support every indexed assignment
+            # path used by the segment loop.  Normalize in FP32 for stable
+            # exponentials, then restore the caller's representation dtype.
+            values = torch.softmax(logits[selected].float(), dim=0).to(logits.dtype)
+            output[selected] = values
     return output
 
 

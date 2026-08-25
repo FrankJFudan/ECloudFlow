@@ -64,6 +64,7 @@ class RankedMolecule:
             "molecule_id": self.molecule_id,
             "pocket_id": self.pocket_id,
             "temporary_id": self.temporary_id,
+            "smiles": self.canonical_smiles,
             "canonical_smiles": self.canonical_smiles,
             "isomeric_smiles": self.canonical_smiles,
             "sa": self.sa_score,

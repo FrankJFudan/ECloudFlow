@@ -38,6 +38,17 @@ def doctor(
     require_gpu: Annotated[
         bool, typer.Option("--require-gpu", help="Treat CUDA visibility as required.")
     ] = False,
+    min_gpus: Annotated[
+        int,
+        typer.Option("--min-gpus", min=1, help="Minimum visible GPU count."),
+    ] = 1,
+    server: Annotated[
+        bool,
+        typer.Option(
+            "--server",
+            help="Require the four-GPU BF16/NCCL production training baseline.",
+        ),
+    ] = False,
     as_json: Annotated[
         bool, typer.Option("--json", help="Emit machine-readable diagnostics.")
     ] = False,
@@ -49,6 +60,8 @@ def doctor(
         dataset=dataset,
         checkpoint=checkpoint,
         require_gpu=require_gpu,
+        min_gpus=min_gpus,
+        server=server,
     )
 
 

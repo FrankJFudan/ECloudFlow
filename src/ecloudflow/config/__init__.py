@@ -1,6 +1,6 @@
 """Typed configuration models and Hydra composition utilities."""
 
-from ecloudflow.config.loader import load_config
+from ecloudflow.config.loader import config_directory, load_config
 from ecloudflow.config.schema import (
     AppConfig,
     BenchmarkConfig,
@@ -39,5 +39,6 @@ __all__ = [
     "TrainerConfig",
     "VisualizationConfig",
     "WeightedLossConfig",
+    "config_directory",
     "load_config",
 ]

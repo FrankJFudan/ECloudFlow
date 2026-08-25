@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from ecloudflow.cli.common import load_run_records
@@ -52,3 +53,100 @@ def test_relative_output_dir_keeps_serialized_pose_paths_resolvable(
     assert loaded[0].raw_path.is_file()
     assert loaded[0].molecule is not None
     assert loaded[0].molecule.GetNumConformers() > 0
+
+
+def test_load_run_records_keeps_unranked_valid_rows_while_enriching_ranked_subset(
+    tmp_path: Path,
+) -> None:
+    """Summary metadata should enrich matching generation rows, not replace them."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "generation.json").write_text(
+        json.dumps(
+            {
+                "valid": [
+                    {
+                        "attempt_id": "attempt-001",
+                        "canonical_smiles": "CCO",
+                        "mode": "de_novo",
+                    },
+                    {
+                        "attempt_id": "attempt-002",
+                        "canonical_smiles": "CCN",
+                        "mode": "de_novo",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "ranked": [
+                    {
+                        "temporary_id": "attempt-001",
+                        "canonical_smiles": "CCO",
+                        "molecule_id": "POCKET-000001",
+                        "rank": 1,
+                        "docking_score": -8.1,
+                        "qed": 0.72,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_run_records(run_dir)
+
+    assert [record.attempt_id for record in records] == ["attempt-001", "attempt-002"]
+    assert records[0].properties["molecule_id"] == "POCKET-000001"
+    assert records[0].properties["rank"] == 1
+    assert records[0].properties["docking_score"] == -8.1
+    assert records[1].canonical_smiles == "CCN"
+    assert "docking_score" not in records[1].properties
+
+
+def test_load_run_records_retains_valid_attempt_elapsed_seconds(tmp_path: Path) -> None:
+    """Per-molecule report rows must retain measured generation time."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "generation.json").write_text(
+        json.dumps(
+            {
+                "valid": [
+                    {
+                        "attempt_id": "attempt-001",
+                        "canonical_smiles": "CCO",
+                        "mode": "de_novo",
+                    },
+                    {
+                        "attempt_id": "attempt-002",
+                        "canonical_smiles": "CCN",
+                        "mode": "de_novo",
+                    },
+                ],
+                "attempt_records": [
+                    {
+                        "attempt_id": "attempt-001",
+                        "status": "valid",
+                        "elapsed_seconds": 0.125,
+                    },
+                    {
+                        "attempt_id": "attempt-002",
+                        "status": "valid",
+                        "elapsed_seconds": 0.25,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_run_records(run_dir)
+
+    assert [record.properties["elapsed_seconds"] for record in records] == [
+        0.125,
+        0.25,
+    ]

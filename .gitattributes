@@ -1,0 +1,14 @@
+* text=auto
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.pdb text eol=lf
+*.sdf text eol=lf
+*.png binary
+*.pdf binary
+*.pt binary
+*.ckpt binary
+*.parquet binary
+*.xlsx binary

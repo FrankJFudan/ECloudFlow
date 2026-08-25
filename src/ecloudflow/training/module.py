@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -14,6 +14,7 @@ from torch import distributed as dist
 from torch import nn
 
 from ecloudflow.config import LossConfig
+from ecloudflow.core.types import ComplexSample
 from ecloudflow.ecloud.decoder import ElectronReconstruction
 from ecloudflow.models import ModelPrediction
 from ecloudflow.training.ema import ExponentialMovingAverage
@@ -68,6 +69,10 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         learning_rate: float = 1.0e-4,
         weight_decay: float = 0.0,
         ema_decay: float = 0.999,
+        batch_builder: Callable[
+            [Sequence[ComplexSample], nn.Module], TrainingBatch
+        ]
+        | None = None,
     ) -> None:
         super().__init__()
         for name, module in (
@@ -89,6 +94,7 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         self.loss_config = loss_config
         self.learning_rate = float(learning_rate)
         self.weight_decay = float(weight_decay)
+        self._batch_builder = batch_builder
         self.loss_scaler = RunningLossScaler(
             decay=loss_config.normalization.decay,
             epsilon=loss_config.normalization.epsilon,
@@ -215,7 +221,11 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
             )
         return decoded_prediction
 
-    def training_step(self, batch: TrainingBatch, batch_idx: int) -> torch.Tensor:
+    def training_step(
+        self,
+        batch: TrainingBatch | Sequence[ComplexSample],
+        batch_idx: int,
+    ) -> torch.Tensor:
         """Compute, validate, and synchronously log one training objective.
 
         :param batch: Typed flattened molecular training batch on the Lightning device.
@@ -236,10 +246,11 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         resumed checkpoint ``global_step`` give deterministic warmups.
         """
         del batch_idx
-        prediction = self(batch)
+        prepared = self._prepare_training_batch(batch)
+        prediction = self(prepared)
         breakdown = compute_ecloudflow_loss(
             prediction,
-            batch.targets,
+            prepared.targets,
             self.loss_config,
             self.loss_scaler if self.loss_config.normalization.enabled else None,
             step=int(self.global_step),
@@ -269,8 +280,11 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         return breakdown.total
 
     def transfer_batch_to_device(
-        self, batch: TrainingBatch, device: torch.device, dataloader_idx: int
-    ) -> TrainingBatch:
+        self,
+        batch: TrainingBatch | Sequence[ComplexSample],
+        device: torch.device,
+        dataloader_idx: int,
+    ) -> TrainingBatch | Sequence[ComplexSample]:
         """Functionally transfer immutable typed batch contracts to a strategy device.
 
         :param batch: Frozen nested training/core dataclasses and tensor leaves.
@@ -289,11 +303,55 @@ class ECloudFlowTrainingModule(L.LightningModule):  # type: ignore[misc]
         state, mask, sparse topology, or scientific value is chosen manually.
         """
         del dataloader_idx
-        if not isinstance(batch, TrainingBatch):
-            raise TypeError("batch must be TrainingBatch.")
+        if not isinstance(batch, TrainingBatch) and (
+            self._batch_builder is None
+            or not isinstance(batch, Sequence)
+            or isinstance(batch, (str, bytes))
+            or not batch
+            or not all(isinstance(item, ComplexSample) for item in batch)
+        ):
+            raise TypeError(
+                "batch must be TrainingBatch or a non-empty ComplexSample sequence."
+            )
         moved = _move_immutable(batch, device)
-        assert isinstance(moved, TrainingBatch)
         return moved
+
+    def _prepare_training_batch(
+        self, batch: TrainingBatch | Sequence[ComplexSample]
+    ) -> TrainingBatch:
+        """Convert canonical clean complexes into one stochastic training batch.
+
+        :param batch: A prebuilt typed batch or a non-empty sequence produced by
+            :class:`~ecloudflow.data.datamodule.ECloudDataModule`.
+        :return: Fully typed noisy state and exact path/scientific targets on the
+            Lightning-managed device.
+        :rtype: TrainingBatch
+        :raises TypeError: If no configured builder can consume the input or the
+            builder violates the stable training boundary.
+
+        Conversion runs after Lightning has transferred immutable sample tensors,
+        so electron tokenization and stochastic paths use the same accelerator and
+        dtype as the model. The builder consumes only rank-local PyTorch RNG state;
+        :class:`ReproducibleCheckpoint` captures that state for exact resume. A
+        prebuilt :class:`TrainingBatch` is returned unchanged, preserving the unit
+        and integration-test boundary. No clean sample is mutated.
+        """
+        if isinstance(batch, TrainingBatch):
+            return batch
+        if (
+            self._batch_builder is None
+            or not isinstance(batch, Sequence)
+            or isinstance(batch, (str, bytes))
+            or not batch
+            or not all(isinstance(item, ComplexSample) for item in batch)
+        ):
+            raise TypeError(
+                "training requires TrainingBatch or configured ComplexSample input."
+            )
+        prepared = self._batch_builder(batch, self.field_tokenizer)
+        if not isinstance(prepared, TrainingBatch):
+            raise TypeError("batch_builder must return TrainingBatch.")
+        return prepared
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """Construct AdamW over the currently trainable staged groups.

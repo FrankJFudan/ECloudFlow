@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,7 @@ def build_complex_sample(
     field_builders: FieldBuilderBundle | None = None,
     *,
     build_fields: bool = True,
+    properties: Mapping[str, float | int | str | torch.Tensor] | None = None,
 ) -> ComplexSample:
     """Parse one cocrystal pair into the canonical model data contract.
 
@@ -100,6 +102,8 @@ def build_complex_sample(
         ligand fields. Defaults to true per the physical-field contract; set it
         to false for graph-only preprocessing. xTB failures leave the ligand
         field absent with typed provenance.
+    :param properties: Optional finite labels and non-empty measurement metadata
+        copied into the immutable sample contract without interpretation.
     :return: Centered graph, optional fields, inverse frame, and provenance.
     :rtype: ComplexSample
     :raises DataValidationError: If files are unreadable or chemistry/geometry
@@ -188,7 +192,7 @@ def build_complex_sample(
         ligand=ligand_graph,
         pocket_field=pocket_field,
         ligand_field=ligand_field,
-        properties={},
+        properties=dict(properties or {}),
         frame=frame,
         provenance=provenance,
     )

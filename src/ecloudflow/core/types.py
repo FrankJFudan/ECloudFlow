@@ -14,6 +14,7 @@ from ecloudflow.core.frames import CoordinateFrame
 from ecloudflow.exceptions import ContractValidationError
 
 TensorProperty: TypeAlias = float | int | torch.Tensor
+SampleProperty: TypeAlias = TensorProperty | str
 
 
 @dataclass(frozen=True)
@@ -391,8 +392,10 @@ class FragmentCondition:
     :param fixed_atom_mask: Boolean atom-identity and charge mask with shape
         ``[N]`` on the reference device.
     :param fixed_bond_mask: Boolean internal-halfedge mask with shape ``[E]``
-        on the reference device. It is true exactly when both endpoints are
-        fixed atoms and is therefore symmetric for unordered endpoint pairs.
+        on the reference device. It selects immutable bonds within each fixed
+        component. When ``component_ids`` is omitted, every fixed-fixed pair
+        is internal; when component labels are supplied, fixed-fixed pairs
+        across components remain editable so link/merge tasks can connect them.
     :param fixed_coord_mask: Boolean coordinate mask with shape ``[N]`` on the
         reference device. It must exactly equal ``fixed_atom_mask`` so fixed
         coordinates are restored and free coordinates remain generative.
@@ -462,7 +465,9 @@ class FragmentCondition:
         if not self.task_id:
             raise ContractValidationError("task_id must be a non-empty string.")
         expected_bond_mask = _internal_bond_mask(
-            self.reference.halfedge_index, self.fixed_atom_mask
+            self.reference.halfedge_index,
+            self.fixed_atom_mask,
+            self.component_ids,
         )
         if not torch.equal(self.fixed_bond_mask, expected_bond_mask):
             raise ContractValidationError(
@@ -507,9 +512,12 @@ class FragmentCondition:
         :raises ContractValidationError: If masks do not match the reference or
             an attachment site is not a fixed atom.
 
-        The fixed-bond mask is ``fixed[src] & fixed[dst] & (src != dst)``. The
-        final predicate explicitly excludes diagonals even though a canonical
-        ``MolecularState`` already rejects self-edges.
+        Without component labels, the fixed-bond mask is
+        ``fixed[src] & fixed[dst] & (src != dst)``. With ``component_ids``, an
+        additional same-component predicate leaves cross-component pairs
+        editable for link/merge decoding. The final predicate explicitly
+        excludes diagonals even though a canonical ``MolecularState`` already
+        rejects self-edges.
         """
         node_count = reference.positions.shape[0]
         _validate_bool_vector(
@@ -523,7 +531,9 @@ class FragmentCondition:
             if attachment_mask is None
             else attachment_mask
         )
-        fixed_bond_mask = _internal_bond_mask(reference.halfedge_index, fixed_atom_mask)
+        fixed_bond_mask = _internal_bond_mask(
+            reference.halfedge_index, fixed_atom_mask, component_ids
+        )
         return cls(
             reference=reference,
             fixed_atom_mask=fixed_atom_mask,
@@ -728,7 +738,7 @@ class ComplexSample:
     ligand: LigandGraph
     pocket_field: ElectronField | None
     ligand_field: ElectronField | None
-    properties: Mapping[str, TensorProperty]
+    properties: Mapping[str, SampleProperty]
     frame: CoordinateFrame
     provenance: SampleProvenance
     fragment: FragmentCondition | None = None
@@ -802,7 +812,9 @@ class ComplexSample:
                 self.fragment.reference.node_batch,
                 "fragment reference",
             )
-        object.__setattr__(self, "properties", _freeze_properties(self.properties))
+        object.__setattr__(
+            self, "properties", _freeze_sample_properties(self.properties)
+        )
 
     def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
         """Transport canonical samples while restoring immutable mappings.
@@ -1032,12 +1044,17 @@ def _validate_halfedge_batches(
 
 
 def _internal_bond_mask(
-    halfedge_index: torch.Tensor, fixed_atom_mask: torch.Tensor
+    halfedge_index: torch.Tensor,
+    fixed_atom_mask: torch.Tensor,
+    component_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build the direct internal-fragment mask for canonical halfedges.
+    """Build the direct immutable-component mask for canonical halfedges.
 
     :param halfedge_index: Canonical unordered pairs with shape ``[2, E]``.
     :param fixed_atom_mask: Boolean atom mask with shape ``[N]``.
+    :param component_ids: Optional non-negative component labels with shape
+        ``[N]``. If supplied, only fixed endpoints sharing a label are
+        immutable; cross-component pairs remain editable for linking.
     :return: Boolean mask with shape ``[E]`` true exactly for fixed endpoint
         pairs, on the same device as the input tensors.
     :rtype: torch.Tensor
@@ -1046,7 +1063,14 @@ def _internal_bond_mask(
     excludes diagonal pairs. It does not create any dense ``[N, N]`` mask.
     """
     source, target = halfedge_index
-    return fixed_atom_mask[source] & fixed_atom_mask[target] & (source != target)
+    mask = fixed_atom_mask[source] & fixed_atom_mask[target] & (source != target)
+    if component_ids is not None:
+        if component_ids.shape != fixed_atom_mask.shape:
+            raise ContractValidationError(
+                "component_ids must match fixed_atom_mask shape."
+            )
+        mask = mask & (component_ids[source] == component_ids[target])
+    return mask
 
 
 def _validate_batch_membership(
@@ -1095,6 +1119,44 @@ def _freeze_properties(
                 "property target values must be finite floats, ints, or tensors."
             )
         copied[key] = value
+    return MappingProxyType(copied)
+
+
+def _freeze_sample_properties(
+    values: Mapping[str, SampleProperty],
+) -> Mapping[str, SampleProperty]:
+    """Validate numeric targets and textual source metadata for one sample.
+
+    :param values: Sample properties keyed by stable non-empty names. Numeric
+        values are available to training, while strings preserve measurement
+        semantics such as ``Kd``, ``<``, and the original PDBBind expression.
+    :return: Defensive read-only copy of every validated property.
+    :rtype: Mapping[str, SampleProperty]
+    :raises ContractValidationError: If a key is empty, a string is empty, or
+        a numeric/tensor value is non-finite or otherwise invalid.
+
+    Generation conditions deliberately continue to use
+    :func:`_freeze_properties`, which accepts numeric values only. This sample-
+    specific validator therefore cannot accidentally route textual metadata
+    into model conditioning tensors. :class:`TrainingBatchBuilder` selects
+    finite scalar values and ignores these strings during collation.
+    """
+    numeric: dict[str, TensorProperty] = {}
+    copied: dict[str, SampleProperty] = {}
+    for key, value in values.items():
+        if not isinstance(key, str) or not key:
+            raise ContractValidationError(
+                "sample property keys must be non-empty strings."
+            )
+        if isinstance(value, str):
+            if not value:
+                raise ContractValidationError(
+                    "textual sample property values must be non-empty."
+                )
+            copied[key] = value
+        else:
+            numeric[key] = value
+    copied.update(_freeze_properties(numeric))
     return MappingProxyType(copied)
 
 

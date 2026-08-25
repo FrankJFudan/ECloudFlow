@@ -13,6 +13,8 @@ build/
 *.egg-info/
 data/raw/
 data/processed/
+data/prepared/
 checkpoints/
+outputs/
 runs/
 wandb/

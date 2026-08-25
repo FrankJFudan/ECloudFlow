@@ -1,0 +1,5 @@
+# @package _global_
+stage: pocket_multitask
+loss:
+  interaction:
+    weight: 1.0

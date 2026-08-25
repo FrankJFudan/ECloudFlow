@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
 
+import torch
+
 import ecloudflow.training.benchmark as benchmark_module
-from ecloudflow.config import BenchmarkConfig, DataConfig
+from ecloudflow.config import BenchmarkConfig, DataConfig, ModelConfig
 from ecloudflow.exceptions import BenchmarkError
+from ecloudflow.models import ECloudFlowModel
 from ecloudflow.training.benchmark import (
     benchmark_hashes,
     benchmark_scaling,
@@ -20,7 +23,10 @@ def test_benchmark_scaling_dry_run_writes_artifacts(tmp_path: Path) -> None:
         dry_run=True,
     )
     assert [row.devices for row in report.rows] == [1, 2, 4]
-    assert report.rows[0].nfe == 20
+    assert report.rows[0].nfe is None
+    assert report.rows[0].valid_count is None
+    assert report.rows[0].valid_yield is None
+    assert report.rows[0].workload == "schema-simulation"
     assert report.rows[0].speedup == 1.0
     assert report.rows[0].peak_memory_bytes > 0
     assert report.rows[0].peak_reserved_memory_bytes >= report.rows[0].peak_memory_bytes
@@ -155,3 +161,87 @@ def test_merge_scaling_reports_rejects_fractional_device_count(tmp_path: Path) -
         pass
     else:
         raise AssertionError("fractional device count should be rejected")
+
+
+def test_merge_scaling_reports_rejects_dry_and_model_measurements(
+    tmp_path: Path,
+) -> None:
+    """Estimated rows must never contribute to measured GPU speedup."""
+    sources = []
+    for name, dry_run, mode, backend in (
+        ("estimate", True, "dry-run", "cpu-simulated"),
+        ("model", False, "distributed", "cuda-ddp"),
+    ):
+        source = tmp_path / f"{name}.json"
+        source.write_text(
+            json.dumps(
+                {
+                    "config": "experiment=h100_large",
+                    "benchmark": {"global_batch_size": 8},
+                    "rows": [
+                        {
+                            "devices": 1 if dry_run else 2,
+                            "samples_per_second": 10.0,
+                            "dry_run": dry_run,
+                            "mode": mode,
+                            "backend": backend,
+                            "workload": (
+                                "schema-simulation"
+                                if dry_run
+                                else "ecloudflow-training-step"
+                            ),
+                            "input_source": (
+                                "analytical-estimate"
+                                if dry_run
+                                else "deterministic-synthetic-complexes"
+                            ),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        sources.append(source)
+
+    try:
+        merge_scaling_reports(sources, tmp_path / "combined")
+    except BenchmarkError:
+        pass
+    else:
+        raise AssertionError("dry-run and model measurements should not merge")
+
+
+def test_config_fingerprint_includes_resolved_benchmark_values() -> None:
+    """Equal override text cannot hide changed resolved scientific settings."""
+    first = benchmark_hashes(
+        "experiment=h100_smoke", BenchmarkConfig(global_batch_size=8)
+    )
+    second = benchmark_hashes(
+        "experiment=h100_smoke", BenchmarkConfig(global_batch_size=16)
+    )
+    assert first["config"] != second["config"]
+
+
+def test_model_workload_executes_ecloudflow_optimizer_step() -> None:
+    """The measured workload must update the real joint model, not a toy MLP."""
+    model = ECloudFlowModel.from_config(
+        ModelConfig(scalar_dim=16, vector_dim=4, num_blocks=1, lmax=2),
+        max_atoms=8,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    generator = torch.Generator().manual_seed(7)
+    batch = benchmark_module._build_benchmark_batch(
+        model,
+        local_batch=1,
+        ligand_nodes=3,
+        pocket_nodes=4,
+        device=torch.device("cpu"),
+        generator=generator,
+    )
+    before = model.atom_head.network[-1].weight.detach().clone()
+
+    benchmark_module._single_step(
+        model, optimizer, batch, torch.device("cpu"), "32-true"
+    )
+
+    assert not torch.equal(before, model.atom_head.network[-1].weight)

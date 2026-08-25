@@ -16,31 +16,87 @@ _COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#F0E442")
 
 
 def plot_quality_speed_pareto(data: Any, path: str | Path, *, seed: int = 2026) -> Path:
-    """Plot quality versus sampling speed and export a deterministic vector."""
+    """Plot quality against measured per-sample generation duration.
+
+    :param data: Rows containing a quality value and optionally a timing value.
+    :param path: SVG/PDF/PNG destination selected from its suffix.
+    :param seed: Stable SVG identifier salt.
+    :return: Written publication figure path.
+    :rtype: pathlib.Path
+
+    The function prefers ``elapsed_seconds`` because it is the per-attempt
+    measurement emitted by the generation manifest. Legacy ``wall_time`` and
+    ``time`` fields remain supported. When no valid timing values exist, the
+    plot explicitly falls back to sample order and changes its title so a
+    profile plot is never misrepresented as a speed comparison.
+    """
     rows = _rows(data)
-    x = [_number(row.get("wall_time", row.get("time", 0.0)), 0.0) for row in rows]
-    y = [_number(row.get("quality", row.get("qed", 0.0)), 0.0) for row in rows]
+    time_metric = _first_numeric_metric(rows, ("elapsed_seconds", "wall_time", "time"))
+    quality_metric = _first_numeric_metric(rows, ("quality", "qed"))
+    if time_metric is None:
+        x = list(range(1, len(rows) + 1))
+        y = [
+            _number(row.get(quality_metric), 0.0) if quality_metric else 0.0
+            for row in rows
+        ]
+        xlabel = "Sample order"
+        title = "Quality profile (timing unavailable)"
+    else:
+        paired = [
+            (_number(row.get(time_metric)), _number(row.get(quality_metric)))
+            for row in rows
+            if quality_metric is not None
+        ]
+        x = [value[0] for value in paired if value[0] is not None and value[1] is not None]
+        y = [value[1] for value in paired if value[0] is not None and value[1] is not None]
+        xlabel = _axis_label(time_metric)
+        title = "Quality-speed Pareto"
     return _scatter(
         x,
         y,
         path,
-        "Sampling time (s)",
-        "Quality",
-        "Quality-speed Pareto",
+        xlabel,
+        _axis_label(quality_metric or "quality"),
+        title,
         seed=seed,
     )
 
 
 def plot_metric_distribution(
-    data: Any, path: str | Path, *, metric: str = "value"
+    data: Any, path: str | Path, *, metric: str | None = None
 ) -> Path:
-    """Plot a compact distribution for one metric column."""
+    """Plot a compact distribution for an explicit or detected metric column.
+
+    :param data: Mapping, row sequence, or dataframe-like measurement source.
+    :param path: SVG/PDF/PNG destination selected from its suffix.
+    :param metric: Optional requested metric column. When omitted, binding and
+        medicinal-chemistry metrics are selected before generic numeric fields.
+    :return: Written publication figure path.
+    :rtype: pathlib.Path
+
+    Generation reports normally contain ``docking_score``, ``qed``, and ``sa``
+    rather than a synthetic column named ``value``. Selecting from actual
+    numeric columns keeps the default report informative while preserving exact
+    caller control through the explicit ``metric`` argument.
+    """
+    rows = _rows(data)
+    selected_metric = metric or _first_numeric_metric(
+        rows,
+        ("docking_score", "vina_score", "qed", "sa", "sa_score", "quality", "value"),
+    )
+    if selected_metric is None:
+        selected_metric = "value"
     values = [
-        _number(row.get(metric))
-        for row in _rows(data)
-        if _number(row.get(metric)) is not None
+        _number(row.get(selected_metric))
+        for row in rows
+        if _number(row.get(selected_metric)) is not None
     ]
-    return _simple_plot(values, path, metric, "Metric distribution")
+    return _simple_plot(
+        values,
+        path,
+        selected_metric,
+        f"{_axis_label(selected_metric)} distribution",
+    )
 
 
 def plot_ecdf(data: Any, path: str | Path, *, metric: str = "value") -> Path:
@@ -175,6 +231,31 @@ def _rows(data: Any) -> list[dict[str, Any]]:
             dict(row) if isinstance(row, Mapping) else {"value": row} for row in data
         ]
     return [{"value": data}]
+
+
+def _first_numeric_metric(
+    rows: Sequence[Mapping[str, Any]], candidates: Sequence[str]
+) -> str | None:
+    """Return the first candidate column containing at least one finite value."""
+    for candidate in candidates:
+        if any(_number(row.get(candidate)) is not None for row in rows):
+            return candidate
+    return None
+
+
+def _axis_label(metric: str) -> str:
+    """Return a compact publication label for common ECloudFlow measurements."""
+    labels = {
+        "docking_score": "Docking score (kcal/mol)",
+        "vina_score": "Vina score (kcal/mol)",
+        "elapsed_seconds": "Elapsed time (s)",
+        "wall_time": "Sampling time (s)",
+        "time": "Sampling time (s)",
+        "qed": "QED",
+        "sa": "SA score",
+        "sa_score": "SA score",
+    }
+    return labels.get(metric, metric.replace("_", " "))
 
 
 def _number(value: Any, default: float | None = None) -> float | None:

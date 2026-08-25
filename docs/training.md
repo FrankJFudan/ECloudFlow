@@ -21,6 +21,27 @@ training run requires prepared shards and a suitable accelerator. Lightning
 owns mixed precision, optimizer state, EMA, checkpointing, and DDP; data
 workers own deterministic rank/worker sharding.
 
+## Stage transfer and resume
+
+The two checkpoint operations have intentionally different contracts.
+`--resume-from` continues the same stage and restores model, optimizer, EMA,
+loss normalization, global step, RNG, and rank-local data position under strict
+semantic compatibility checks. `--init-from` starts a new stage by loading the
+joint backbone, field tokenizer, and field decoder strictly while all optimizer
+and runtime state starts fresh.
+
+```bash
+ecloudflow train +experiment=pdbbind_large train=stage2 \
+  --init-from runs/stage1/checkpoints/last.ckpt \
+  --output-dir runs/stage2
+ecloudflow train +experiment=pdbbind_large train=stage2 \
+  --resume-from runs/stage2/checkpoints/last.ckpt \
+  --output-dir runs/stage2-resumed
+```
+
+Use `scripts/train_curriculum_4xh100.sh` to run all four stages with the correct
+model-only boundary automatically.
+
 ## Objective and checkpointing
 
 The objective combines flow velocity, terminal score, simplex cross-entropy,

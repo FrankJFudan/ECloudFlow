@@ -68,6 +68,22 @@ def test_segment_softmax_normalizes_each_uneven_destination_group() -> None:
     )
 
 
+def test_segment_softmax_supports_bfloat16_indexed_assignment() -> None:
+    """Mixed-precision model messages retain normalized BF16 weights."""
+    logits = torch.tensor([0.0, 1.0, -0.5, 0.25], dtype=torch.bfloat16)
+    destination = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    weights = segment_softmax(logits, destination, count=2)
+
+    assert weights.dtype is torch.bfloat16
+    assert torch.allclose(
+        weights[destination == 0].float().sum(), torch.ones((), dtype=torch.float32), atol=2e-3
+    )
+    assert torch.allclose(
+        weights[destination == 1].float().sum(), torch.ones((), dtype=torch.float32), atol=2e-3
+    )
+
+
 def test_native_radius_fallback_matches_hand_derived_edges() -> None:
     """Mutation caught: chunk boundaries may drop or duplicate exact radius pairs."""
     positions = torch.tensor(

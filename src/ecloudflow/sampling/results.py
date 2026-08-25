@@ -11,6 +11,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ecloudflow.sampling.profiles import SamplingProfile
+
 
 class GenerationMode(str, Enum):
     """Supported de novo and fragment-conditioned generation objectives."""
@@ -41,7 +43,8 @@ class GenerationRequest:
 
     :param pocket: Pocket path or already parsed pocket object.
     :param num_molecules: Number of valid unique molecules requested.
-    :param fragment: Optional positioned fragment path/object.
+    :param fragment: Optional positioned fragment path/object or a non-empty
+        sequence of paths/objects for link and merge tasks.
     :param mode: De novo, grow, link, replace, or merge objective.
     :param profile: Named sampling profile.
     :param max_attempts: Optional bounded attempt budget.
@@ -56,7 +59,7 @@ class GenerationRequest:
     num_molecules: int
     fragment: Any = None
     mode: GenerationMode = GenerationMode.DE_NOVO
-    profile: str = "balanced"
+    profile: str | SamplingProfile = "balanced"
     max_attempts: int | None = None
     output_dir: str | Path | None = None
     seed: int = 2026
@@ -90,11 +93,14 @@ class GenerationRequest:
             raise TypeError("strict_count must be boolean.")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise TypeError("seed must be an integer.")
-        if not isinstance(self.profile, str):
-            raise TypeError("profile must be a string.")
-        profile = self.profile.lower()
-        if profile not in {"fast", "balanced", "quality"}:
-            raise ValueError(f"unknown sampling profile: {self.profile!r}")
+        if isinstance(self.profile, SamplingProfile):
+            profile: str | SamplingProfile = self.profile
+        elif isinstance(self.profile, str):
+            profile = self.profile.lower()
+            if profile not in {"fast", "balanced", "quality"}:
+                raise ValueError(f"unknown sampling profile: {self.profile!r}")
+        else:
+            raise TypeError("profile must be a string or SamplingProfile.")
         object.__setattr__(self, "profile", profile)
         if self.mode is GenerationMode.DE_NOVO and self.fragment is not None:
             raise ValueError("fragment is only valid for fragment-conditioned modes.")
@@ -155,6 +161,7 @@ class GenerationRecord:
         """Return a JSON-safe summary without serializing the RDKit object."""
         return {
             "attempt_id": self.attempt_id,
+            "smiles": self.canonical_smiles,
             "canonical_smiles": self.canonical_smiles,
             "mode": self.mode.value,
             "seed": self.seed,

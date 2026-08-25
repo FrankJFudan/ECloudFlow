@@ -29,6 +29,7 @@ _OPERATIONAL_KEYS = frozenset(
     {
         "resume_from",
         "resume_from_checkpoint",
+        "init_from",
         "checkpoint_path",
         "ckpt_path",
         "checkpoint_dir",

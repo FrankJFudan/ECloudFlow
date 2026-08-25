@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Annotated, Any
 
+import torch
 import typer
 from rdkit import Chem
 from rdkit.Chem import QED
@@ -17,23 +18,31 @@ from ecloudflow.cli.common import merge_overrides
 from ecloudflow.config import load_config
 from ecloudflow.docking.base import DockingResult, DockingStatus
 from ecloudflow.docking.vina import VinaBackend
-from ecloudflow.sampling.profiles import get_profile
+from ecloudflow.sampling.profiles import SamplingProfile, get_profile
 from ecloudflow.sampling.results import GenerationMode, GenerationShortfallError
 
 
 def sample_command(
     pocket: Annotated[Path, typer.Argument(help="Pocket PDB path.")],
-    num_molecules: Annotated[int, typer.Option("--num-molecules", "-n", min=1)] = 100,
-    fragment: Annotated[Path | None, typer.Option("--fragment")] = None,
+    num_molecules: Annotated[
+        int | None, typer.Option("--num-molecules", "-n", min=1)
+    ] = None,
+    fragment: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--fragment",
+            help="Positioned fragment SDF; repeat for link/merge multi-fragment tasks.",
+        ),
+    ] = None,
     mode: Annotated[GenerationMode, typer.Option("--mode")] = GenerationMode.DE_NOVO,
-    profile: Annotated[str, typer.Option("--profile")] = "balanced",
+    profile: Annotated[str | None, typer.Option("--profile")] = None,
     checkpoint: Annotated[Path, typer.Option("--checkpoint")] = Path(
         "checkpoints/ecloudflow.ckpt"
     ),
     output_dir: Annotated[Path, typer.Option("--output-dir", "-o")] = Path(
         "runs/sample"
     ),
-    seed: Annotated[int, typer.Option("--seed")] = 2026,
+    seed: Annotated[int | None, typer.Option("--seed")] = None,
     max_attempts: Annotated[int | None, typer.Option("--max-attempts", min=1)] = None,
     docking: Annotated[
         str,
@@ -65,7 +74,8 @@ def sample_command(
 
     :param pocket: Input pocket PDB in the desired output coordinate frame.
     :param num_molecules: Target number of valid unique molecules.
-    :param fragment: Optional positioned fragment SDF for fragment modes.
+    :param fragment: Optional positioned fragment SDF list for fragment modes;
+        repeat ``--fragment`` for link/merge tasks.
     :param mode: De novo, grow, link, replace, or merge generation objective.
     :param profile: Fast, balanced, or quality numerical profile.
     :param checkpoint: Trained checkpoint consumed by the pipeline.
@@ -89,21 +99,29 @@ def sample_command(
             f"pocket does not exist: {pocket}", param_hint="pocket"
         )
     if mode is not GenerationMode.DE_NOVO:
-        if fragment is None:
+        if not fragment:
             raise typer.BadParameter(
                 "--fragment is required for fragment-conditioned modes"
             )
-        if not fragment.is_file():
+        missing = next((path for path in fragment if not path.is_file()), None)
+        if missing is not None:
             raise typer.BadParameter(
-                f"fragment does not exist: {fragment}", param_hint="fragment"
+                f"fragment does not exist: {missing}", param_hint="fragment"
             )
+    elif fragment:
+        raise typer.BadParameter("--fragment is only valid for fragment modes")
     try:
         # Resolve the complete configuration even when no override is given;
         # the resulting artifact is part of the scientific run provenance.
         resolved_overrides = merge_overrides(overrides, trailing)
         resolved = load_config(resolved_overrides)
-        if profile == "balanced" and resolved.sample.profile != "balanced":
+        profile_was_explicit = profile is not None
+        if num_molecules is None:
+            num_molecules = resolved.sample.num_molecules
+        if profile is None:
             profile = resolved.sample.profile
+        if seed is None:
+            seed = resolved.seed
         if max_attempts is None:
             max_attempts = resolved.sample.max_attempts
     except (KeyError, ValueError) as error:
@@ -112,7 +130,15 @@ def sample_command(
     if destination.exists() and not destination.is_dir():
         raise typer.BadParameter(f"output directory is not a directory: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
-    sampler_profile = get_profile(profile)
+    if profile_was_explicit:
+        sampler_profile = get_profile(profile)
+    else:
+        sampler_profile = SamplingProfile(
+            name=profile,
+            solver=resolved.sample.solver,
+            num_steps=resolved.sample.num_steps,
+            corrector_steps=resolved.sample.corrector_steps,
+        )
     effective_sample = resolved.sample.model_copy(
         update={
             "profile": sampler_profile.name,
@@ -130,7 +156,9 @@ def sample_command(
         "request": {
             "pocket": str(pocket.expanduser().resolve()),
             "fragment": (
-                str(fragment.expanduser().resolve()) if fragment is not None else None
+                [str(path.expanduser().resolve()) for path in fragment]
+                if fragment
+                else None
             ),
             "mode": mode.value,
             "profile": sampler_profile.name,
@@ -151,7 +179,7 @@ def sample_command(
             num_molecules=num_molecules,
             fragment=fragment,
             mode=mode,
-            profile=profile,
+            profile=sampler_profile,
             max_attempts=max_attempts,
             output_dir=destination,
             seed=seed,
@@ -162,9 +190,12 @@ def sample_command(
         if result is None:
             raise typer.BadParameter(str(error)) from error
         typer.echo(f"warning: {error}", err=True)
+        shortfall_error: GenerationShortfallError | None = error
     except (FileNotFoundError, RuntimeError, ValueError, TypeError) as error:
         raise typer.BadParameter(str(error)) from error
 
+    else:
+        shortfall_error = None
     backend = _select_docking_backend(docking, smoke=smoke)
     pocket_id = _pocket_id(pocket)
     try:
@@ -185,6 +216,8 @@ def sample_command(
         for path in docked.output_bundle.paths:
             typer.echo(str(path))
     typer.echo(str(resolved_config_path))
+    if shortfall_error is not None:
+        raise typer.Exit(code=2)
 
 
 def _write_resolved_config(path: Path, payload: dict[str, Any]) -> None:
@@ -211,7 +244,8 @@ def _build_pipeline(checkpoint: Path, *, smoke: bool) -> ECloudFlowPipeline:
             checkpoint=checkpoint,
             candidate_generator=candidate_generator,
         )
-    return ECloudFlowPipeline.from_pretrained(checkpoint)
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    return ECloudFlowPipeline.from_pretrained(checkpoint, map_location=device)
 
 
 def _json_candidate_generator(path: Path):

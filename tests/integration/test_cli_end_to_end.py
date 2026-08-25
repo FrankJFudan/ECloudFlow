@@ -39,6 +39,7 @@ def test_cli_tiny_end_to_end(tmp_path: Path) -> None:
     assert resolved_config["request"]["docking"] == "auto"
     with (tmp_path / "samples.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
+    assert all(row["smiles"] for row in rows)
     assert [row["molecule_id"] for row in rows] == [
         "toy_pocket-000001",
         "toy_pocket-000002",
@@ -66,6 +67,35 @@ def test_cli_tiny_end_to_end(tmp_path: Path) -> None:
     )
     assert molecule_view.exit_code == 0, molecule_view.stdout
     assert (tmp_path / "molecule_toy_pocket-000001.html").is_file()
+
+
+def test_cli_report_before_evaluation_uses_measured_attempt_duration(
+    tmp_path: Path,
+) -> None:
+    """A report immediately after sampling must preserve real speed values."""
+    runner = CliRunner()
+    pocket = Path(__file__).parents[1] / "fixtures" / "complex" / "toy_pocket.pdb"
+    sampled = runner.invoke(
+        app,
+        [
+            "sample",
+            str(pocket),
+            "-n",
+            "2",
+            "--smoke",
+            "--profile",
+            "fast",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+    assert sampled.exit_code == 0, sampled.stdout
+
+    reported = runner.invoke(app, ["report", str(tmp_path), "--format", "paper"])
+
+    assert reported.exit_code == 0, reported.stdout
+    pareto = (tmp_path / "quality_speed_pareto.svg").read_text(encoding="utf-8")
+    assert "<!-- Elapsed time (s) -->" in pareto
 
 
 def test_cli_config_accepts_trailing_override() -> None:

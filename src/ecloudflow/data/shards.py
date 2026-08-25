@@ -89,6 +89,7 @@ class ShardWriter:
         output_dir: Path,
         *,
         split: GroupedSplit | None = None,
+        source_skips: Iterable[SkipRecord] = (),
     ) -> DatasetManifest:
         """Build or resume one content-verified immutable dataset generation.
 
@@ -102,6 +103,10 @@ class ShardWriter:
         :param split: Optional frozen leakage-controlled sample/entity split.
             Grouped assignments must cover exactly every successfully serialized
             sample; ``None`` publishes explicit unpartitioned mode.
+        :param source_skips: Deterministic discovery/validation failures observed
+            before canonical sample construction. They are hashed into the
+            generation configuration and published manifest alongside any
+            serialization-time skips.
         :return: Fully validated manifest for the newly published or recovered
             generation, including hashes, skips, provenance, and split audit.
         :rtype: DatasetManifest
@@ -145,11 +150,15 @@ class ShardWriter:
         """
         output_dir = Path(output_dir)
         durability.durable_mkdir(output_dir, parents=True, exist_ok=True)
+        initial_skips = tuple(source_skips)
+        if any(not isinstance(record, SkipRecord) for record in initial_skips):
+            raise TypeError("source_skips must contain SkipRecord values")
         config_fingerprint = _generation_config_fingerprint(
             self.target_size_bytes,
             self.max_samples_per_shard,
             self.preprocessing_version,
             split,
+            initial_skips,
         )
         recovered = _recover_ready_generation(output_dir)
         if recovered is not None:
@@ -164,7 +173,7 @@ class ShardWriter:
         _validate_completed_shards(stage_dir, staged_shards)
         sample_ids: list[str] = []
         source_hashes: dict[str, str] = {}
-        skips: list[SkipRecord] = []
+        skips: list[SkipRecord] = list(initial_skips)
         shard_records: list[ShardRecord] = list(staged_shards)
         pending: list[tuple[ComplexSample, bytes]] = []
         pending_bytes = 0
@@ -504,6 +513,7 @@ def _generation_config_fingerprint(
     max_samples_per_shard: int | None,
     preprocessing_version: str,
     split: GroupedSplit | None,
+    source_skips: tuple[SkipRecord, ...],
 ) -> str:
     """Hash settings that must remain identical across a resumed generation."""
     payload = {
@@ -511,6 +521,14 @@ def _generation_config_fingerprint(
         "max_samples_per_shard": max_samples_per_shard,
         "preprocessing_version": preprocessing_version,
         "split_hash": split.hash if split is not None else None,
+        "source_skips": [
+            {
+                "sample_id": record.sample_id,
+                "category": record.category,
+                "message": record.message,
+            }
+            for record in source_skips
+        ],
     }
     return (
         "sha256:"

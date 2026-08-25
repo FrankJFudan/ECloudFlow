@@ -1,0 +1,6 @@
+profile: fast
+num_molecules: 100
+max_attempts: null
+solver: euler
+num_steps: 20
+corrector_steps: 0

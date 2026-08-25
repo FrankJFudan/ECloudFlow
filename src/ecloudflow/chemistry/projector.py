@@ -213,7 +213,10 @@ class ChemicalProjector:
         if fixed is not None:
             fixed_source = fixed.fixed_atom_mask[source]
             fixed_target = fixed.fixed_atom_mask[target]
-            internal = fixed_source & fixed_target
+            # ``fixed_bond_mask`` distinguishes immutable within-component
+            # pairs from cross-component fixed pairs that link/merge tasks
+            # must leave editable.
+            internal = fixed.fixed_bond_mask
             crossing = fixed_source ^ fixed_target
             fixed_endpoint_is_attachment = (
                 fixed.attachment_mask[source] & fixed_source

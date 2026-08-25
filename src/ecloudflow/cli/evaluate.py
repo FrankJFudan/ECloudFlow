@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import csv
+import json
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from rdkit import Chem
 
 from ecloudflow.cli.common import atomic_write_json, load_run_records, merge_overrides
 from ecloudflow.config import load_config
@@ -59,8 +62,13 @@ def evaluate_command(
         raise typer.BadParameter("profile must be default, full, or smoke")
     context = EvaluationContext(
         records=records,
+        references=_load_references(config.evaluation.reference_path),
         timings=_timings_from_records(records),
-        metadata={"run_dir": str(run_dir), "profile": profile},
+        metadata={
+            "run_dir": str(run_dir),
+            "profile": profile,
+            "optional_backends": dict(config.evaluation.optional_backends),
+        },
         raw_relaxed_policy=config.evaluation.raw_relaxed_policy,
     )
     result = evaluate_run(
@@ -69,7 +77,11 @@ def evaluate_command(
         groups=groups,
     )
     rows = [record.as_dict() for record in records]
-    aggregate = _aggregate_docking(rows, config.evaluation.bootstrap_seed)
+    aggregate = _aggregate_docking(
+        rows,
+        config.evaluation.bootstrap_seed,
+        config.evaluation.bootstrap_resamples,
+    )
     destination = run_dir / "evaluation.json"
     atomic_write_json(
         destination,
@@ -102,7 +114,9 @@ def _timings_from_records(records: tuple[Any, ...]) -> dict[str, Any]:
     )
 
 
-def _aggregate_docking(rows: list[dict[str, Any]], seed: int) -> dict[str, Any]:
+def _aggregate_docking(
+    rows: list[dict[str, Any]], seed: int, resamples: int = 1000
+) -> dict[str, Any]:
     """Return a pocket-macro docking summary when scores are available."""
     observations = []
     for row in rows:
@@ -122,9 +136,84 @@ def _aggregate_docking(rows: list[dict[str, Any]], seed: int) -> dict[str, Any]:
         return {"docking_score": None}
     return {
         "docking_score": bootstrap_macro_summary(
-            observations, seed=seed, value="value"
+            observations, seed=seed, resamples=resamples, value="value"
         ).as_dict()
     }
+
+
+def _load_references(path_value: str | None) -> dict[str, tuple[str, ...]]:
+    """Load a canonical reference-SMILES index from common research formats.
+
+    :param path_value: Optional JSON, CSV, SMI/TXT, or SDF file configured by
+        ``evaluation.reference_path``.
+    :return: Mapping containing a stable sorted tuple under ``"smiles"``.
+    :rtype: dict[str, tuple[str, ...]]
+    :raises typer.BadParameter: If the path, format, or molecule records are
+        unreadable or contain no valid SMILES.
+
+    JSON accepts either a top-level sequence or a mapping with ``smiles`` or
+    ``canonical_smiles``. CSV selects either named column. SMI/TXT uses the
+    first whitespace-delimited token on each non-comment line. SDF records are
+    sanitized by RDKit. Every molecule is canonicalized isomerically and
+    deduplicated; source files are read only and no reference is silently
+    replaced after a parse failure.
+    """
+    if path_value is None:
+        return {}
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        raise typer.BadParameter(f"evaluation reference file does not exist: {path}")
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                values = payload.get("smiles", payload.get("canonical_smiles", ()))
+            else:
+                values = payload
+            if isinstance(values, str):
+                raw = [values]
+            elif isinstance(values, (list, tuple, set)):
+                raw = [str(value) for value in values]
+            else:
+                raise ValueError("JSON must contain a SMILES sequence")
+        elif suffix == ".csv":
+            with path.open("r", encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            raw = [
+                str(row.get("canonical_smiles") or row.get("smiles") or "")
+                for row in rows
+            ]
+        elif suffix in {".smi", ".smiles", ".txt"}:
+            raw = [
+                line.split()[0]
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+        elif suffix == ".sdf":
+            molecules = list(Chem.SDMolSupplier(str(path), sanitize=True, removeHs=True))
+            if any(molecule is None for molecule in molecules):
+                raise ValueError("SDF contains an invalid molecule record")
+            raw = [
+                Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
+                for molecule in molecules
+                if molecule is not None
+            ]
+        else:
+            raise ValueError("supported suffixes are .json, .csv, .smi, .txt, and .sdf")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise typer.BadParameter(f"invalid evaluation reference file: {error}") from error
+    canonical: set[str] = set()
+    for value in raw:
+        molecule = Chem.MolFromSmiles(value)
+        if molecule is None:
+            raise typer.BadParameter(f"invalid reference SMILES: {value!r}")
+        canonical.add(
+            Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
+        )
+    if not canonical:
+        raise typer.BadParameter("evaluation reference file contains no molecules")
+    return {"smiles": tuple(sorted(canonical))}
 
 
 __all__ = ["evaluate_command"]

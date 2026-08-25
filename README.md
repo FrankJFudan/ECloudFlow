@@ -7,10 +7,11 @@ chemical graph decoding.  The public pipeline generates coordinates in the
 pocket binding frame, supports de novo and fragment-conditioned objectives,
 and records every accepted, rejected, and failed attempt.
 
-This repository is an engineering and reproducibility scaffold.  It does not
-ship a trained checkpoint and it does not claim a state-of-the-art binding
-benchmark.  Binding quality must be measured with a declared docking protocol,
-matched data split, and independent validation.
+This repository contains the model, training runtime, constrained sampler,
+evaluation pipeline, tests, and reproducible server launch files. It does not
+ship private datasets or a trained checkpoint and it does not claim a
+state-of-the-art binding benchmark. Binding quality must be measured with a
+declared docking protocol, matched data split, and independent validation.
 
 ## Highlights
 
@@ -35,17 +36,41 @@ matched data split, and independent validation.
 
 ## Installation
 
-Use the supplied Python environment or create an isolated environment with
-Python 3.10--3.12.  Install the package in editable mode:
+Use Python 3.10--3.12. For local development in an existing compatible
+environment, install the package and all workflow extras:
 
 ```bash
 conda activate 3dmolecule
-python -m pip install -e .
-python -m pip install -e '.[dev,eval,viz,train]'
+python -m pip install -e '.[dev,train,eval,viz]'
 ```
 
-The core package does not require Vina, xTB, PoseBusters, or Py3Dmol.  Install
-those tools separately when the corresponding metric or viewer is enabled.
+For a four-H100 Linux server with a sufficiently recent NVIDIA driver, create
+the verified CUDA 12.8 environment directly from the repository:
+
+```bash
+bash scripts/setup_h100.sh
+conda activate ecloudflow-h100
+ecloudflow doctor --server
+```
+
+The verified direct dependency set is recorded in
+`requirements/h100-cu128.txt`. Vina, xTB, and Open Babel are external optional
+executables; install them separately when docking, QM labels, or PDBQT
+conversion is enabled. Missing optional tools produce explicit unavailable
+statuses.
+
+Regular wheel installation is also supported. Default Hydra YAML, report
+templates, and plotting styles are included in the wheel:
+
+```bash
+python -m pip install build
+python -m build
+python -m pip install 'dist/ecloudflow-0.1.0-py3-none-any.whl[train,eval,viz]'
+ecloudflow config show +experiment=smoke
+```
+
+See `docs/server.md` for repository upload, installation, acceptance, and job
+launch procedures.
 
 ## Doctor
 
@@ -90,7 +115,42 @@ checkpoint, and docking selection.
 PDBBind, CrossDocked, and ligand-pretraining data are represented by immutable
 content-addressed WebDataset shards.  The importer preserves the source frame,
 source hashes, split assignments, and optional QM provenance.  A preparation
-preflight writes a resolved manifest without inventing records:
+preflight writes a resolved manifest without inventing records. ECloudFlow does
+not redistribute either dataset: acquire PDBBind from its licensed official
+download page and CrossDocked2020 from its publisher, then keep raw data outside
+the Git checkout.
+
+Import an extracted PDBBind release or CrossDocked2020 tree in one command:
+
+```bash
+ecloudflow data import-local --dataset pdbbind \
+  --source-root /data/ecloudflow/raw/pdbbind \
+  --output-dir /data/ecloudflow/processed/pdbbind \
+  --workers 16 --strict-sources
+
+ecloudflow data import-local --dataset crossdocked \
+  --source-root /data/ecloudflow/raw/crossdocked \
+  --index /data/ecloudflow/raw/crossdocked/types/it2_tt_v1.1_completeset_train0.types \
+  --output-dir /data/ecloudflow/processed/crossdocked \
+  --rmsd-threshold 1.0 --workers 16 --strict-sources
+```
+
+The output contains `manifest.json`, `import-summary.json`, immutable tar
+shards, affinity/pose metadata, and leakage-controlled train/validation/test
+assignments. Configure training with the manifest only:
+
+```bash
+ecloudflow train +experiment=pdbbind_large \
+  data.manifest=/data/ecloudflow/processed/pdbbind/manifest.json \
+  --output-dir /runs/ecloudflow/stage3
+```
+
+Run graph-only smoke imports with `--limit 32 --no-fields`; production imports
+should retain physical fields. See `docs/data.md` for official download URLs,
+accepted raw layouts, cluster files, shard format, and licensing boundaries.
+
+The separate preparation command can write a configuration preflight without
+inventing records:
 
 ```bash
 ecloudflow data prepare --dataset pdbbind --output-dir data/prepared
@@ -100,8 +160,8 @@ For one explicit pocket/ligand pair, build a canonical sample and manifest:
 
 ```bash
 ecloudflow data prepare --dataset pdbbind \
-  --pocket examples/3ztx_pocket.pdb --ligand examples/3ztx_ligand.sdf \
-  --sample-id 3ZTX --output-dir data/processed/pdbbind --no-fields
+  --pocket examples/toy_pocket.pdb --ligand examples/toy_ligand.sdf \
+  --sample-id TOY --output-dir data/processed/toy --no-fields
 ```
 
 `--no-fields` is useful for graph-only debugging.  Physical fields should be
@@ -146,22 +206,61 @@ ecloudflow config show +experiment=pdbbind_large
 ecloudflow train +experiment=pdbbind_large --output-dir runs/pdbbind-large
 ```
 
+For the normal server path, use the checked launcher. Lightning creates the
+four DDP workers itself; do not wrap this training command in another
+`torchrun` process group:
+
+```bash
+bash scripts/train_4xh100.sh \
+  --manifest /data/ecloudflow/pdbbind/manifest.json \
+  --output /runs/ecloudflow/stage3 --stage 3
+```
+
+Run the complete stage 1-to-4 curriculum with strict model-only transfer
+between stages:
+
+```bash
+bash scripts/train_curriculum_4xh100.sh \
+  /data/ecloudflow/pdbbind/manifest.json /runs/ecloudflow/curriculum
+```
+
+Within a stage, `--resume-from` restores model, optimizer, EMA, RNG, and data
+position exactly. Between stages, `--init-from` loads the three model groups
+strictly but starts optimizer, EMA, loss normalization, RNG, and data position
+fresh.
+
 Run the benchmark harness after a dataset and checkpoint are available:
 
 ```bash
-bash scripts/run_h100_smoke.sh --config experiment=h100_smoke --output runs/h100-smoke
-bash scripts/benchmark_scaling.sh --config experiment=h100_large --output runs/scaling
+export ECLOUDFLOW_DATA_MANIFEST=data/processed/pdbbind/manifest.json
+ECLOUDFLOW_RUN_NCCL=1 bash scripts/run_h100_smoke.sh \
+  --config experiment=h100_smoke --output runs/h100-smoke
+ECLOUDFLOW_RUN_NCCL=1 bash scripts/benchmark_scaling.sh \
+  --config experiment=h100_large --output runs/scaling
+
+# Local report-contract check; this does not claim GPU measurements.
 ecloudflow benchmark --devices 1 --devices 2 --devices 4 \
-  --steps 100 --config experiment=h100_large --output-dir runs/scaling
+  --steps 1 --config experiment=h100_large --output-dir runs/scaling-dry \
+  --dry-run
 ```
 
 The scripts print Git and dataset-manifest hashes.  `run_h100_smoke.sh` uses a
-local benchmark by default; set `ECLOUDFLOW_RUN_NCCL=1` on the server to invoke
-`torchrun --nproc_per_node=4`.  The NCCL scaling script stores raw one-, two-,
-and four-process reports under `dev1/`, `dev2/`, and `dev4/`, then publishes a
-combined `scaling.json`/`scaling.csv` at the requested output root with
-recomputed speedup and efficiency.  Local CI uses a clearly labeled CPU
-simulation when requested device counts are not visible.
+local benchmark by default; `ECLOUDFLOW_RUN_NCCL=1` is therefore mandatory for
+server measurements and invokes `torchrun --nproc_per_node=4`.  The NCCL
+scaling script stores raw one-, two-, and four-process reports under `dev1/`,
+`dev2/`, and `dev4/`, then publishes a combined `scaling.json`/`scaling.csv` at
+the requested output root with recomputed speedup and efficiency.  Local CI
+uses a clearly labeled CPU simulation when requested device counts are not
+visible.
+
+Before a long job, run the real four-GPU acceptance path against prepared
+shards. It trains two steps, writes a checkpoint, resumes to step three, and
+fails on any dataset, BF16, NCCL, checkpoint, or distributed-runtime error:
+
+```bash
+bash scripts/acceptance_h100.sh \
+  /data/ecloudflow/pdbbind/manifest.json /runs/ecloudflow/acceptance
+```
 
 ## Sampling
 
@@ -173,6 +272,11 @@ ecloudflow sample 3ztx_pocket.pdb --checkpoint checkpoints/ecloudflow-large.ckpt
   --num-molecules 100 --profile balanced --output-dir runs/3ztx
 ```
 
+Checkpoint-backed sampling constructs the deterministic six-channel pocket
+physical field and supplies it together with the pocket graph to atom-count
+prediction and every flow/score call. Generated local coordinates are restored
+through the stored pocket frame to the input PDB coordinate system.
+
 `--num-molecules` is the target number of valid unique molecules, not the
 number of raw attempts.  The default attempt bound is five times the target;
 `--max-attempts` and `--strict-count` expose bounded-shortfall behavior.
@@ -182,15 +286,19 @@ Fragment-conditioned optimization uses one shared pipeline:
 ```bash
 ecloudflow sample 3ztx_pocket.pdb --checkpoint checkpoints/ecloudflow-large.ckpt \
   --fragment hit_fragment.sdf --mode grow -n 100 --profile balanced
-ecloudflow sample 3ztx_pocket.pdb --fragment hit_fragment.sdf --mode link -n 100
+ecloudflow sample 3ztx_pocket.pdb --fragment fragment_a.sdf \
+  --fragment fragment_b.sdf --mode link -n 100
 ecloudflow sample 3ztx_pocket.pdb --fragment hit_fragment.sdf --mode replace -n 100
-ecloudflow sample 3ztx_pocket.pdb --fragment hit_fragment.sdf --mode merge -n 100
+ecloudflow sample 3ztx_pocket.pdb --fragment fragment_a.sdf \
+  --fragment fragment_b.sdf --mode merge -n 100
 ```
 
 Fixed atom identity, charge, internal bonds, and coordinates are clamped after
 every solver/corrector operation.  The final graph decoder unions fixed
 components before adding attachment edges and rejects valence, connectivity,
-sanitization, and conformer failures.
+sanitization, and conformer failures. SDF fragment attachment sites default to
+atoms with available hydrogens; atom properties `ecloudflow_attachment`,
+`attachment_site`, or `attachment` may explicitly restrict or declare sites.
 
 ### Profiles and NFE
 
@@ -201,7 +309,9 @@ sanitization, and conformer failures.
 | `quality` | Heun, 100 steps, stronger corrector | 208 | final candidates |
 
 The NFE values are reporting contracts; actual model calls and optional
-guidance/decoding work are recorded in efficiency diagnostics.
+guidance/decoding work are recorded by generation efficiency diagnostics. The
+distributed training benchmark does not reuse these configured values as if
+they were measured sampling NFE.
 
 ## Docking, Ranking, and Outputs
 
@@ -253,6 +363,14 @@ ecloudflow sample pocket.pdb -n 500 sample.corrector_steps=4
 The resolved configuration is serialized into training, benchmark, and
 evaluation artifacts.  Keep machine-specific paths in ignored local override
 files rather than committing them.
+
+An external configuration tree can replace the packaged defaults without
+modifying the installation:
+
+```bash
+export ECLOUDFLOW_CONFIG_DIR=/opt/ecloudflow-configs
+ecloudflow config show +experiment=pdbbind_large
+```
 
 ## Python API
 
@@ -309,6 +427,9 @@ src/ecloudflow/evaluation    ranking, metrics, aggregation, output writers
 src/ecloudflow/visualization viewers, plots, and HTML reports
 src/ecloudflow/training      Lightning module, checkpoints, benchmark harness
 src/ecloudflow/cli           Typer commands and environment doctor
+scripts                      H100 setup, acceptance, training, and benchmarks
+requirements                 verified direct server dependency sets
+.github/workflows            CPU tests, documentation, and wheel verification
 configs                      tiny/base/large and experiment presets
 docs                          theory and operational references
 ```

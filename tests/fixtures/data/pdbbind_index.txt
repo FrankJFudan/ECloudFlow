@@ -1,0 +1,3 @@
+# PDB code  resolution  year  -logKd/Ki  raw measurement
+1abc  2.00  2020  7.30103  Kd=50nM  // synthetic fixture
+2def  1.80  2019  6.00000  Ki<1uM   // synthetic fixture

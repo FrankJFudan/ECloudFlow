@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install CPU runtime and build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install ".[dev,train,eval,viz]" build
+      - name: Static and documentation checks
+        run: |
+          ruff check src tests tools
+          python tools/check_python_docs.py src tests tools
+          python -m compileall -q src
+          git diff --check
+      - name: Test
+        run: python -m pytest -q -m "not external and not server"
+      - name: Build distributions
+        run: python -m build
+      - name: Verify regular wheel installation
+        shell: bash
+        run: |
+          python -m pip uninstall -y ecloudflow
+          python -m pip install --no-deps dist/ecloudflow-*.whl
+          cd "$(mktemp -d)"
+          ecloudflow config show +experiment=smoke > resolved.json
+          python -c "from ecloudflow.config import config_directory; assert (config_directory() / 'config.yaml').is_file()"

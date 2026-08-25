@@ -10,6 +10,8 @@ ecloudflow sample pocket.pdb --checkpoint checkpoints/ecloudflow-large.ckpt \
   --num-molecules 100 --profile balanced --output-dir runs/pocket
 ecloudflow sample pocket.pdb --fragment hit_fragment.sdf --mode grow -n 100 \
   --profile balanced --output-dir runs/grow
+ecloudflow sample pocket.pdb --fragment fragment_a.sdf \
+  --fragment fragment_b.sdf --mode link -n 100
 ```
 
 `--smoke --docking deterministic` is an explicit wiring fixture and does not
@@ -27,11 +29,24 @@ shortfall is published with duplicate and rejection statistics, and
 
 ## Fragment invariants
 
-The positioned fragment is represented by a boolean atom mask. Fixed atom
+The positioned fragment(s) are represented by a boolean atom mask. Fixed atom
 types, charges, internal bonds, and coordinates are restored after every
 integrator, score corrector, and projection call. New attachment edges are
-allowed only through the mode-specific mask. This exact clamping is tested by
-tensor equality, not by a tolerance-based post-hoc repair.
+allowed only through the attachment mask. For an SDF fragment, the default
+mask is fail-closed: atoms with available implicit/explicit hydrogens are
+inferred as sites, saturated atoms are blocked, and optional atom properties
+`ecloudflow_attachment`, `attachment_site`, or `attachment` can explicitly
+mark a site (`true`/`false`). This prevents a complete candidate graph from
+connecting to arbitrary interior atoms. Exact clamping is tested by tensor
+equality, not by a tolerance-based post-hoc repair.
+
+## Pocket electron field
+
+Checkpoint-backed inference builds the deterministic density, partial-charge,
+donor, acceptor, hydrophobic, and aromatic pocket field from the canonical
+pocket graph. The same framed field conditions atom-count prediction and every
+flow/score network evaluation. Field construction is deterministic and does
+not invoke xTB; optional ligand QM fields remain training supervision.
 
 ## Artifacts
 

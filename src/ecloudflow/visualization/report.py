@@ -67,7 +67,13 @@ def build_report(
         if isinstance(evaluation, EvaluationResult)
         else _safe(evaluation)
     )
-    rows = _extract_rows(payload)
+    rows = (
+        _context_molecule_rows(evaluation.context)
+        if isinstance(evaluation, EvaluationResult)
+        else _extract_rows(payload)
+    )
+    if not rows:
+        rows = _extract_rows(payload)
     figure_paths = [
         plot_metric_distribution(rows, destination / "metric_distribution.svg"),
         plot_quality_speed_pareto(rows, destination / "quality_speed_pareto.svg"),
@@ -110,7 +116,7 @@ def build_report(
 def _extract_rows(payload: Any) -> list[dict[str, Any]]:
     """Find a list of metric rows in common evaluation payload shapes."""
     if isinstance(payload, dict):
-        for key in ("rows", "ranked", "molecules", "per_item"):
+        for key in ("rows", "ranked", "molecules", "valid", "per_item"):
             value = payload.get(key)
             if isinstance(value, list):
                 return [
@@ -119,6 +125,38 @@ def _extract_rows(payload: Any) -> list[dict[str, Any]]:
                 ]
         return [{"metric": key, "value": value} for key, value in payload.items()]
     return [{"value": payload}]
+
+
+def _context_molecule_rows(context: Any) -> list[dict[str, Any]]:
+    """Serialize direct evaluation context molecules without losing metrics.
+
+    :param context: Optional :class:`EvaluationContext` retained by an
+        :class:`EvaluationResult`.
+    :return: JSON-safe molecule rows in the context's ranked-or-generated
+        ordering, or an empty list when no serializable molecular records exist.
+    :rtype: list[dict[str, typing.Any]]
+
+    ``EvaluationResult.as_dict`` deliberately serializes only aggregate metric
+    results. A direct Python caller, however, supplied molecular records that
+    may already contain docking, QED, SA, and timing values. Extracting their
+    ``as_dict`` representation here keeps the report figures and top-molecule
+    table equivalent to the CLI artifact workflow without mutating evaluation
+    state or recomputing any scientific metric.
+    """
+    if context is None:
+        return []
+    values = getattr(context, "molecules", ())
+    rows: list[dict[str, Any]] = []
+    for value in values:
+        if isinstance(value, dict):
+            rows.append(_safe(value))
+            continue
+        as_dict = getattr(value, "as_dict", None)
+        if callable(as_dict):
+            serialized = as_dict()
+            if isinstance(serialized, dict):
+                rows.append(_safe(serialized))
+    return rows
 
 
 def _table_keys(rows: list[dict[str, Any]]) -> list[str]:

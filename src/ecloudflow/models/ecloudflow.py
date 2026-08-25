@@ -553,20 +553,34 @@ class ECloudFlowModel(nn.Module):  # type: ignore[misc]
         endpoint_electron_latent = (
             state.electron_latent + (1.0 - node_time) * electron_velocity
         )
+        # Autocast can make individual heads emit BF16/FP16 while residual
+        # additions involving the float32 state remain float32.  The public
+        # ``ModelPrediction`` contract deliberately exposes one stable dtype,
+        # so cast every differentiable output at this boundary.  ``Tensor.to``
+        # preserves gradients and keeps the operation local to the caller's
+        # state device; it does not disable mixed-precision computation inside
+        # the backbone or heads.
+        prediction_dtype = state.positions.dtype
         return ModelPrediction(
-            position_velocity=position_velocity,
-            position_score=position_score,
-            electron_velocity=electron_velocity,
-            electron_score=electron_score,
-            atom_logits=atom_logits,
-            charge_logits=charge_logits,
-            bond_logits=bond_logits,
-            count_logits=count_logits,
-            affinity=self.affinity_head(hidden.pooled),
-            affinity_log_variance=self.affinity_log_variance_head(hidden.pooled),
-            interaction_logits=self.interaction_head(hidden.pooled),
-            endpoint_positions=endpoint_positions,
-            endpoint_electron_latent=endpoint_electron_latent,
+            position_velocity=position_velocity.to(dtype=prediction_dtype),
+            position_score=position_score.to(dtype=prediction_dtype),
+            electron_velocity=electron_velocity.to(dtype=prediction_dtype),
+            electron_score=electron_score.to(dtype=prediction_dtype),
+            atom_logits=atom_logits.to(dtype=prediction_dtype),
+            charge_logits=charge_logits.to(dtype=prediction_dtype),
+            bond_logits=bond_logits.to(dtype=prediction_dtype),
+            count_logits=count_logits.to(dtype=prediction_dtype),
+            affinity=self.affinity_head(hidden.pooled).to(dtype=prediction_dtype),
+            affinity_log_variance=self.affinity_log_variance_head(hidden.pooled).to(
+                dtype=prediction_dtype
+            ),
+            interaction_logits=self.interaction_head(hidden.pooled).to(
+                dtype=prediction_dtype
+            ),
+            endpoint_positions=endpoint_positions.to(dtype=prediction_dtype),
+            endpoint_electron_latent=endpoint_electron_latent.to(
+                dtype=prediction_dtype
+            ),
             pocket_cache_key=encoding.cache_key,
         )
 

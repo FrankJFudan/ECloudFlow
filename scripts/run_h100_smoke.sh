@@ -40,7 +40,9 @@ from ecloudflow.training.benchmark import benchmark_hashes
 
 config = os.environ["ECLOUDFLOW_BENCHMARK_CONFIG"]
 resolved = load_config([config if config.startswith(("+", "~")) else f"+{config}"])
-hashes = benchmark_hashes(config, resolved.benchmark, resolved.data)
+hashes = benchmark_hashes(
+    config, resolved.benchmark, resolved.data, app_config=resolved
+)
 print(f"git={hashes['git']}")
 print(f"config={hashes['config']}")
 print(f"data={hashes['data']}")
